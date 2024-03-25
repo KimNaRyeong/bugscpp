@@ -144,7 +144,7 @@ def collect_snippet(target_bugs):
         if consider_coverage and not gcov_path:
             return
         execution_count = parse_gcov_file(gcov_path)
-        class_name = relative_path[:-2].replace('/', '.').replace('src.', '') # should I trim src, too?
+        class_name = relative_path[:-2].replace('/', '.') # should I trim src, too? -> no
 
         for node in translation_unit.cursor.walk_preorder():
             if node.kind == clang.cindex.CursorKind.FUNCTION_DECL and node.is_definition(): # to exclude empty functions that came from headers
@@ -260,5 +260,5 @@ def collect_token_statistics(target_bugs):
             json.dump(sorted(data, key=lambda info: info['name']), f, indent=4)
  
 if __name__ == "__main__":
-    collect_snippet([('libchewing', '1')])
-    collect_token_statistics([('zsh', '1', 'Src', True), ('libchewing', '1', 'src', True), ('berry', '1', 'src', True), ('yara', '1', 'libyara', True)])
+    collect_snippet([('libchewing', '8')])
+    # collect_token_statistics([('zsh', '1', 'Src', True), ('libchewing', '1', 'src', True), ('berry', '1', 'src', True), ('yara', '1', 'libyara', True)])
