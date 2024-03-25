@@ -1,6 +1,7 @@
 import os
 
 pre_path = './bugscpp/results/libchewing_5_with_b/'
+# pre_path = './benchmark/libchewing-6'
 dir_list = os.listdir(pre_path)
 # print(dir_list)
 wf = open('./data/bugscpp/libchewing_5/failing_tests', 'w')
