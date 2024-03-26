@@ -1,0 +1,509 @@
+        -:    0:Source:src/be_baselib.c
+        -:    0:Graph:./src/be_baselib.gcno
+        -:    0:Data:./src/be_baselib.gcda
+        -:    0:Runs:1
+        -:    1:/********************************************************************
+        -:    2:** Copyright (c) 2018-2020 Guan Wenliang
+        -:    3:** This file is part of the Berry default interpreter.
+        -:    4:** skiars@qq.com, https://github.com/Skiars/berry
+        -:    5:** See Copyright Notice in the LICENSE file or at
+        -:    6:** https://github.com/Skiars/berry/blob/master/LICENSE
+        -:    7:********************************************************************/
+        -:    8:#include "be_object.h"
+        -:    9:#include "be_vm.h"
+        -:   10:#include "be_exec.h"
+        -:   11:#include "be_mem.h"
+        -:   12:#include "be_gc.h"
+        -:   13:#include "be_class.h"
+        -:   14:#include "be_vector.h"
+        -:   15:#include "be_string.h"
+        -:   16:#include "be_map.h"
+        -:   17:#include <string.h>
+        -:   18:
+        -:   19:#define READLINE_STEP       100
+        -:   20:
+        7:   21:static int l_assert(bvm *vm)
+        -:   22:{
+        7:   23:    int argc = be_top(vm);
+        -:   24:    /* assertion fails when there is no argument
+        -:   25:     * or the first argument is nil or false. */
+        7:   26:    if (!argc || !be_tobool(vm, 1)) {
+        1:   27:        const char *msg = "assert failed!";
+       1*:   28:        if (argc >= 2 && be_isstring(vm, 2)) {
+    #####:   29:            msg = be_tostring(vm, 2);
+        -:   30:        }
+        1:   31:        be_raise(vm, "assert_failed", msg);
+        -:   32:    }
+        6:   33:    be_return_nil(vm);
+        -:   34:}
+        -:   35:
+    #####:   36:static int l_print(bvm *vm)
+        -:   37:{
+    #####:   38:    int i, argc = be_top(vm);
+    #####:   39:    for (i = 1; i <= argc; ++i) {
+    #####:   40:        const char *str = be_tostring(vm, i);
+    #####:   41:        size_t len = be_strlen(vm, i);
+    #####:   42:        be_writebuffer(str, len);
+    #####:   43:        if (i < argc) {
+    #####:   44:            be_writebuffer(" ", 1);
+        -:   45:        }
+        -:   46:    }
+    #####:   47:    be_writenewline();
+    #####:   48:    be_return_nil(vm);
+        -:   49:}
+        -:   50:
+    #####:   51:static int m_readline(bvm *vm)
+        -:   52:{
+    #####:   53:    size_t pos = 0, size = READLINE_STEP;
+    #####:   54:    char *buffer = be_malloc(vm, size);
+    #####:   55:    char *res = be_readstring(buffer, (int)size);
+    #####:   56:    while (res) {
+    #####:   57:        pos += strlen(buffer + pos) - 1;
+    #####:   58:        if (!pos || buffer[pos] == '\n') {
+    #####:   59:            buffer[pos] = '\0'; /* trim \n */
+    #####:   60:            break;
+        -:   61:        }
+    #####:   62:        buffer = be_realloc(vm, buffer, size, size + READLINE_STEP);
+    #####:   63:        res = be_readstring(buffer + pos + 1, READLINE_STEP);
+    #####:   64:        size += READLINE_STEP;
+        -:   65:    }
+    #####:   66:    be_pushstring(vm, buffer);
+    #####:   67:    be_free(vm, buffer, size);
+    #####:   68:    be_return(vm);
+        -:   69:}
+        -:   70:
+    #####:   71:static int l_input(bvm *vm)
+        -:   72:{
+    #####:   73:    if (be_top(vm) && be_isstring(vm, 1)) { /* echo prompt */
+    #####:   74:        be_writestring(be_tostring(vm, 1));
+        -:   75:    }
+    #####:   76:    return m_readline(vm);
+        -:   77:}
+        -:   78:
+        -:   79:/* Look in the current class and all super classes for a method corresponding to a specific closure pointer */
+    #####:   80:static bclass *find_class_closure(bclass *cl, bclosure *needle)
+        -:   81:{
+    #####:   82:    while (cl) {
+        -:   83:        bmapnode *node;  /* iterate on members of the class */
+    #####:   84:        bmap *members = be_class_members(cl);
+    #####:   85:        if (members) {  /* only iterate if there are members */
+    #####:   86:            bmapiter iter = be_map_iter();
+    #####:   87:            while ((node = be_map_next(members, &iter)) != NULL) {
+    #####:   88:                if (var_type(&node->value) == BE_CLOSURE) {  /* only native functions are considered */
+    #####:   89:                    bclosure *clos_iter = var_toobj(&node->value);  /* retrieve the method's closure */
+    #####:   90:                    if (clos_iter == needle) {
+        -:   91:                        /* we found the closure, we now know its class */
+    #####:   92:                        return cl;
+        -:   93:                    }
+        -:   94:                }
+        -:   95:            }
+        -:   96:        }
+    #####:   97:        cl = be_class_super(cl);  /* move to super class */
+        -:   98:    }
+    #####:   99:    return NULL;  /* not found */
+        -:  100:}
+        -:  101:
+    #####:  102:static int l_super(bvm *vm)
+        -:  103:{
+    #####:  104:    int argc = be_top(vm);
+        -:  105:
+        -:  106:    /* if no argument, or arg 1 is nil, return nil */
+    #####:  107:    if (argc == 0 || be_isnil(vm, 1)) {
+    #####:  108:        be_return_nil(vm);
+        -:  109:    }
+        -:  110:
+        -:  111:    /* if arg 1 is a class, simply return super */
+    #####:  112:    if (be_isclass(vm, 1)) {
+    #####:  113:        be_getsuper(vm, 1);
+    #####:  114:        be_return(vm);
+        -:  115:    }
+        -:  116:
+        -:  117:    /* arg 1 is an instance */
+    #####:  118:    if (be_isinstance(vm, 1)) {
+    #####:  119:        binstance *o = var_toobj(be_indexof(vm, 1));
+    #####:  120:        bclass *target_class = NULL;  /* the minimal class expected, or any super class */
+    #####:  121:        bclass *base_class = NULL;  /* current class of the caller, if any */
+        -:  122:
+        -:  123:        /* if arg 2 is present, it must be a class */
+    #####:  124:        if (argc >= 2) {
+    #####:  125:            if (be_isclass(vm, 2)) {
+    #####:  126:                target_class = var_toobj(be_indexof(vm, 2));
+    #####:  127:            } else if (be_isnil(vm, 2)) {
+        -:  128:                // ignore, revert to standard super() behavior if second arg is explicit nil
+        -:  129:            } else {
+    #####:  130:                be_raise(vm, "type_error", "leveled super() requires 'instance' and 'class' arguments");
+        -:  131:            }
+        -:  132:        }
+        -:  133:
+        -:  134:        /* now the more complex part, if arg 1 is an instance */
+        -:  135:        /* if instance is the sole argument, try to find if it comes from a method of a class and set 'base_class' accordinly */
+        -:  136:        /* later it will be equivalent to passing this class as second argument */
+    #####:  137:        if (argc == 1) {
+        -:  138:            /* we look in the callstack for the caller's closure */
+    #####:  139:            int size = be_stack_count(&vm->callstack);
+    #####:  140:            if (size >= 2) {  /* need at least 2 stackframes: current (for super() native) and caller (the one we are interested in) */
+    #####:  141:                bcallframe *caller = be_vector_at(&vm->callstack, size - 2);  /* get the callframe of caller */
+    #####:  142:                bvalue *func = caller->func;  /* function object of caller */
+    #####:  143:                if (var_type(func) == BE_CLOSURE) {  /* only useful if the caller is a Berry closure (i.e. not native) */
+    #####:  144:                    bclosure *clos_ctx = var_toobj(func);  /* this is the closure we look for in the class chain */
+    #####:  145:                    base_class = find_class_closure(o->_class, clos_ctx);  /* iterate on current and super classes to find where the closure belongs */
+        -:  146:                }
+        -:  147:            }
+        -:  148:        }
+        -:  149:
+    #####:  150:        if (base_class || target_class) {
+    #####:  151:            if (base_class) {
+    #####:  152:                target_class = base_class->super;
+    #####:  153:                if (!target_class) be_return_nil(vm);   /* fast exit if top class */
+        -:  154:            }
+        -:  155:            /* leveled super, i.e. fix the parenthood class level */
+    #####:  156:            if (o) {
+    #####:  157:                o = be_instance_super(o);   /* always skip the current class and move to super */
+        -:  158:            }
+    #####:  159:            while (o) {
+    #####:  160:                bclass *c = be_instance_class(o);
+    #####:  161:                if (c == target_class) break;         /* found */
+    #####:  162:                o = be_instance_super(o);
+        -:  163:            }
+    #####:  164:            bvalue *top = be_incrtop(vm);
+    #####:  165:            if (o) {
+    #####:  166:                var_setinstance(top, o);    /* return the instance with the specified parent class */
+        -:  167:            } else {
+    #####:  168:                var_setnil(top);            /* not found, return nil */
+        -:  169:            }
+    #####:  170:            be_return(vm);
+        -:  171:        } else {
+    #####:  172:            be_getsuper(vm, 1);
+    #####:  173:            be_return(vm);
+        -:  174:        }
+        -:  175:    }
+        -:  176:
+        -:  177:    /* fall through, return nil if we don't know what to do */
+    #####:  178:    be_return_nil(vm);
+        -:  179:}
+        -:  180:
+    #####:  181:static int l_type(bvm *vm)
+        -:  182:{
+    #####:  183:    if (be_top(vm)) {
+    #####:  184:        be_pushstring(vm, be_typename(vm, 1));
+    #####:  185:        be_return(vm);
+        -:  186:    }
+    #####:  187:    be_return_nil(vm);
+        -:  188:}
+        -:  189:
+    #####:  190:static int l_classname(bvm *vm)
+        -:  191:{
+    #####:  192:    if (be_top(vm)) {
+    #####:  193:        const char *t = be_classname(vm, 1);
+    #####:  194:        if (t) {
+    #####:  195:            be_pushstring(vm, t);
+    #####:  196:            be_return(vm);
+        -:  197:        }
+        -:  198:    }
+    #####:  199:    be_return_nil(vm);
+        -:  200:}
+        -:  201:
+    #####:  202:static int l_classof(bvm *vm)
+        -:  203:{
+    #####:  204:    if (be_top(vm) && be_classof(vm, 1)) {
+    #####:  205:        be_return(vm);
+        -:  206:    }
+    #####:  207:    be_return_nil(vm);
+        -:  208:}
+        -:  209:
+    #####:  210:static int l_number(bvm *vm)
+        -:  211:{
+    #####:  212:    if (be_top(vm)) {
+    #####:  213:        if (be_isstring(vm, 1)) {
+    #####:  214:            be_str2num(vm, be_tostring(vm, 1));
+    #####:  215:            be_return(vm);
+    #####:  216:        } else if (be_isnumber(vm, 1)) {
+    #####:  217:            be_pushvalue(vm, 1);
+    #####:  218:            be_return(vm);
+        -:  219:        }
+        -:  220:    }
+    #####:  221:    be_return_nil(vm);
+        -:  222:}
+        -:  223:
+    #####:  224:static int l_int(bvm *vm)
+        -:  225:{
+    #####:  226:    if (be_top(vm)) {
+    #####:  227:        if (be_isstring(vm, 1)) {
+    #####:  228:            const char *s = be_tostring(vm, 1);
+    #####:  229:            be_pushint(vm, be_str2int(s, NULL));
+    #####:  230:        } else if (be_isreal(vm, 1)) {
+    #####:  231:            be_pushint(vm, (bint)be_toreal(vm, 1));
+    #####:  232:        } else if (be_isint(vm, 1)) {
+    #####:  233:            be_pushvalue(vm, 1);
+        -:  234:        } else {
+    #####:  235:            be_return_nil(vm);
+        -:  236:        }
+    #####:  237:        be_return(vm);
+        -:  238:    }
+    #####:  239:    be_return_nil(vm);
+        -:  240:}
+        -:  241:
+    #####:  242:static int l_real(bvm *vm)
+        -:  243:{
+    #####:  244:    if (be_top(vm)) {
+    #####:  245:        if (be_isstring(vm, 1)) {
+    #####:  246:            const char *s = be_tostring(vm, 1);
+    #####:  247:            be_pushreal(vm, be_str2real(s, NULL));
+    #####:  248:        } else if (be_isint(vm, 1)) {
+    #####:  249:            be_pushreal(vm, (breal)be_toint(vm, 1));
+    #####:  250:        } else if (be_isreal(vm, 1)) {
+    #####:  251:            be_pushvalue(vm, 1);
+        -:  252:        } else {
+    #####:  253:            be_return_nil(vm);
+        -:  254:        }
+    #####:  255:        be_return(vm);
+        -:  256:    }
+    #####:  257:    be_return_nil(vm);
+        -:  258:}
+        -:  259:
+    #####:  260:static int check_method(bvm *vm, const char *attr)
+        -:  261:{
+    #####:  262:    return be_top(vm) &&
+    #####:  263:        be_isinstance(vm, 1) && be_getmethod(vm, 1, attr);
+        -:  264:}
+        -:  265:
+    #####:  266:static int l_iterator(bvm *vm)
+        -:  267:{
+    #####:  268:    if (be_top(vm) && be_isfunction(vm, 1)) {
+    #####:  269:        be_return(vm); /* return the argument[0]::function */
+        -:  270:    }
+    #####:  271:    if (check_method(vm, "iter")) {
+    #####:  272:        be_pushvalue(vm, 1);
+    #####:  273:        be_call(vm, 1);
+    #####:  274:        be_pop(vm, 1);
+    #####:  275:        be_return(vm);
+        -:  276:    }
+    #####:  277:    be_return_nil(vm);
+        -:  278:}
+        -:  279:
+        -:  280:/* call a function with variable number of arguments */
+        -:  281:/* first argument is a callable object (function, closure, native function, native closure) */
+        -:  282:/* then all subsequent arguments are pushed except the last one */
+        -:  283:/* If the last argument is a 'list', then all elements are pushed as arguments */
+        -:  284:/* otherwise the last argument is pushed as well */
+    #####:  285:static int l_call(bvm *vm)
+        -:  286:{
+    #####:  287:    int top = be_top(vm);
+    #####:  288:    if (top >= 1 && be_isfunction(vm, 1)) {
+    #####:  289:        size_t arg_count = top - 1;  /* we have at least 'top - 1' arguments */
+        -:  290:        /* test if last argument is a list */
+        -:  291:
+    #####:  292:        if (top > 1 && be_isinstance(vm, top) && be_getmember(vm, top, ".p") && be_islist(vm, top + 1)) {
+    #####:  293:            int32_t list_size = be_data_size(vm, top + 1);
+        -:  294:
+    #####:  295:            if (list_size > 0) {
+    #####:  296:                be_stack_require(vm, list_size + 3);   /* make sure we don't overflow the stack */
+    #####:  297:                for (int i = 0; i < list_size; i++) {
+    #####:  298:                    be_pushnil(vm);
+        -:  299:                }
+    #####:  300:                be_moveto(vm, top + 1, top + 1 + list_size);
+    #####:  301:                be_moveto(vm, top, top + list_size);
+        -:  302:
+    #####:  303:                be_refpush(vm, -2);
+    #####:  304:                be_pushiter(vm, -1);
+    #####:  305:                while (be_iter_hasnext(vm, -2)) {
+    #####:  306:                    be_iter_next(vm, -2);
+    #####:  307:                    be_moveto(vm, -1, top);
+    #####:  308:                    top++;
+    #####:  309:                    be_pop(vm, 1);
+        -:  310:                }
+    #####:  311:                be_pop(vm, 1);  /* remove iterator */
+    #####:  312:                be_refpop(vm);
+        -:  313:            }
+    #####:  314:            be_pop(vm, 2);
+    #####:  315:            arg_count = arg_count - 1 + list_size;
+        -:  316:        }
+        -:  317:        /* actual call */
+    #####:  318:        be_call(vm, arg_count);
+        -:  319:        /* remove args */
+    #####:  320:        be_pop(vm, arg_count);
+        -:  321:        /* return value */
+        -:  322:
+    #####:  323:        be_return(vm);
+        -:  324:    }
+    #####:  325:    be_raise(vm, "value_error", "first argument must be a function");
+    #####:  326:    be_return_nil(vm);
+        -:  327:}
+        -:  328:
+    #####:  329:static int l_str(bvm *vm)
+        -:  330:{
+    #####:  331:    if (be_top(vm)) {
+    #####:  332:        be_tostring(vm, 1);
+        -:  333:    } else {
+    #####:  334:        be_pushstring(vm, "");
+        -:  335:    }
+    #####:  336:    be_return(vm);
+        -:  337:}
+        -:  338:
+    #####:  339:static int l_size(bvm *vm)
+        -:  340:{
+    #####:  341:    if (be_top(vm) && be_isstring(vm, 1)) {
+    #####:  342:        be_pushint(vm, be_strlen(vm, 1));
+    #####:  343:        be_return(vm);
+        -:  344:    }
+    #####:  345:    if (check_method(vm, "size")) {
+    #####:  346:        be_pushvalue(vm, 1);
+    #####:  347:        be_call(vm, 1);
+    #####:  348:        be_pop(vm, 1);
+    #####:  349:        be_return(vm);
+        -:  350:    }
+    #####:  351:    be_return_nil(vm);
+        -:  352:}
+        -:  353:
+    #####:  354:static int l_module(bvm *vm)
+        -:  355:{
+    #####:  356:    int argc = be_top(vm);
+    #####:  357:    be_newmodule(vm);
+    #####:  358:    if (argc > 0 && be_isstring(vm, 1)) {
+    #####:  359:        be_setname(vm, -1, be_tostring(vm, 1));
+        -:  360:    }
+    #####:  361:    be_return(vm);
+        -:  362:}
+        -:  363:
+        -:  364:#if BE_USE_SCRIPT_COMPILER
+    #####:  365:static int raise_compile_error(bvm *vm)
+        -:  366:{
+    #####:  367:    be_pop(vm, 2); /* pop the exception value and message */
+    #####:  368:    be_throw(vm, BE_EXCEPTION);
+    #####:  369:    return 0;
+        -:  370:}
+        -:  371:
+    #####:  372:static int m_compile_str(bvm *vm)
+        -:  373:{
+    #####:  374:    int len = be_strlen(vm, 1);
+    #####:  375:    const char *src = be_tostring(vm, 1);
+    #####:  376:    int res = be_loadbuffer(vm, "string", src, len);
+    #####:  377:    if (res == BE_OK) {
+    #####:  378:        be_return(vm);
+        -:  379:    }
+    #####:  380:    return raise_compile_error(vm);
+        -:  381:}
+        -:  382:
+    #####:  383:static int m_compile_file(bvm *vm)
+        -:  384:{
+    #####:  385:    const char *fname = be_tostring(vm, 1);
+    #####:  386:    int res = be_loadfile(vm, fname);
+    #####:  387:    if (res == BE_OK) {
+    #####:  388:        be_return(vm);
+    #####:  389:    } else if (res == BE_IO_ERROR) {
+    #####:  390:        be_pushstring(vm, "io_error");
+    #####:  391:        be_pushvalue(vm, -2);
+        -:  392:    }
+    #####:  393:    return raise_compile_error(vm);
+        -:  394:}
+        -:  395:#endif
+        -:  396:
+    #####:  397:static int l_compile(bvm *vm)
+        -:  398:{
+        -:  399:#if BE_USE_SCRIPT_COMPILER
+    #####:  400:    if (be_top(vm) && be_isstring(vm, 1)) {
+    #####:  401:        if (be_top(vm) >= 2 && be_isstring(vm, 2)) {
+    #####:  402:            const char *s = be_tostring(vm, 2);
+    #####:  403:            if (!strcmp(s, "string")) {
+    #####:  404:                return m_compile_str(vm);
+        -:  405:            }
+    #####:  406:            if (!strcmp(s, "file")) {
+    #####:  407:                return m_compile_file(vm);
+        -:  408:            }
+        -:  409:        } else {
+    #####:  410:            return m_compile_str(vm);
+        -:  411:        }
+        -:  412:    }
+        -:  413:#endif
+    #####:  414:    be_return_nil(vm);
+        -:  415:}
+        -:  416:
+    #####:  417:static int _issubv(bvm *vm, bbool (*filter)(bvm*, int))
+        -:  418:{
+    #####:  419:    bbool status = bfalse;
+    #####:  420:    if (be_top(vm) >= 2 && filter(vm, 1)) {
+    #####:  421:        be_pushvalue(vm, 2);
+    #####:  422:        status = be_isderived(vm, 1);
+        -:  423:    }
+    #####:  424:    be_pushbool(vm, status);
+    #####:  425:    be_return(vm);
+        -:  426:}
+        -:  427:
+    #####:  428:static int l_issubclass(bvm *vm)
+        -:  429:{
+    #####:  430:    return _issubv(vm, be_isclass);
+        -:  431:}
+        -:  432:
+    #####:  433:static int l_isinstance(bvm *vm)
+        -:  434:{
+    #####:  435:    return _issubv(vm, be_isinstance);
+        -:  436:}
+        -:  437:
+        -:  438:#if !BE_USE_PRECOMPILED_OBJECT
+        -:  439:void be_load_baselib(bvm *vm)
+        -:  440:{
+        -:  441:    be_regfunc(vm, "assert", l_assert);
+        -:  442:    be_regfunc(vm, "print", l_print);
+        -:  443:    be_regfunc(vm, "input", l_input);
+        -:  444:    be_regfunc(vm, "super", l_super);
+        -:  445:    be_regfunc(vm, "type", l_type);
+        -:  446:    be_regfunc(vm, "classname", l_classname);
+        -:  447:    be_regfunc(vm, "classof", l_classof);
+        -:  448:    be_regfunc(vm, "number", l_number);
+        -:  449:    be_regfunc(vm, "str", l_str);
+        -:  450:    be_regfunc(vm, "int", l_int);
+        -:  451:    be_regfunc(vm, "real", l_real);
+        -:  452:    be_regfunc(vm, "module", l_module);
+        -:  453:    be_regfunc(vm, "size", l_size);
+        -:  454:    be_regfunc(vm, "compile", l_compile);
+        -:  455:    be_regfunc(vm, "issubclass", l_issubclass);
+        -:  456:    be_regfunc(vm, "isinstance", l_isinstance);
+        -:  457:    be_regfunc(vm, "__iterator__", l_iterator);
+        -:  458:}
+        -:  459:
+        -:  460:/* call must be added later to respect order of builtins */
+        -:  461:void be_load_baselib_call(bvm *vm)
+        -:  462:{
+        -:  463:    be_regfunc(vm, "call", l_call);
+        -:  464:}
+        -:  465:#else
+        -:  466:extern const bclass be_class_list;
+        -:  467:extern const bclass be_class_map;
+        -:  468:extern const bclass be_class_range;
+        -:  469:extern const bclass be_class_bytes;
+        -:  470:extern int be_nfunc_open(bvm *vm);
+        -:  471:/* @const_object_info_begin
+        -:  472:vartab m_builtin (scope: local) {
+        -:  473:    assert, func(l_assert)
+        -:  474:    print, func(l_print)
+        -:  475:    input, func(l_input)
+        -:  476:    super, func(l_super)
+        -:  477:    type, func(l_type)
+        -:  478:    classname, func(l_classname)
+        -:  479:    classof, func(l_classof)
+        -:  480:    number, func(l_number)
+        -:  481:    str, func(l_str)
+        -:  482:    int, func(l_int)
+        -:  483:    real, func(l_real)
+        -:  484:    module, func(l_module)
+        -:  485:    size, func(l_size)
+        -:  486:    compile, func(l_compile)
+        -:  487:    issubclass, func(l_issubclass)
+        -:  488:    isinstance, func(l_isinstance)
+        -:  489:    __iterator__, func(l_iterator)
+        -:  490:    open, func(be_nfunc_open)
+        -:  491:    list, class(be_class_list)
+        -:  492:    map, class(be_class_map)
+        -:  493:    range, class(be_class_range)
+        -:  494:    bytes, class(be_class_bytes)
+        -:  495:    call, func(l_call)
+        -:  496:}
+        -:  497:@const_object_info_end */
+        -:  498:#include "../generate/be_fixed_m_builtin.h"
+        -:  499:#include "be_var.h"
+        -:  500:
+        1:  501:void be_load_baselib(bvm *vm)
+        -:  502:{
+        1:  503:    be_const_builtin_set(vm, &m_builtin_map, &m_builtin_vector);
+        1:  504:}
+        -:  505:#endif

@@ -1,0 +1,792 @@
+        -:    0:Source:src/be_strlib.c
+        -:    0:Graph:./src/be_strlib.gcno
+        -:    0:Data:./src/be_strlib.gcda
+        -:    0:Runs:1
+        -:    1:/********************************************************************
+        -:    2:** Copyright (c) 2018-2020 Guan Wenliang
+        -:    3:** This file is part of the Berry default interpreter.
+        -:    4:** skiars@qq.com, https://github.com/Skiars/berry
+        -:    5:** See Copyright Notice in the LICENSE file or at
+        -:    6:** https://github.com/Skiars/berry/blob/master/LICENSE
+        -:    7:********************************************************************/
+        -:    8:#include "be_strlib.h"
+        -:    9:#include "be_string.h"
+        -:   10:#include "be_vm.h"
+        -:   11:#include "be_class.h"
+        -:   12:#include "be_module.h"
+        -:   13:#include "be_exec.h"
+        -:   14:#include "be_mem.h"
+        -:   15:#include <string.h>
+        -:   16:#include <stdio.h>
+        -:   17:#include <ctype.h>
+        -:   18:
+        -:   19:#define is_space(c)     ((c) == ' ' || (c) == '\t' || (c) == '\r' || (c) == '\n')
+        -:   20:#define is_digit(c)     ((c) >= '0' && (c) <= '9')
+        -:   21:#define skip_space(s)   while (is_space(*(s))) { ++(s); }
+        -:   22:
+        -:   23:typedef bint (*str_opfunc)(const char*, const char*, bint, bint);
+        -:   24:
+    #####:   25:bstring* be_strcat(bvm *vm, bstring *s1, bstring *s2)
+        -:   26:{
+    #####:   27:    size_t len = (size_t)str_len(s1) + str_len(s2);
+    #####:   28:    if (len <= SHORT_STR_MAX_LEN) {
+        -:   29:        char buf[SHORT_STR_MAX_LEN + 1];
+    #####:   30:        strcpy(buf, str(s1));
+    #####:   31:        strncat(buf, str(s2), len);
+    #####:   32:        return be_newstrn(vm, buf, len);
+        -:   33:    } else { /* long string */
+    #####:   34:        bstring *s = be_newstrn(vm, NULL, len);
+    #####:   35:        char *sbuf = (char*)str(s);
+    #####:   36:        strcpy(sbuf, str(s1));
+    #####:   37:        strcpy(sbuf + str_len(s1), str(s2));
+    #####:   38:        return s;
+        -:   39:    }
+        -:   40:}
+        -:   41:
+    #####:   42:int be_strcmp(bstring *s1, bstring *s2)
+        -:   43:{
+    #####:   44:    if (be_eqstr(s1, s2)) {
+    #####:   45:        return 0;
+        -:   46:    }
+    #####:   47:    return strcmp(str(s1), str(s2));
+        -:   48:}
+        -:   49:
+    #####:   50:bstring* be_num2str(bvm *vm, bvalue *v)
+        -:   51:{
+        -:   52:    char buf[25];
+    #####:   53:    if (var_isint(v)) {
+    #####:   54:        sprintf(buf, BE_INT_FORMAT, var_toint(v));
+    #####:   55:    } else if (var_isreal(v)) {
+    #####:   56:        sprintf(buf, "%g", var_toreal(v));
+        -:   57:    } else {
+    #####:   58:        sprintf(buf, "(nan)");
+        -:   59:    }
+    #####:   60:    return be_newstr(vm, buf);
+        -:   61:}
+        -:   62:
+    #####:   63:static void module2str(char *buf, bvalue *v)
+        -:   64:{
+    #####:   65:    const char *name = be_module_name(cast(bmodule*, var_toobj(v)));
+    #####:   66:    if (name) {
+    #####:   67:        sprintf(buf, "<module: %s>", name);
+        -:   68:    } else {
+    #####:   69:        sprintf(buf, "<module: %p>", var_toobj(v));
+        -:   70:    }
+    #####:   71:}
+        -:   72:
+    #####:   73:static bstring* sim2str(bvm *vm, bvalue *v)
+        -:   74:{
+        -:   75:    char sbuf[64]; /* BUG: memory overflow */
+    #####:   76:    switch (var_type(v)) {
+    #####:   77:    case BE_NIL:
+    #####:   78:        strcpy(sbuf, "nil");
+    #####:   79:        break;
+    #####:   80:    case BE_BOOL:
+    #####:   81:        strcpy(sbuf, var_tobool(v) ? "true" : "false");
+    #####:   82:        break;
+    #####:   83:    case BE_INDEX:
+        -:   84:    case BE_INT:
+    #####:   85:        sprintf(sbuf, BE_INT_FORMAT, var_toint(v));
+    #####:   86:        break;
+    #####:   87:    case BE_REAL:
+    #####:   88:        sprintf(sbuf, "%g", var_toreal(v));
+    #####:   89:        break;
+    #####:   90:    case BE_CLOSURE: case BE_NTVCLOS: case BE_NTVFUNC:
+    #####:   91:        sprintf(sbuf, "<function: %p>", var_toobj(v));
+    #####:   92:        break;
+    #####:   93:    case BE_CLASS:
+    #####:   94:        sprintf(sbuf, "<class: %s>",
+    #####:   95:            str(be_class_name(cast(bclass*, var_toobj(v)))));
+    #####:   96:        break;
+    #####:   97:    case BE_MODULE:
+    #####:   98:        module2str(sbuf, v);
+    #####:   99:        break;
+    #####:  100:    default:
+    #####:  101:        strcpy(sbuf, "(unknow value)");
+    #####:  102:        break;
+        -:  103:    }
+    #####:  104:    return be_newstr(vm, sbuf);
+        -:  105:}
+        -:  106:
+    #####:  107:static bstring* ins2str(bvm *vm, int idx)
+        -:  108:{
+    #####:  109:    bstring *s = str_literal(vm, "tostring");
+    #####:  110:    binstance *obj = var_toobj(vm->reg + idx);
+        -:  111:    /* get method 'tostring' */
+    #####:  112:    int type = be_instance_member(vm, obj, s, vm->top);
+    #####:  113:    be_incrtop(vm); /* push the obj::tostring to stack */
+    #####:  114:    if (basetype(type) != BE_FUNCTION) {
+    #####:  115:        bstring *name = be_class_name(be_instance_class(obj));
+    #####:  116:        char *sbuf = be_malloc(vm, (size_t)str_len(name) + 16);
+    #####:  117:        sprintf(sbuf, "<instance: %s()>", str(name));
+    #####:  118:        be_stackpop(vm, 1); /* pop the obj::tostring */
+    #####:  119:        s = be_newstr(vm, sbuf);
+    #####:  120:        be_free(vm, sbuf, (size_t)str_len(name) + 16);
+        -:  121:    } else {
+    #####:  122:        *vm->top = vm->reg[idx];
+    #####:  123:        be_dofunc(vm, vm->top - 1, 1);
+    #####:  124:        be_stackpop(vm, 1); /* pop the obj::tostring */
+    #####:  125:        if (!var_isstr(vm->top)) { /* check the return value */
+    #####:  126:            const char *name = str(be_instance_name(obj));
+    #####:  127:            be_raise(vm, "runtime_error", be_pushfstring(vm,
+        -:  128:                "the value of `%s::tostring()` is not a 'string'",
+    #####:  129:                strlen(name) ? name : "<anonymous>"));
+        -:  130:        }
+    #####:  131:        s = var_tostr(vm->top);
+        -:  132:    }
+    #####:  133:    return s;
+        -:  134:}
+        -:  135:
+    #####:  136:void be_val2str(bvm *vm, int index)
+        -:  137:{
+        -:  138:    bstring *s;
+    #####:  139:    int idx = be_absindex(vm, index) - 1;
+    #####:  140:    bvalue *v = vm->reg + idx;
+    #####:  141:    if (var_isstr(v)) return; /* do nothing */
+    #####:  142:    s = var_isinstance(v) ? ins2str(vm, idx) : sim2str(vm, v);
+    #####:  143:    v = vm->reg + idx; /* the stack may change */
+    #####:  144:    var_setstr(v, s);
+        -:  145:}
+        -:  146:
+    #####:  147:static void pushstr(bvm *vm, const char *s, size_t len)
+        -:  148:{
+        -:  149:    /* to create a string and then update the top pointer,
+        -:  150:     * otherwise the GC may crash due to uninitialized values.
+        -:  151:     **/
+    #####:  152:    bstring *str = be_newstrn(vm, s, len);
+    #####:  153:    bvalue *reg = be_incrtop(vm);
+    #####:  154:    var_setstr(reg, str);
+    #####:  155:}
+        -:  156:
+    #####:  157:static const char* concat2(bvm *vm)
+        -:  158:{
+    #####:  159:    bvalue *dst = vm->top - 2;
+    #####:  160:    bstring *s1 = var_tostr(dst);
+    #####:  161:    bstring *s2 = var_tostr(dst + 1);
+    #####:  162:    bstring *s = be_strcat(vm, s1, s2);
+        -:  163:    be_assert(var_isstr(vm->top - 2) && var_isstr(vm->top - 1));
+    #####:  164:    dst = vm->top - 2; /* the stack may change */
+    #####:  165:    var_setstr(dst, s);
+    #####:  166:    --vm->top;
+    #####:  167:    return str(s);
+        -:  168:}
+        -:  169:
+    #####:  170:const char* be_pushvfstr(bvm *vm, const char *format, va_list arg)
+        -:  171:{
+    #####:  172:    pushstr(vm, "", 0);
+    #####:  173:    for (;;) {
+    #####:  174:        const char *p = strchr(format, '%');
+    #####:  175:        if (p == NULL) {
+    #####:  176:            break;
+        -:  177:        }
+    #####:  178:        pushstr(vm, format, p - format);
+    #####:  179:        concat2(vm);
+    #####:  180:        switch (p[1]) {
+    #####:  181:        case 's': {
+    #####:  182:            const char *s = va_arg(arg, char*);
+    #####:  183:            if (s == NULL) {
+    #####:  184:                s = "(null)";
+        -:  185:            }
+    #####:  186:            pushstr(vm, s, strlen(s));
+    #####:  187:            break;
+        -:  188:        }
+    #####:  189:        case 'd': {
+        -:  190:            bstring *s;
+    #####:  191:            bvalue *v = be_incrtop(vm);
+    #####:  192:            var_setint(v, va_arg(arg, int));
+    #####:  193:            s = be_num2str(vm, v);
+    #####:  194:            var_setstr(v, s);
+    #####:  195:            break;
+        -:  196:        }
+    #####:  197:        case 'f': case 'g': {
+        -:  198:            bstring *s;
+    #####:  199:            bvalue *v = be_incrtop(vm);
+    #####:  200:            var_setreal(v, cast(breal, va_arg(arg, double)));
+    #####:  201:            s = be_num2str(vm, v);
+    #####:  202:            var_setstr(v, s);
+    #####:  203:            break;
+        -:  204:        }
+    #####:  205:        case 'c': {
+    #####:  206:            char c = cast(char, va_arg(arg, int));
+    #####:  207:            pushstr(vm, &c, 1);
+    #####:  208:            break;
+        -:  209:        }
+    #####:  210:        case '%': {
+    #####:  211:            pushstr(vm, "%", 1);
+    #####:  212:            break;
+        -:  213:        }
+    #####:  214:        case 'p': {
+        -:  215:            char buf[2 * sizeof(void*) + 4];
+    #####:  216:            sprintf(buf, "%p", va_arg(arg, void*));
+    #####:  217:            pushstr(vm, buf, strlen(buf));
+    #####:  218:            break;
+        -:  219:        }
+    #####:  220:        default:
+    #####:  221:            pushstr(vm, "(unknow)", 8);
+    #####:  222:            break;
+        -:  223:        }
+    #####:  224:        concat2(vm);
+    #####:  225:        format = p + 2;
+        -:  226:    }
+    #####:  227:    pushstr(vm, format, strlen(format));
+    #####:  228:    return concat2(vm);
+        -:  229:}
+        -:  230:
+        -:  231:/*******************************************************************
+        -:  232: * the function be_str2int():
+        -:  233: * >>-+------------+--+-----+----digits----><
+        -:  234: *    '-whitespace-'  +- + -+
+        -:  235: *                    '- - -'
+        -:  236: *******************************************************************/
+       17:  237:BERRY_API bint be_str2int(const char *str, const char **endstr)
+        -:  238:{
+        -:  239:    int c, sign;
+       17:  240:    bint sum = 0;
+      17*:  241:    skip_space(str);
+       17:  242:    sign = c = *str++;
+       17:  243:    if (c == '+' || c == '-') {
+    #####:  244:        c = *str++;
+        -:  245:    }
+       51:  246:    while (is_digit(c)) {
+       34:  247:        sum = sum * 10 + c - '0';
+       34:  248:        c = *str++;
+        -:  249:    }
+       17:  250:    if (endstr) {
+    #####:  251:        *endstr = str - 1;
+        -:  252:    }
+      17*:  253:    return sign == '-' ? -sum : sum;
+        -:  254:}
+        -:  255:
+        -:  256:/*******************************************************************
+        -:  257: * the function be_str2real():
+        -:  258: * >>-+------------+--+-----+--+-digits--+---+--+--------+-+------->
+        -:  259: *    '-whitespace-'  +- + -+  |         '-.-'  '-digits-' |   
+        -:  260: *                    '- - -'  '-.--digits-----------------'   
+        -:  261: * 
+        -:  262: * >--+------------------------+----------------------------------><
+        -:  263: *    '-+-e-+--+-----+--digits-'   
+        -:  264: *      '-E-'  +- + -+             
+        -:  265: *             '- - -'  
+        -:  266: *******************************************************************/
+    #####:  267:BERRY_API breal be_str2real(const char *str, const char **endstr)
+        -:  268:{
+        -:  269:    int c, sign;
+    #####:  270:    breal sum = 0, deci = 0, point = (breal)0.1;
+    #####:  271:    skip_space(str);
+    #####:  272:    sign = c = *str++;
+    #####:  273:    if (c == '+' || c == '-') {
+    #####:  274:        c = *str++;
+        -:  275:    }
+    #####:  276:    while (is_digit(c)) {
+    #####:  277:        sum = sum * 10 + c - '0';
+    #####:  278:        c = *str++;
+        -:  279:    }
+    #####:  280:    if (c == '.') {
+    #####:  281:        c = *str++;
+    #####:  282:        while (is_digit(c)) {
+    #####:  283:            deci = deci + ((breal)c - '0') * point;
+    #####:  284:            point *= (breal)0.1;
+    #####:  285:            c = *str++;
+        -:  286:        }
+        -:  287:    }
+    #####:  288:    sum = sum + deci;
+    #####:  289:    if (c == 'e' || c == 'E') {
+    #####:  290:        int e = 0;
+    #####:  291:        breal ratio = (c = *str++) == '-' ? (breal)0.1 : 10;
+    #####:  292:        if (c == '+' || c == '-') {
+    #####:  293:            c = *str++;
+        -:  294:        }
+    #####:  295:        while (is_digit(c)) {
+    #####:  296:            e = e * 10 + c - '0';
+    #####:  297:            c = *str++;
+        -:  298:        }
+    #####:  299:        while (e--) {
+    #####:  300:            sum *= ratio;
+        -:  301:        }
+        -:  302:    }
+    #####:  303:    if (endstr) {
+    #####:  304:        *endstr = str - 1;
+        -:  305:    }
+    #####:  306:    return sign == '-' ? -sum : sum;
+        -:  307:}
+        -:  308:
+        -:  309:/* convert a string to a number (integer or real).
+        -:  310: * 1. skip \s*[\+\-]?\d*
+        -:  311: * 2. matched [.eE]? yes: real, no: integer.
+        -:  312: **/
+    #####:  313:BERRY_API const char *be_str2num(bvm *vm, const char *str)
+        -:  314:{
+        -:  315:    const char *sout; 
+    #####:  316:    bint c, vint = be_str2int(str, &sout);
+    #####:  317:    c = *sout;
+    #####:  318:    if (c == '.' || c == 'e' || c == 'E') {
+    #####:  319:        be_pushreal(vm, be_str2real(str, &sout));
+        -:  320:    } else {
+    #####:  321:        be_pushint(vm, vint);
+        -:  322:    }
+    #####:  323:    return sout;
+        -:  324:}
+        -:  325:
+        -:  326:/* string subscript operation */
+    #####:  327:bstring* be_strindex(bvm *vm, bstring *str, bvalue *idx)
+        -:  328:{
+    #####:  329:    if (var_isint(idx)) {
+    #####:  330:        int pos = var_toidx(idx);
+    #####:  331:        if (pos < str_len(str)) {
+    #####:  332:            return be_newstrn(vm, str(str) + pos, 1);
+        -:  333:        }
+    #####:  334:        be_raise(vm, "index_error", "string index out of range");
+        -:  335:    }
+    #####:  336:    be_raise(vm, "index_error", "string indices must be integers");
+    #####:  337:    return NULL;
+        -:  338:}
+        -:  339:
+    #####:  340:size_t be_strlcpy(char *dst, const char *src, size_t maxlen)
+        -:  341:{
+    #####:  342:    const size_t srclen = strlen(src);
+    #####:  343:    if (srclen + 1 < maxlen) {
+    #####:  344:        memcpy(dst, src, srclen + 1);
+    #####:  345:    } else if (maxlen != 0) {
+    #####:  346:        memcpy(dst, src, maxlen - 1);
+    #####:  347:        dst[maxlen-1] = '\0';
+        -:  348:    }
+    #####:  349:    return srclen;
+        -:  350:}
+        -:  351:
+    #####:  352:const char* be_splitpath(const char *path)
+        -:  353:{
+        -:  354:    const char *p;
+    #####:  355:    for (p = path - 1; *path != '\0'; ++path) {
+    #####:  356:        if (*path == '/') {
+    #####:  357:            p = path;
+        -:  358:        }
+        -:  359:    }
+    #####:  360:    return p + 1; /* return the file name pointer */
+        -:  361:}
+        -:  362:
+    #####:  363:const char* be_splitname(const char *path)
+        -:  364:{
+    #####:  365:    const char *p, *q, *end = path + strlen(path);
+    #####:  366:    for (p = end; *p != '.' && p > path; --p); /* skip [^\.] */
+    #####:  367:    for (q = p; *q == '.' && q > path; --q); /* skip \. */
+    #####:  368:    if ((q == path && *q == '.') || *q == '/') {
+    #####:  369:        return end;
+        -:  370:    }
+    #####:  371:    return p;
+        -:  372:}
+        -:  373:
+    #####:  374:static unsigned escape_length(const char *s, int quote)
+        -:  375:{
+    #####:  376:    unsigned c, len = 0, step = quote == '"' ? 5 : 3;
+    #####:  377:    for (; (c = *s) != '\0'; ++s) {
+    #####:  378:        switch (c) {
+    #####:  379:        case '\\': case '\n': case '\r': case '\t':
+    #####:  380:            len += 1;
+    #####:  381:            break;
+    #####:  382:        default:
+    #####:  383:            if (c < 0x20)
+    #####:  384:                len += step;
+    #####:  385:            else if (c == (unsigned)quote)
+    #####:  386:                len += 1;
+    #####:  387:            break;
+        -:  388:        }
+        -:  389:    }
+    #####:  390:    return len;
+        -:  391:}
+        -:  392:
+    #####:  393:static unsigned eschex(unsigned num)
+        -:  394:{
+    #####:  395:    return num <= 9 ? '0' + num : 'a' + num - 10;
+        -:  396:}
+        -:  397:
+        -:  398:/* escape as Berry or JSON */
+    #####:  399:static char* escape(char *q, unsigned c, int quote)
+        -:  400:{
+    #####:  401:    int json = quote == '"';
+    #####:  402:    switch (c) {
+    #####:  403:    case '\\': *q++ = '\\'; *q = '\\'; break;
+    #####:  404:    case '\n': *q++ = '\\'; *q = 'n'; break;
+    #####:  405:    case '\r': *q++ = '\\'; *q = 'r'; break;
+    #####:  406:    case '\t': *q++ = '\\'; *q = 't'; break;
+    #####:  407:    default:
+    #####:  408:        if (c < 0x20) { /* other characters are escaped using '\uxxxx' */
+    #####:  409:            *q++ = '\\';
+    #####:  410:            if (json) {
+    #####:  411:                *q++ = 'u'; *q++ = '0'; *q++ = '0';
+    #####:  412:                *q++ = (char)eschex(c >> 4);
+    #####:  413:                *q = (char)eschex(c & 0x0f);
+        -:  414:            } else {
+    #####:  415:                *q++ = 'x';
+    #####:  416:                *q++ = (char)eschex(c >> 4);
+    #####:  417:                *q = (char)eschex(c & 0x0f);
+        -:  418:            }
+        -:  419:        } else { /* quotes and unescaped characters */
+    #####:  420:            if (c == (unsigned)quote)
+    #####:  421:                *q++ = '\\';
+    #####:  422:            *q = (char)c;
+        -:  423:        }
+    #####:  424:        break;
+        -:  425:    }
+    #####:  426:    return q;
+        -:  427:}
+        -:  428:
+    #####:  429:static void toescape(bvm *vm, int index, int quote)
+        -:  430:{
+        -:  431:    char *buf, *q;
+    #####:  432:    const char *p, *s = be_tostring(vm, index);
+    #####:  433:    size_t len = (size_t)be_strlen(vm, index);
+    #####:  434:    len += escape_length(s, quote) + 2; /* escape length + quote mark */
+    #####:  435:    buf = q = be_pushbuffer(vm, len);
+    #####:  436:    *q++ = (char)quote; /* add first quote */
+        -:  437:    /* generate escape string */
+    #####:  438:    for (p = s; *p != '\0'; ++p, ++q) {
+    #####:  439:        q = escape(q, *p, quote);
+        -:  440:    }
+    #####:  441:    *q = (char)quote; /* add last quote */
+    #####:  442:    be_pushnstring(vm, buf, len); /* make escape string from buffer */
+    #####:  443:    be_moveto(vm, -1, index);
+    #####:  444:    be_pop(vm, 2); /* remove buffer & top string */
+    #####:  445:}
+        -:  446:
+    #####:  447:BERRY_API const char* be_toescape(bvm *vm, int index, int mode)
+        -:  448:{
+    #####:  449:    if (be_isstring(vm, index)) {
+    #####:  450:        index = be_absindex(vm, index);
+    #####:  451:        toescape(vm, index, mode == 'u' ? '"' : '\'');
+        -:  452:    }
+    #####:  453:    return be_tostring(vm, index);
+        -:  454:}
+        -:  455:
+        -:  456:#if BE_USE_STRING_MODULE
+        -:  457:
+        -:  458:#define MAX_FORMAT_MODE     32
+        -:  459:#define FLAGES              "+- #0"
+        -:  460:
+    #####:  461:static const char* skip2dig(const char *s)
+        -:  462:{
+    #####:  463:    if (is_digit(*s)) {
+    #####:  464:        ++s;
+        -:  465:    }
+    #####:  466:    if (is_digit(*s)) {
+    #####:  467:        ++s;
+        -:  468:    }
+    #####:  469:    return s;
+        -:  470:}
+        -:  471:
+    #####:  472:static const char* get_mode(const char *str, char *buf)
+        -:  473:{
+    #####:  474:    const char *p = str;
+    #####:  475:    while (*p && strchr(FLAGES, *p)) { /* skip flags */
+    #####:  476:        ++p;
+        -:  477:    }
+    #####:  478:    p = skip2dig(p); /* skip width (2 digits at most) */
+    #####:  479:    if (*p == '.') {
+    #####:  480:        p = skip2dig(++p); /* skip width (2 digits at most) */
+        -:  481:    }
+    #####:  482:    *(buf++) = '%';
+    #####:  483:    strncpy(buf, str, p - str + 1);
+    #####:  484:    buf[p - str + 1] = '\0';
+    #####:  485:    return p;
+        -:  486:}
+        -:  487:
+    #####:  488:static void mode_fixlen(char *mode, const char *lenmode)
+        -:  489:{
+    #####:  490:    size_t l = strlen(mode), lm = strlen(lenmode);
+    #####:  491:    char spec = mode[l - 1];
+    #####:  492:    strcpy(mode + l - 1, lenmode);
+    #####:  493:    mode[l + lm - 1] = spec;
+    #####:  494:    mode[l + lm] = '\0';
+    #####:  495:}
+        -:  496:
+    #####:  497:static int str_format(bvm *vm)
+        -:  498:{
+    #####:  499:    int top = be_top(vm);
+    #####:  500:    if (top > 0 && be_isstring(vm, 1)) {
+    #####:  501:        int index = 2;
+    #####:  502:        const char *format = be_tostring(vm, 1);
+    #####:  503:        pushstr(vm, "", 0);
+    #####:  504:        for (;;) {
+        -:  505:            char mode[MAX_FORMAT_MODE];
+        -:  506:            char buf[128];
+    #####:  507:            const char *p = strchr(format, '%');
+    #####:  508:            if (p == NULL) {
+    #####:  509:                break;
+        -:  510:            }
+    #####:  511:            pushstr(vm, format, p - format);
+    #####:  512:            concat2(vm);
+    #####:  513:            p = get_mode(p + 1, mode);
+    #####:  514:            buf[0] = '\0';
+    #####:  515:            if (index > top && *p != '%') {
+    #####:  516:                be_raise(vm, "runtime_error", be_pushfstring(vm,
+        -:  517:                    "bad argument #%d to 'format': no value", index));
+        -:  518:            }
+    #####:  519:            switch (*p) {
+    #####:  520:            case '%':
+    #####:  521:                be_pushstring(vm, "%");
+    #####:  522:                --index;  /* compensate the future ++index */
+    #####:  523:                break;
+    #####:  524:            case 'd': case 'i': case 'o':
+        -:  525:            case 'u': case 'x': case 'X':
+    #####:  526:                if (be_isint(vm, index)) {
+    #####:  527:                    mode_fixlen(mode, BE_INT_FMTLEN);
+    #####:  528:                    sprintf(buf, mode, be_toint(vm, index));
+        -:  529:                }
+    #####:  530:                be_pushstring(vm, buf);
+    #####:  531:                break;
+    #####:  532:            case 'e': case 'E':
+        -:  533:            case 'f': case 'g': case 'G':
+    #####:  534:                if (be_isnumber(vm, index)) {
+    #####:  535:                    sprintf(buf, mode, be_toreal(vm, index));
+        -:  536:                }
+    #####:  537:                be_pushstring(vm, buf);
+    #####:  538:                break;
+    #####:  539:            case 'c':
+    #####:  540:                if (be_isint(vm, index)) {
+    #####:  541:                    sprintf(buf, "%c", (int)be_toint(vm, index));
+        -:  542:                }
+    #####:  543:                be_pushstring(vm, buf);
+    #####:  544:                break;
+    #####:  545:            case 's': {
+    #####:  546:                const char *s = be_tostring(vm, index);
+    #####:  547:                int len = be_strlen(vm, 2);
+    #####:  548:                if (len > 100 && strlen(mode) == 2) {
+    #####:  549:                    be_pushvalue(vm, index);
+        -:  550:                } else {
+    #####:  551:                    sprintf(buf, mode, s);
+    #####:  552:                    be_pushstring(vm, buf);
+        -:  553:                }
+    #####:  554:                break;
+        -:  555:            }
+    #####:  556:            default: /* error */
+    #####:  557:                be_raise(vm, "runtime_error", be_pushfstring(vm,
+    #####:  558:                    "invalid option '%%%c' to 'format'", *p));
+    #####:  559:                break;
+        -:  560:            }
+    #####:  561:            concat2(vm);
+    #####:  562:            format = p + 1;
+    #####:  563:            ++index;
+        -:  564:        }
+    #####:  565:        pushstr(vm, format, strlen(format));
+    #####:  566:        concat2(vm);
+    #####:  567:        be_return(vm);
+        -:  568:    }
+    #####:  569:    be_return_nil(vm);
+        -:  570:}
+        -:  571:
+        -:  572:/* string.op(s1, s2, begin=0, end=length(s2)) */
+    #####:  573:static bint str_operation(bvm *vm, str_opfunc func, bint error)
+        -:  574:{
+    #####:  575:    int top = be_top(vm);
+        -:  576:    /* check the number and type of arguments */
+    #####:  577:    if (top >= 2 && be_isstring(vm, 1) && be_isstring(vm, 2)) {
+        -:  578:        /* get the operation string and its length */
+    #####:  579:        int len1 = be_strlen(vm, 1);
+    #####:  580:        int len2 = be_strlen(vm, 2);
+    #####:  581:        const char *s1 = be_tostring(vm, 1);
+    #####:  582:        const char *s2 = be_tostring(vm, 2);
+        -:  583:        /* get begin and end indexes (may use default values) */
+    #####:  584:        bint begin = top >= 3 && be_isint(vm, 3) ? be_toint(vm, 3) : 0;
+    #####:  585:        bint end = top >= 4 && be_isint(vm, 4) ? be_toint(vm, 4) : len1;
+        -:  586:        /* basic range check:
+        -:  587:         * 1. begin position must be greater than 0 and
+        -:  588:         *    less than the length of the source string.
+        -:  589:         * 2. the length of the pattern string cannot be
+        -:  590:         *    less than the matching range (end - begin).
+        -:  591:         **/
+    #####:  592:        if (begin >= 0 && begin <= len1 && end - begin >= len2) {
+        -:  593:            /* call the operation function */
+    #####:  594:            return func(s1, s2, begin, end - len2);
+        -:  595:        }
+        -:  596:    }
+    #####:  597:    return error; /* returns the default error value */
+        -:  598:}
+        -:  599:
+    #####:  600:static bint _sfind(const char *s1, const char *s2, bint begin, bint end)
+        -:  601:{
+    #####:  602:    const char *res = strstr(s1 + begin, s2);
+    #####:  603:    if (res) {
+    #####:  604:        bint pos = (bint)(res - s1);
+    #####:  605:        return pos <= end ? pos : -1;
+        -:  606:    }
+    #####:  607:    return -1;
+        -:  608:}
+        -:  609:
+    #####:  610:static int str_find(bvm *vm)
+        -:  611:{
+    #####:  612:    be_pushint(vm, str_operation(vm, _sfind, -1));
+    #####:  613:    be_return(vm);
+        -:  614:}
+        -:  615:
+    #####:  616:static bint _scount(const char *s1, const char *s2, bint begin, bint end)
+        -:  617:{
+    #####:  618:    bint count = 0;
+    #####:  619:    const char *res = s1 + begin, *send = s1 + end;
+    #####:  620:    while ((res = strstr(res, s2)) != NULL && res <= send) {
+    #####:  621:        count += 1;
+    #####:  622:        res += 1;
+        -:  623:    }
+    #####:  624:    return count;
+        -:  625:}
+        -:  626:
+    #####:  627:static int str_count(bvm *vm)
+        -:  628:{
+    #####:  629:    be_pushint(vm, str_operation(vm, _scount, 0));
+    #####:  630:    be_return(vm);
+        -:  631:}
+        -:  632:
+    #####:  633:static bbool _split_string(bvm *vm, int top)
+        -:  634:{
+    #####:  635:    if (be_isstring(vm, 2)) {
+        -:  636:        const char *res;
+    #####:  637:        int len1 = be_strlen(vm, 1);
+    #####:  638:        int len2 = be_strlen(vm, 2);
+    #####:  639:        const char *s1 = be_tostring(vm, 1);
+    #####:  640:        const char *s2 = be_tostring(vm, 2);
+    #####:  641:        bint count = len2 /* match when the pattern string is not empty */
+    #####:  642:            ? top >= 3 && be_isint(vm, 3) ? be_toint(vm, 3) : len1
+    #####:  643:            : 0; /* cannot match empty pattern string */
+    #####:  644:        while (count-- && (res = strstr(s1, s2)) != NULL) {
+    #####:  645:            be_pushnstring(vm, s1, res - s1);
+    #####:  646:            be_data_push(vm, -2);
+    #####:  647:            be_pop(vm, 1);
+    #####:  648:            s1 = res + len2;
+        -:  649:        }
+    #####:  650:        be_pushstring(vm, s1);
+    #####:  651:        be_data_push(vm, -2);
+    #####:  652:        be_pop(vm, 1);
+    #####:  653:        return btrue;
+        -:  654:    }
+    #####:  655:    return bfalse;
+        -:  656:}
+        -:  657:
+    #####:  658:static bbool _split_index(bvm *vm)
+        -:  659:{
+    #####:  660:    if (be_isint(vm, 2)) {
+    #####:  661:        int len = be_strlen(vm, 1), idx = be_toindex(vm, 2);
+    #####:  662:        const char *s = be_tostring(vm, 1);
+    #####:  663:        idx = idx > len ? len : idx < -len ? -len : idx;
+    #####:  664:        if (idx < 0) {
+    #####:  665:            idx += len;
+        -:  666:        }
+    #####:  667:        be_pushnstring(vm, s, idx);
+    #####:  668:        be_data_push(vm, -2);
+    #####:  669:        be_pop(vm, 1);
+    #####:  670:        be_pushnstring(vm, s + idx, (size_t)len - idx);
+    #####:  671:        be_data_push(vm, -2);
+    #####:  672:        be_pop(vm, 1);
+    #####:  673:        return btrue;
+        -:  674:    }
+    #####:  675:    return bfalse;
+        -:  676:}
+        -:  677:
+    #####:  678:static int str_split(bvm *vm)
+        -:  679:{
+    #####:  680:    int top = be_top(vm);
+    #####:  681:    be_newobject(vm, "list");
+    #####:  682:    if (top >= 2 && be_isstring(vm, 1)) {
+    #####:  683:        if (!_split_index(vm))
+    #####:  684:            _split_string(vm, top);
+        -:  685:    }
+    #####:  686:    be_pop(vm, 1);
+    #####:  687:    be_return(vm);
+        -:  688:}
+        -:  689:
+    #####:  690:static int str_i2hex(bvm *vm)
+        -:  691:{
+    #####:  692:    int top = be_top(vm);
+    #####:  693:    if (top && be_isint(vm, 1)) {
+    #####:  694:        bint value = be_toint(vm, 1);
+    #####:  695:        char fmt[10] = { "%" BE_INT_FMTLEN "X" }, buf[18];
+    #####:  696:        if (top >= 2 && be_isint(vm, 2)) {
+    #####:  697:            bint num = be_toint(vm, 2);
+    #####:  698:            if (num > 0 && num <= 16) {
+    #####:  699:                sprintf(fmt, "%%.%d" BE_INT_FMTLEN "X", (int)num);
+        -:  700:            }
+        -:  701:        }
+    #####:  702:        sprintf(buf, fmt, value);
+    #####:  703:        be_pushstring(vm, buf);
+    #####:  704:        be_return(vm);
+        -:  705:    }
+    #####:  706:    be_return_nil(vm);
+        -:  707:}
+        -:  708:
+    #####:  709:static int str_byte(bvm *vm)
+        -:  710:{
+    #####:  711:    if (be_top(vm) && be_isstring(vm, 1)) {
+    #####:  712:        const bbyte *s = (const bbyte *)be_tostring(vm, 1);
+    #####:  713:        be_pushint(vm, *s);
+    #####:  714:        be_return(vm);
+        -:  715:    }
+    #####:  716:    be_return_nil(vm);
+        -:  717:}
+        -:  718:
+    #####:  719:static int str_char(bvm *vm)
+        -:  720:{
+    #####:  721:    if (be_top(vm) && be_isint(vm, 1)) {
+    #####:  722:        char c = be_toint(vm, 1) & 0xFF;
+    #####:  723:        be_pushnstring(vm, &c, 1);
+    #####:  724:        be_return(vm);
+        -:  725:    }
+    #####:  726:    be_return_nil(vm);
+        -:  727:}
+        -:  728:
+        -:  729:// boolean to select whether we call toupper() or tolower()
+    #####:  730:static int str_touplower(bvm *vm, bbool up)
+        -:  731:{
+    #####:  732:    if (be_top(vm) && be_isstring(vm, 1)) {
+    #####:  733:        const char *p, *s = be_tostring(vm, 1);
+    #####:  734:        size_t len = (size_t)be_strlen(vm, 1);
+        -:  735:        char *buf, *q;
+    #####:  736:        buf = q = be_pushbuffer(vm, len);
+        -:  737:        /* convert to lower case */
+    #####:  738:        for (p = s; *p != '\0'; ++p, ++q) {
+    #####:  739:            *q = up ? toupper(*p) : tolower(*p);
+        -:  740:        }
+    #####:  741:        be_pushnstring(vm, buf, len); /* make escape string from buffer */
+    #####:  742:        be_remove(vm, 2); /* remove buffer */
+    #####:  743:        be_return(vm);
+        -:  744:    }
+    #####:  745:    be_return_nil(vm);
+        -:  746:}
+        -:  747:
+    #####:  748:static int str_tolower(bvm *vm) {
+    #####:  749:    return str_touplower(vm, bfalse);
+        -:  750:}
+        -:  751:
+    #####:  752:static int str_toupper(bvm *vm) {
+    #####:  753:    return str_touplower(vm, btrue);
+        -:  754:}
+        -:  755:
+        -:  756:
+        -:  757:#if !BE_USE_PRECOMPILED_OBJECT
+        -:  758:be_native_module_attr_table(string) {
+        -:  759:    be_native_module_function("format", str_format),
+        -:  760:    be_native_module_function("count", str_count),
+        -:  761:    be_native_module_function("split", str_split),
+        -:  762:    be_native_module_function("find", str_find),
+        -:  763:    be_native_module_function("hex", str_i2hex),
+        -:  764:    be_native_module_function("byte", str_byte),
+        -:  765:    be_native_module_function("char", str_char),
+        -:  766:    be_native_module_function("tolower", str_tolower),
+        -:  767:    be_native_module_function("toupper", str_toupper),
+        -:  768:};
+        -:  769:
+        -:  770:be_define_native_module(string, NULL);
+        -:  771:#else
+        -:  772:/* @const_object_info_begin
+        -:  773:module string (scope: global, depend: BE_USE_STRING_MODULE) {
+        -:  774:    format, func(str_format)
+        -:  775:    count, func(str_count)
+        -:  776:    split, func(str_split)
+        -:  777:    find, func(str_find)
+        -:  778:    hex, func(str_i2hex)
+        -:  779:    byte, func(str_byte)
+        -:  780:    char, func(str_char)
+        -:  781:    tolower, func(str_tolower)
+        -:  782:    toupper, func(str_toupper)
+        -:  783:}
+        -:  784:@const_object_info_end */
+        -:  785:#include "../generate/be_fixed_string.h"
+        -:  786:#endif
+        -:  787:
+        -:  788:#endif /* BE_USE_STRING_MODULE */
