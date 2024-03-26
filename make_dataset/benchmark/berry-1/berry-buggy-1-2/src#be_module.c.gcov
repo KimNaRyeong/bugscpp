@@ -1,0 +1,459 @@
+        -:    0:Source:src/be_module.c
+        -:    0:Graph:./src/be_module.gcno
+        -:    0:Data:./src/be_module.gcda
+        -:    0:Runs:1
+        -:    1:/********************************************************************
+        -:    2:** Copyright (c) 2018-2020 Guan Wenliang
+        -:    3:** This file is part of the Berry default interpreter.
+        -:    4:** skiars@qq.com, https://github.com/Skiars/berry
+        -:    5:** See Copyright Notice in the LICENSE file or at
+        -:    6:** https://github.com/Skiars/berry/blob/master/LICENSE
+        -:    7:********************************************************************/
+        -:    8:#include "be_module.h"
+        -:    9:#include "be_string.h"
+        -:   10:#include "be_strlib.h"
+        -:   11:#include "be_list.h"
+        -:   12:#include "be_exec.h"
+        -:   13:#include "be_map.h"
+        -:   14:#include "be_gc.h"
+        -:   15:#include "be_mem.h"
+        -:   16:#include "be_vm.h"
+        -:   17:#include <string.h>
+        -:   18:
+        -:   19:/* the maximum suffix length */
+        -:   20:#define SUFFIX_LEN      5 /* length of (.be .bec .so .dll) + 1 */
+        -:   21:
+        -:   22:/* check POSIX platforms */
+        -:   23:#if defined(__linux__) || \
+        -:   24:    defined(__APPLE__) || defined(__unix__) || defined(__CYGWIN__)
+        -:   25:  #define __POSIX_OS__
+        -:   26:#endif
+        -:   27:
+        -:   28:#if BE_USE_SHARED_LIB
+        -:   29:  #if defined(__POSIX_OS__)
+        -:   30:    #define DLL_SUFFIX ".so"
+        -:   31:  #elif defined(_WIN32)
+        -:   32:    #define DLL_SUFFIX ".dll"
+        -:   33:  #else
+        -:   34:    #define DLL_SUFFIX ""
+        -:   35:    #warning module: unsuppord OS
+        -:   36:  #endif
+        -:   37:#endif
+        -:   38:
+        -:   39:extern BERRY_LOCAL const bntvmodule* const be_module_table[];
+        -:   40:
+        -:   41:static bmodule* native_module(bvm *vm, const bntvmodule *nm, bvalue *dst);
+        -:   42:
+    #####:   43:static const bntvmodule* find_native(bstring *path)
+        -:   44:{
+        -:   45:    const bntvmodule *module;
+    #####:   46:    const bntvmodule* const *node = be_module_table;
+    #####:   47:    for (; (module = *node) != NULL; ++node) {
+    #####:   48:        if (!strcmp(module->name, str(path))) {
+    #####:   49:            return module;
+        -:   50:        }
+        -:   51:    }
+    #####:   52:    return NULL;
+        -:   53:}
+        -:   54:
+    #####:   55:static void insert_attrs(bvm *vm, bmap *table, const bntvmodule *nm)
+        -:   56:{
+        -:   57:    size_t i;
+    #####:   58:    for (i = 0; i < nm->size; ++i) {
+    #####:   59:        const bntvmodobj *node = nm->attrs + i;
+    #####:   60:        bstring *name = be_newstr(vm, node->name);
+    #####:   61:        bvalue *v = be_map_insertstr(vm, table, name, NULL);
+        -:   62:        be_assert(node->type <= BE_CMODULE);
+    #####:   63:        switch (node->type) {
+    #####:   64:        case BE_CNIL:
+    #####:   65:            var_setnil(v);
+    #####:   66:            break;
+    #####:   67:        case BE_CINT:
+    #####:   68:            var_setint(v, node->u.i);
+    #####:   69:            break;
+    #####:   70:        case BE_CREAL:
+    #####:   71:            var_setreal(v, node->u.r);
+    #####:   72:            break;
+    #####:   73:        case BE_CBOOL:
+    #####:   74:            var_setbool(v, node->u.b);
+    #####:   75:            break;
+    #####:   76:        case BE_CFUNCTION:
+    #####:   77:            var_setntvfunc(v, node->u.f);
+    #####:   78:            break;
+    #####:   79:        case BE_CSTRING:
+    #####:   80:            var_setstr(v, be_newstr(vm, node->u.s));
+    #####:   81:            break;
+    #####:   82:        case BE_CMODULE:
+    #####:   83:            native_module(vm, node->u.o, v);
+    #####:   84:            break;
+    #####:   85:        default: /* error */
+    #####:   86:            break;
+        -:   87:        }
+        -:   88:    }
+    #####:   89:}
+        -:   90:
+    #####:   91:static bmodule* new_module(bvm *vm, const bntvmodule *nm)
+        -:   92:{
+    #####:   93:    bgcobject *gco = be_gcnew(vm, BE_MODULE, bmodule);
+    #####:   94:    bmodule *obj = cast_module(gco);
+    #####:   95:    if (obj) {
+    #####:   96:        var_setmodule(vm->top, obj);
+    #####:   97:        be_incrtop(vm);
+    #####:   98:        obj->info.native = nm;
+    #####:   99:        obj->table = NULL; /* gc protection */
+    #####:  100:        obj->table = be_map_new(vm);
+    #####:  101:        insert_attrs(vm, obj->table, nm);
+    #####:  102:        be_map_release(vm, obj->table); /* clear space */
+    #####:  103:        be_stackpop(vm, 1);
+        -:  104:    }
+    #####:  105:    return obj;
+        -:  106:}
+        -:  107:
+    #####:  108:static bmodule* native_module(bvm *vm, const bntvmodule *nm, bvalue *dst)
+        -:  109:{
+    #####:  110:    if (nm) {
+        -:  111:        bmodule *obj;
+    #####:  112:        if (nm->module) {
+    #####:  113:            obj = (bmodule *)nm->module;
+        -:  114:        } else { /* new module */
+    #####:  115:            obj = new_module(vm, nm);
+        -:  116:        }
+    #####:  117:        if (obj && dst) {
+    #####:  118:            var_setmodule(dst, obj);
+        -:  119:        }
+    #####:  120:        return obj;
+        -:  121:    }
+    #####:  122:    return NULL;
+        -:  123:}
+        -:  124:
+    #####:  125:static char* fixpath(bvm *vm, bstring *path, size_t *size)
+        -:  126:{
+        -:  127:    char *buffer;
+        -:  128:    const char *split, *base;
+    #####:  129:    bvalue *func = vm->cf->func;
+    #####:  130:    bclosure *cl = var_toobj(func);
+        -:  131:    be_assert(var_isclosure(func));
+    #####:  132:    base = str(cl->proto->source); /* get the source file path */
+    #####:  133:    split = be_splitpath(base);
+    #####:  134:    *size = split - base + (size_t)str_len(path) + SUFFIX_LEN;
+    #####:  135:    buffer = be_malloc(vm, *size);
+    #####:  136:    strncpy(buffer, base, split - base);
+    #####:  137:    strcpy(buffer + (split - base), str(path));
+    #####:  138:    return buffer;
+        -:  139:}
+        -:  140:
+    #####:  141:static char* conpath(bvm *vm, bstring *path1, bstring *path2, size_t *size)
+        -:  142:{
+        -:  143:    char *buffer;
+    #####:  144:    int len1 = str_len(path1);
+    #####:  145:    *size = (size_t)len1 + (size_t)str_len(path2) + 1 + SUFFIX_LEN;
+    #####:  146:    buffer = be_malloc(vm, *size);
+    #####:  147:    strcpy(buffer, str(path1));
+    #####:  148:    buffer[len1] = '/';
+    #####:  149:    strcpy(buffer + len1 + 1, str(path2));
+    #####:  150:    return buffer;
+        -:  151:}
+        -:  152:
+    #####:  153:static int open_script(bvm *vm, char *path)
+        -:  154:{
+    #####:  155:    int res = be_loadmodule(vm, path);
+    #####:  156:    if (res == BE_OK)
+    #####:  157:        be_call(vm, 0);
+    #####:  158:    return res;
+        -:  159:}
+        -:  160:
+        -:  161:#if BE_USE_SHARED_LIB
+    #####:  162:static int open_dllib(bvm *vm, char *path)
+        -:  163:{
+    #####:  164:    int res = be_loadlib(vm, path);
+    #####:  165:    if (res == BE_OK)
+    #####:  166:        be_call(vm, 0);
+    #####:  167:    return res;
+        -:  168:}
+        -:  169:#endif
+        -:  170:
+    #####:  171:static int open_libfile(bvm *vm, char *path, size_t size)
+        -:  172:{
+    #####:  173:    int res, idx = 0;
+    #####:  174:    const char *sfxs[] = { "", ".bec", ".be" };
+        -:  175:    do {
+    #####:  176:        strcpy(path + size - SUFFIX_LEN, sfxs[idx]);
+    #####:  177:        res = open_script(vm, path);
+    #####:  178:    } while (idx++ < 2 && res == BE_IO_ERROR);
+    #####:  179:    if (res == BE_IO_ERROR) {
+        -:  180:#if BE_USE_SHARED_LIB
+    #####:  181:        strcpy(path + size - SUFFIX_LEN, DLL_SUFFIX);
+    #####:  182:        res = open_dllib(vm, path);
+        -:  183:#endif
+        -:  184:    }
+    #####:  185:    be_free(vm, path, size);
+    #####:  186:    return res;
+        -:  187:}
+        -:  188:
+    #####:  189:static int load_path(bvm *vm, bstring *path, bstring *mod)
+        -:  190:{
+        -:  191:    size_t size;
+    #####:  192:    char *fullpath = conpath(vm, path, mod, &size);
+    #####:  193:    return open_libfile(vm, fullpath, size);
+        -:  194:}
+        -:  195:
+    #####:  196:static int load_cwd(bvm *vm, bstring *path)
+        -:  197:{
+        -:  198:    size_t size;
+    #####:  199:    char *fullpath = fixpath(vm, path, &size);
+    #####:  200:    return open_libfile(vm, fullpath, size);
+        -:  201:}
+        -:  202:
+    #####:  203:static int load_package(bvm *vm, bstring *path)
+        -:  204:{
+    #####:  205:    int res = load_cwd(vm, path); /* load from current directory */
+    #####:  206:    if (res == BE_IO_ERROR && vm->module.path) {
+    #####:  207:        blist *list = vm->module.path;
+    #####:  208:        bvalue *v = be_list_end(list) - 1;
+    #####:  209:        bvalue *first = be_list_data(list);
+    #####:  210:        for (; res == BE_IO_ERROR && v >= first; v--) {
+    #####:  211:            if (var_isstr(v)) {
+    #####:  212:                res = load_path(vm, var_tostr(v), path);
+        -:  213:            }
+        -:  214:        }
+        -:  215:    }
+    #####:  216:    return res;
+        -:  217:}
+        -:  218:
+    #####:  219:static int load_native(bvm *vm, bstring *path)
+        -:  220:{
+    #####:  221:    const bntvmodule *nm = find_native(path);
+    #####:  222:    bmodule *mod = native_module(vm, nm, NULL);
+    #####:  223:    if (mod != NULL) {
+        -:  224:        /* the pointer vm->top may be changed */
+    #####:  225:        var_setmodule(vm->top, mod);
+    #####:  226:        be_incrtop(vm);
+    #####:  227:        return BE_OK;
+        -:  228:    }
+    #####:  229:    return BE_IO_ERROR;
+        -:  230:}
+        -:  231:
+    #####:  232:static bvalue* load_cached(bvm *vm, bstring *path)
+        -:  233:{
+    #####:  234:    bvalue *v = NULL;
+    #####:  235:    if (vm->module.loaded) {
+    #####:  236:        v = be_map_findstr(vm, vm->module.loaded, path);
+    #####:  237:        if (v) {
+    #####:  238:            *vm->top = *v;
+    #####:  239:            be_incrtop(vm);
+        -:  240:        }
+        -:  241:    }
+    #####:  242:    return v;
+        -:  243:}
+        -:  244:
+    #####:  245:static void cache_module(bvm *vm, bstring *name)
+        -:  246:{
+        -:  247:    bvalue *v;
+    #####:  248:    if (vm->module.loaded == NULL) {
+    #####:  249:        vm->module.loaded = be_map_new(vm);
+        -:  250:    }
+    #####:  251:    v = be_map_insertstr(vm, vm->module.loaded, name, NULL);
+    #####:  252:    *v = vm->top[-1];
+    #####:  253:}
+        -:  254:
+        -:  255:/* Try to run '()' function of module. Module is already loaded. */
+    #####:  256:static void module_init(bvm *vm) {
+    #####:  257:    if (be_getmember(vm, -1, "init")) {
+        -:  258:        /* found, call it with no parameter */
+    #####:  259:        be_call(vm, 0);
+        -:  260:        /* we don't care about the result */
+        -:  261:    }
+    #####:  262:    be_pop(vm, 1);
+    #####:  263:}
+        -:  264:
+        -:  265:/* load module to vm->top */
+    #####:  266:int be_module_load(bvm *vm, bstring *path)
+        -:  267:{
+    #####:  268:    int res = BE_OK;
+    #####:  269:    if (!load_cached(vm, path)) {
+    #####:  270:        res = load_native(vm, path);
+    #####:  271:        if (res == BE_IO_ERROR)
+    #####:  272:            res = load_package(vm, path);
+    #####:  273:        if (res == BE_OK) {
+    #####:  274:            cache_module(vm, path);
+        -:  275:            /* on first load of the module, try running the '()' function */
+    #####:  276:            module_init(vm);
+        -:  277:        }
+        -:  278:    }
+    #####:  279:    return res;
+        -:  280:}
+        -:  281:
+    #####:  282:bmodule* be_module_new(bvm *vm)
+        -:  283:{
+    #####:  284:    bgcobject *gco = be_gcnew(vm, BE_MODULE, bmodule);
+    #####:  285:    bmodule *obj = cast_module(gco);
+    #####:  286:    if (obj) {
+    #####:  287:        var_setmodule(vm->top, obj);
+    #####:  288:        be_incrtop(vm);
+    #####:  289:        obj->info.native = NULL;
+    #####:  290:        obj->table = NULL; /* gc protection */
+    #####:  291:        obj->table = be_map_new(vm);
+    #####:  292:        be_stackpop(vm, 1);
+        -:  293:    }
+    #####:  294:    return obj;
+        -:  295:}
+        -:  296:
+    #####:  297:void be_module_delete(bvm *vm, bmodule *module)
+        -:  298:{
+    #####:  299:    be_free(vm, module, sizeof(bmodule));
+    #####:  300:}
+        -:  301:
+    #####:  302:int be_module_attr(bvm *vm, bmodule *module, bstring *attr, bvalue *dst)
+        -:  303:{
+    #####:  304:    bvalue *member = be_map_findstr(vm, module->table, attr);
+    #####:  305:    if (!member) {  /* try the 'member' function */
+    #####:  306:        member = be_map_findstr(vm, module->table, str_literal(vm, "member"));
+    #####:  307:        if (member && var_basetype(member) == BE_FUNCTION) {
+    #####:  308:            bvalue *top = vm->top;
+    #####:  309:            top[0] = *member;
+    #####:  310:            var_setstr(&top[1], attr);
+    #####:  311:            vm->top += 2;   /* prevent collection results */
+    #####:  312:            be_dofunc(vm, top, 1); /* call method 'method' */
+    #####:  313:            vm->top -= 2;
+    #####:  314:            *dst = *vm->top;   /* copy result to R(A) */
+    #####:  315:            if (var_basetype(dst) != BE_NIL) {
+    #####:  316:                return var_type(dst);
+        -:  317:            }
+        -:  318:        }
+    #####:  319:        return BE_NONE;
+        -:  320:    } else {
+    #####:  321:        *dst = *member;
+    #####:  322:        return var_type(dst);
+        -:  323:    }
+        -:  324:}
+        -:  325:
+    #####:  326:bbool be_module_setmember(bvm *vm, bmodule *module, bstring *attr, bvalue *src)
+        -:  327:{
+    #####:  328:    assert(src);
+    #####:  329:    bmap *attrs = module->table;
+    #####:  330:    if (!gc_isconst(attrs)) {
+    #####:  331:        bvalue *v = be_map_findstr(vm, attrs, attr);
+    #####:  332:        if (v == NULL) {
+    #####:  333:            v = be_map_insertstr(vm, attrs, attr, NULL);
+        -:  334:        }
+    #####:  335:        if (v) {
+    #####:  336:            *v = *src;
+    #####:  337:            return btrue;
+        -:  338:        }
+        -:  339:    } else {
+        -:  340:        /* if not writable, try 'setmember' */
+    #####:  341:        int type = be_module_attr(vm, module, str_literal(vm, "setmember"), vm->top);
+    #####:  342:        if (type == BE_FUNCTION) {
+    #####:  343:            bvalue *top = vm->top;
+        -:  344:            // top[0] already has 'member'
+    #####:  345:            var_setstr(&top[1], attr);  /* attribute name */
+    #####:  346:            top[2] = *src;  /* new value */
+    #####:  347:            vm->top += 3;   /* prevent collection results */
+    #####:  348:            be_dofunc(vm, top, 2); /* call method 'setmember' */
+    #####:  349:            vm->top -= 3;
+    #####:  350:            return btrue;
+        -:  351:        }
+        -:  352:    }
+    #####:  353:    return bfalse;
+        -:  354:}
+        -:  355:
+    #####:  356:const char* be_module_name(bmodule *module)
+        -:  357:{
+    #####:  358:    if (gc_isconst(module)) {
+    #####:  359:        return module->info.name;
+        -:  360:    }
+    #####:  361:    if (gc_exmark(module) & BE_MODULE_NAME) {
+    #####:  362:        return str(module->info.sname);
+        -:  363:    }
+    #####:  364:    if (module->info.native) {
+    #####:  365:        return module->info.native->name;
+        -:  366:    }
+    #####:  367:    return NULL;
+        -:  368:}
+        -:  369:
+    #####:  370:bbool be_module_setname(bmodule *module, bstring *name)
+        -:  371:{
+    #####:  372:    if (!gc_isconst(module)) {
+    #####:  373:        module->info.sname = name;
+    #####:  374:        gc_setexmark(module, BE_MODULE_NAME);
+    #####:  375:        return btrue;
+        -:  376:    }
+    #####:  377:    return bfalse;
+        -:  378:}
+        -:  379:
+        1:  380:static blist* pathlist(bvm *vm)
+        -:  381:{
+        1:  382:    if (!vm->module.path) {
+        1:  383:        vm->module.path = be_list_new(vm);
+        -:  384:    }
+        1:  385:    return vm->module.path;
+        -:  386:}
+        -:  387:
+        -:  388:/* push the path list to the top */
+    #####:  389:BERRY_API void be_module_path(bvm *vm)
+        -:  390:{
+    #####:  391:    blist *list = pathlist(vm);
+    #####:  392:    bvalue *reg = be_incrtop(vm);
+    #####:  393:    var_setlist(reg, list);
+    #####:  394:}
+        -:  395:
+        1:  396:BERRY_API void be_module_path_set(bvm *vm, const char *path)
+        -:  397:{
+        1:  398:    blist *list = pathlist(vm);
+        1:  399:    bvalue *value = be_list_push(vm, list, NULL);
+        1:  400:    var_setnil(value);
+        1:  401:    var_setstr(value, be_newstr(vm, path))
+        1:  402:}
+        -:  403:
+        -:  404:/* shared library support */
+        -:  405:#if BE_USE_SHARED_LIB
+        -:  406:
+        -:  407:#if defined(__POSIX_OS__)
+        -:  408:#include <dlfcn.h>
+        -:  409:
+        -:  410:#if defined(__GNUC__)
+        -:  411:  #define cast_func(f) (__extension__(bntvfunc)(f))
+        -:  412:#else
+        -:  413:  #define cast_func(f) ((bntvfunc)(f))
+        -:  414:#endif
+        -:  415:
+        -:  416:/* load shared library */
+    #####:  417:BERRY_API int be_loadlib(bvm *vm, const char *path)
+        -:  418:{
+    #####:  419:    void *handle = dlopen(path, RTLD_LAZY);
+    #####:  420:    bntvfunc func = cast_func(dlsym(handle, "berry_export"));
+    #####:  421:    if (func == NULL) {
+    #####:  422:        return BE_IO_ERROR;
+        -:  423:    }
+    #####:  424:    be_pushntvfunction(vm, func);
+    #####:  425:    return BE_OK;
+        -:  426:}
+        -:  427:#elif defined(_WIN32)
+        -:  428:#include<wtypes.h>
+        -:  429:#include <winbase.h>
+        -:  430:
+        -:  431:BERRY_API int be_loadlib(bvm *vm, const char *path)
+        -:  432:{
+        -:  433:    HINSTANCE handle = LoadLibrary(path);
+        -:  434:    if (handle) {
+        -:  435:        union {
+        -:  436:            FARPROC proc;
+        -:  437:            bntvfunc func;
+        -:  438:        } u;
+        -:  439:        u.proc = GetProcAddress(handle, "berry_export");
+        -:  440:        if (u.func != NULL) {
+        -:  441:            be_pushntvfunction(vm, u.func);
+        -:  442:            return BE_OK;
+        -:  443:        }
+        -:  444:    }
+        -:  445:    return BE_IO_ERROR;
+        -:  446:}
+        -:  447:#else
+        -:  448:BERRY_API int be_loadlib(bvm *vm, const char *path)
+        -:  449:{
+        -:  450:    (void)vm, (void)path;
+        -:  451:    return BE_IO_ERROR;
+        -:  452:}
+        -:  453:#endif
+        -:  454:
+        -:  455:#endif /* BE_USE_SHARED_LIB */

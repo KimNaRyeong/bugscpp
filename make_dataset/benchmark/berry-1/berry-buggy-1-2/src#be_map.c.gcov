@@ -1,0 +1,354 @@
+        -:    0:Source:src/be_map.c
+        -:    0:Graph:./src/be_map.gcno
+        -:    0:Data:./src/be_map.gcda
+        -:    0:Runs:1
+        -:    1:/********************************************************************
+        -:    2:** Copyright (c) 2018-2020 Guan Wenliang
+        -:    3:** This file is part of the Berry default interpreter.
+        -:    4:** skiars@qq.com, https://github.com/Skiars/berry
+        -:    5:** See Copyright Notice in the LICENSE file or at
+        -:    6:** https://github.com/Skiars/berry/blob/master/LICENSE
+        -:    7:********************************************************************/
+        -:    8:#include "be_map.h"
+        -:    9:#include "be_string.h"
+        -:   10:#include "be_vector.h"
+        -:   11:#include "be_class.h"
+        -:   12:#include "be_mem.h"
+        -:   13:#include "be_gc.h"
+        -:   14:#include "be_vm.h"
+        -:   15:#include "be_exec.h"
+        -:   16:#include <string.h>
+        -:   17:
+        -:   18:#define key(node)           (&(node)->key)
+        -:   19:#define value(node)         (&(node)->value)
+        -:   20:#define isnil(node)         var_isnil(key(node))
+        -:   21:#define setnil(node)        var_setnil(key(node))
+        -:   22:#define hash2slot(m, h)     ((m)->slots + (h) % (m)->size)
+        -:   23:#define hashcode(_v)        _hashcode(vm, (_v)->type, (_v)->v)
+        -:   24:#define keytype(key)        ((signed char)(key)->type)
+        -:   25:
+        -:   26:#define next(node)          ((node)->key.next)
+        -:   27:#define pos2slot(map, n)    ((n) != LASTNODE ? ((map)->slots + (n)) : NULL)
+        -:   28:#define pos(map, node)      ((int)((node) - (map)->slots))
+        -:   29:#define setkey(node, _v)    { (node)->key.type = (bbyte)(_v)->type; \
+        -:   30:                              (node)->key.v = (_v)->v; }
+        -:   31:
+        -:   32:#define datasize(size)      ((size) * sizeof(bmapnode))
+        -:   33:
+        -:   34:#define LASTNODE            ((1 << 24) - 1)
+        -:   35:
+    #####:   36:static int map_nextsize(int size)
+        -:   37:{
+        -:   38:    be_assert(size < LASTNODE);
+    #####:   39:    if (size < LASTNODE) {
+    #####:   40:        return be_nextsize(size);
+        -:   41:    }
+    #####:   42:    return LASTNODE + 1;
+        -:   43:}
+        -:   44:
+    #####:   45:static uint32_t hashptr(void *p)
+        -:   46:{
+    #####:   47:    uintptr_t i = (uintptr_t)p;
+    #####:   48:    return (uint32_t)((i ^ (i >> 16)) & 0xFFFFFFFF);
+        -:   49:}
+        -:   50:
+        -:   51:#if BE_USE_SINGLE_FLOAT
+        -:   52:#define hashreal(v)     ((uint32_t)((v).i))
+        -:   53:#else
+    #####:   54:static uint32_t hashreal(union bvaldata v)
+        -:   55:{
+        -:   56:    union { breal r; uint32_t i[2]; } u;
+    #####:   57:    u.r = v.r;
+    #####:   58:    return u.i[0] ^ u.i[1];
+        -:   59:}
+        -:   60:#endif
+        -:   61:
+        -:   62:#if BE_USE_OVERLOAD_HASH
+    #####:   63:static uint32_t hashins(bvm *vm, binstance *obj)
+        -:   64:{
+    #####:   65:    int type = be_instance_member(vm, obj, str_literal(vm, "hash"), vm->top);
+    #####:   66:    if (basetype(type) == BE_FUNCTION) {
+    #####:   67:        bvalue *top = vm->top;
+    #####:   68:        var_setinstance(top + 1, obj);
+    #####:   69:        vm->top += 2;
+    #####:   70:        be_dofunc(vm, top, 1); /* call method 'item' */
+    #####:   71:        vm->top -= 2;
+    #####:   72:        if (!var_isint(vm->top)) { /* check the return value */
+    #####:   73:            const char *name = str(be_instance_name(obj));
+    #####:   74:            be_raise(vm, "runtime_error", be_pushfstring(vm,
+        -:   75:                "the value of `%s::hash()` is not a 'int'",
+    #####:   76:                strlen(name) ? name : "<anonymous>"));
+        -:   77:        }
+    #####:   78:        return (uint32_t)var_toint(vm->top);
+        -:   79:    }
+    #####:   80:    return hashptr(obj);
+        -:   81:}
+        -:   82:#endif
+        -:   83:
+      172:   84:static uint32_t _hashcode(bvm *vm, int type, union bvaldata v)
+        -:   85:{
+        -:   86:    (void)vm;
+      172:   87:    switch (type) {
+    #####:   88:    case BE_NIL: return 0;
+    #####:   89:    case BE_BOOL: return (uint32_t)v.b;
+    #####:   90:    case BE_INT: return (uint32_t)v.i;
+    #####:   91:    case BE_REAL: return hashreal(v);
+      172:   92:    case BE_STRING: return be_strhash(v.s);
+        -:   93:#if BE_USE_OVERLOAD_HASH
+    #####:   94:    case BE_INSTANCE: return hashins(vm, v.p);
+        -:   95:#endif
+    #####:   96:    default: return hashptr(v.p);
+        -:   97:    }
+        -:   98:}
+        -:   99:
+       89:  100:static int eqnode(bvm *vm, bmapnode *node, bvalue *key, uint32_t hash)
+        -:  101:{
+        -:  102:    (void)vm;
+       89:  103:    if (!var_isnil(key)) {
+       89:  104:        bmapkey *k = key(node);
+        -:  105:#if BE_USE_OVERLOAD_HASH
+       89:  106:        if (var_isinstance(key)) {
+        -:  107:            bvalue kv;
+    #####:  108:            kv.type = k->type;
+    #####:  109:            kv.v = k->v;
+    #####:  110:            return be_vm_iseq(vm, key, &kv);
+        -:  111:        }
+        -:  112:#endif
+       89:  113:        if(keytype(k) == key->type && hashcode(k) == hash) {
+       39:  114:            switch (key->type) {
+    #####:  115:            case BE_INT: return var_toint(key) == var_toint(k);
+    #####:  116:            case BE_REAL: return var_toreal(key) == var_toreal(k);
+       39:  117:            case BE_STRING: return be_eqstr(var_tostr(key), var_tostr(k));
+    #####:  118:            default: return var_toobj(key) == var_toobj(k);
+        -:  119:            }
+        -:  120:        }
+        -:  121:    }
+       50:  122:    return 0;
+        -:  123:}
+        -:  124:
+    #####:  125:static bmapnode* findprev(bmap *map, bmapnode *list, bmapnode *slot)
+        -:  126:{
+    #####:  127:    int n, pos = pos(map, slot);
+    #####:  128:    bmapnode *prev = list;
+        -:  129:    for (;;) {
+    #####:  130:        n = next(prev);
+    #####:  131:        if (n == pos || n == LASTNODE) {
+        -:  132:            break;
+        -:  133:        }
+    #####:  134:        prev = map->slots + n;
+        -:  135:    }
+    #####:  136:    return n == pos ? prev : NULL;
+        -:  137:}
+        -:  138:
+        2:  139:static bmapnode* nextfree(bmap *map)
+        -:  140:{
+        2:  141:    bmapnode *base = map->slots;
+        2:  142:    while (map->lastfree >= base) {
+        2:  143:        if (isnil(map->lastfree)) {
+        2:  144:            return map->lastfree;
+        -:  145:        }
+    #####:  146:        --map->lastfree;
+        -:  147:    }
+    #####:  148:    return NULL;
+        -:  149:}
+        -:  150:
+        6:  151:static bmapnode* insert(bvm *vm, bmap *map, bvalue *key, uint32_t hash)
+        -:  152:{
+        6:  153:    bmapnode *slot = hash2slot(map, hash);
+        6:  154:    if (isnil(slot)) { /* empty slot */
+        4:  155:        setkey(slot, key);
+        4:  156:        next(slot) = LASTNODE;
+        -:  157:    } else {
+        2:  158:        uint32_t h = hashcode(key(slot)); /* get the hashcode of the exist node */
+        2:  159:        bmapnode *mainslot = hash2slot(map, h); /* get the main-slot */
+        2:  160:        bmapnode *new = nextfree(map); /* get a free slot */
+        2:  161:        if (mainslot == slot) { /* old is main slot */
+        -:  162:            /* insert in first */
+        2:  163:            setkey(new, key);
+        2:  164:            next(new) = next(slot);
+        2:  165:            next(slot) = pos(map, new);
+        2:  166:            slot = new;
+        -:  167:        } else {
+    #####:  168:            bmapnode *prev = findprev(map, mainslot, slot);
+    #####:  169:            next(prev) = pos(map, new); /* link the previous node */
+    #####:  170:            *new = *slot; /* copy to new slot */
+    #####:  171:            setkey(slot, key);
+    #####:  172:            next(slot) = LASTNODE;
+        -:  173:        }
+        -:  174:    }
+        6:  175:    return slot;
+        -:  176:}
+        -:  177:
+       79:  178:static bmapnode* find(bvm *vm, bmap *map, bvalue *key, uint32_t hash)
+        -:  179:{
+       79:  180:    bmapnode *slot = hash2slot(map, hash);
+       79:  181:    if (isnil(slot)) {
+       19:  182:        return NULL;
+        -:  183:    }
+       89:  184:    while (!eqnode(vm, slot, key, hash)) {
+       50:  185:        int n = next(slot);
+       50:  186:        if (n == LASTNODE) {
+       21:  187:            return NULL;
+        -:  188:        }
+       29:  189:        slot = map->slots + n;
+        -:  190:    }
+       39:  191:    return slot;
+        -:  192:}
+        -:  193:
+        4:  194:static void resize(bvm *vm, bmap *map, int size)
+        -:  195:{
+        -:  196:    int i, oldsize;
+        -:  197:    bmapnode *slots, *oldslots;
+        4:  198:    if (size < map->count) {
+    #####:  199:        return;
+        -:  200:    }
+        4:  201:    oldsize = map->size;
+        4:  202:    oldslots = map->slots;
+        4:  203:    slots = be_malloc(vm, datasize(size));
+       12:  204:    for (i = 0; i < size; ++i) {
+        8:  205:        setnil(slots + i);
+        -:  206:    }
+        4:  207:    map->size = size;
+        4:  208:    map->slots = slots;
+        4:  209:    map->lastfree = slots + size - 1;
+        -:  210:    /* rehash */
+        6:  211:    for (i = 0; i < oldsize; ++i) {
+        2:  212:        bmapnode *node = oldslots + i;
+        2:  213:        if (!isnil(node)) {
+        -:  214:            bvalue v;
+        -:  215:            bmapnode *newslot;
+        2:  216:            v.type = node->key.type;
+        2:  217:            v.v = node->key.v;
+        2:  218:            newslot = insert(vm, map, &v, hashcode(&v));
+        2:  219:            newslot->value = node->value;
+        -:  220:        }
+        -:  221:    }
+        4:  222:    be_free(vm, oldslots, datasize(oldsize));
+        -:  223:}
+        -:  224:
+        3:  225:bmap* be_map_new(bvm *vm)
+        -:  226:{
+        3:  227:    bgcobject *gco = be_gcnew(vm, BE_MAP, bmap);
+       3*:  228:    bmap *map = cast_map(gco);
+        3:  229:    if (map) {
+        3:  230:        map->size = 0;
+        3:  231:        map->count = 0;
+        3:  232:        map->slots = NULL;
+        3:  233:        var_setmap(vm->top, map);
+        3:  234:        be_incrtop(vm);
+        3:  235:        resize(vm, map, 2);
+        3:  236:        be_stackpop(vm, 1);
+        -:  237:    }
+        3:  238:    return map;
+        -:  239:}
+        -:  240:
+        3:  241:void be_map_delete(bvm *vm, bmap *map)
+        -:  242:{
+        3:  243:    be_free(vm, map->slots, datasize(map->size));
+        3:  244:    be_free(vm, map, sizeof(bmap));
+        3:  245:}
+        -:  246:
+       75:  247:bvalue* be_map_find(bvm *vm, bmap *map, bvalue *key)
+        -:  248:{
+       75:  249:    bmapnode *entry = find(vm, map, key, hashcode(key));
+       75:  250:    return entry ? value(entry) : NULL;
+        -:  251:}
+        -:  252:
+        4:  253:bvalue* be_map_insert(bvm *vm, bmap *map, bvalue *key, bvalue *value)
+        -:  254:{
+        4:  255:    uint32_t hash = hashcode(key);
+        4:  256:    bmapnode *entry = find(vm, map, key, hash);
+        4:  257:    if (!entry) { /* new entry */
+        4:  258:        if (map->count >= map->size) {
+    #####:  259:            resize(vm, map, map_nextsize(map->size));
+        -:  260:        }
+        4:  261:        entry = insert(vm, map, key, hash);
+        4:  262:        ++map->count;
+        -:  263:    }
+        4:  264:    if (value) {
+    #####:  265:        entry->value = *value;
+        -:  266:    }
+        4:  267:    return value(entry);
+        -:  268:}
+        -:  269:
+    #####:  270:int be_map_remove(bvm *vm, bmap *map, bvalue *key)
+        -:  271:{
+    #####:  272:    uint32_t hash = hashcode(key);
+    #####:  273:    bmapnode *slot = hash2slot(map, hash); /* main slot */
+        -:  274:
+    #####:  275:    if (eqnode(vm, slot, key, hash)) { /* first node */
+    #####:  276:        bmapnode *next = pos2slot(map, next(slot));
+    #####:  277:        if (next) { /* has next */
+    #####:  278:            *slot = *next; /* first: copy the second node to the slot */
+    #####:  279:            slot = next; /* second: set the second node to nil (empty) */
+        -:  280:        }
+        -:  281:    } else { /* the node will be remove is not first-node */
+    #####:  282:        bmapnode *prev = slot;
+    #####:  283:        for (;;) { /* find the previous node */
+    #####:  284:            int n = next(prev);
+    #####:  285:            slot = pos2slot(map, n);
+    #####:  286:            if (slot == NULL) { /* node not found */
+    #####:  287:                return bfalse;
+        -:  288:            }
+    #####:  289:            if (eqnode(vm, slot, key, hash)) {
+    #####:  290:                break;
+        -:  291:            }
+    #####:  292:            prev = slot;
+        -:  293:        }
+        -:  294:        /* link the list */
+    #####:  295:        next(prev) = next(slot);
+        -:  296:    }
+        -:  297:    /* set to nil */
+    #####:  298:    setnil(slot);
+        -:  299:    /* add to lastfree */
+    #####:  300:    if (map->lastfree < slot) {
+    #####:  301:        map->lastfree = slot;
+        -:  302:    }
+    #####:  303:    --map->count;
+    #####:  304:    return btrue;
+        -:  305:}
+        -:  306:
+       75:  307:bvalue* be_map_findstr(bvm *vm, bmap *map, bstring *key)
+        -:  308:{
+        -:  309:    bvalue v;
+       75:  310:    var_setstr(&v, key);
+       75:  311:    return be_map_find(vm, map, &v);
+        -:  312:}
+        -:  313:
+        4:  314:bvalue* be_map_insertstr(bvm *vm, bmap *map, bstring *key, bvalue *value)
+        -:  315:{
+        -:  316:    bvalue v;
+        4:  317:    var_setstr(&v, key);
+        4:  318:    set_fixed(key);
+        4:  319:    bvalue * r = be_map_insert(vm, map, &v, value);
+        4:  320:    restore_fixed(key);
+        4:  321:    return r;
+        -:  322:}
+        -:  323:
+    #####:  324:void be_map_removestr(bvm *vm, bmap *map, bstring *key)
+        -:  325:{
+        -:  326:    bvalue v;
+    #####:  327:    var_setstr(&v, key);
+    #####:  328:    be_map_remove(vm, map, &v);
+    #####:  329:}
+        -:  330:
+        1:  331:bmapnode* be_map_next(bmap *map, bmapiter *iter)
+        -:  332:{
+        1:  333:    bmapnode *end = map->slots + map->size;
+       1*:  334:    *iter = *iter ? *iter + 1 : map->slots;
+        3:  335:    while (*iter < end && isnil(*iter)) {
+        2:  336:        ++(*iter);
+        -:  337:    }
+       1*:  338:    return *iter < end ? *iter : NULL;
+        -:  339:}
+        -:  340:
+       11:  341:bmapnode* be_map_val2node(bvalue *value)
+        -:  342:{
+       11:  343:    return (bmapnode *)((size_t)value - sizeof(bmapkey));
+        -:  344:}
+        -:  345:
+        1:  346:void be_map_release(bvm *vm, bmap *map)
+        -:  347:{
+        -:  348:    (void)vm;
+       1*:  349:    resize(vm, map, map->count ? map->count : 1);
+        1:  350:}

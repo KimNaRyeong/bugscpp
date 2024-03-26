@@ -1,0 +1,1173 @@
+        -:    0:Source:src/be_api.c
+        -:    0:Graph:./src/be_api.gcno
+        -:    0:Data:./src/be_api.gcda
+        -:    0:Runs:1
+        -:    1:/********************************************************************
+        -:    2:** Copyright (c) 2018-2020 Guan Wenliang
+        -:    3:** This file is part of the Berry default interpreter.
+        -:    4:** skiars@qq.com, https://github.com/Skiars/berry
+        -:    5:** See Copyright Notice in the LICENSE file or at
+        -:    6:** https://github.com/Skiars/berry/blob/master/LICENSE
+        -:    7:********************************************************************/
+        -:    8:#include "be_vm.h"
+        -:    9:#include "be_func.h"
+        -:   10:#include "be_class.h"
+        -:   11:#include "be_string.h"
+        -:   12:#include "be_vector.h"
+        -:   13:#include "be_var.h"
+        -:   14:#include "be_list.h"
+        -:   15:#include "be_map.h"
+        -:   16:#include "be_parser.h"
+        -:   17:#include "be_debug.h"
+        -:   18:#include "be_exec.h"
+        -:   19:#include "be_strlib.h"
+        -:   20:#include "be_module.h"
+        -:   21:#include "be_gc.h"
+        -:   22:#include <string.h>
+        -:   23:
+        -:   24:#define retreg(vm)      ((vm)->cf->func)
+        -:   25:
+        -:   26:struct solidfuncinfo {
+        -:   27:    const char *name;
+        -:   28:    bclosure *function;
+        -:   29:};
+        -:   30:
+    #####:   31:static void class_init(bvm *vm, bclass *c, const bnfuncinfo *lib)
+        -:   32:{
+    #####:   33:    if (lib) {
+    #####:   34:        while (lib->name) {
+    #####:   35:            bstring *s = be_newstr(vm, lib->name);
+    #####:   36:            if (lib->function) { /* method */
+    #####:   37:                be_prim_method_bind(vm, c, s, lib->function);
+        -:   38:            } else {
+    #####:   39:                be_member_bind(vm, c, s, btrue); /* member */
+        -:   40:            }
+    #####:   41:            ++lib;
+        -:   42:        }
+    #####:   43:        if (lib->function == (bntvfunc) BE_CLOSURE) {
+        -:   44:            /* next section is closures */
+    #####:   45:            struct solidfuncinfo *slib = (struct solidfuncinfo*)++lib;
+    #####:   46:            while (slib->name) {
+    #####:   47:                if (slib->function) { /* method */
+    #####:   48:                    bstring *s = be_newstr(vm, slib->name);
+    #####:   49:                    be_closure_method_bind(vm, c, s, slib->function);
+        -:   50:                }
+    #####:   51:                ++slib;
+        -:   52:            }
+        -:   53:        }
+    #####:   54:        be_map_release(vm, c->members); /* clear space */
+        -:   55:    }
+    #####:   56:}
+        -:   57:
+    #####:   58:static bclass* class_auto_make(bvm *vm, bstring *name, const bnfuncinfo *lib)
+        -:   59:{
+        -:   60:    bvalue key, *res;
+    #####:   61:    var_setobj(&key, BE_COMPTR, (void*)lib);
+    #####:   62:    if (vm->ntvclass == NULL) {
+    #####:   63:        vm->ntvclass = be_map_new(vm);
+        -:   64:    }
+    #####:   65:    res = be_map_find(vm, vm->ntvclass, &key);
+    #####:   66:    if (res == NULL || !var_isclass(res)) {
+        -:   67:        bclass *c;
+        -:   68:        /* insert class to native class table */
+    #####:   69:        res = be_map_insert(vm, vm->ntvclass, &key, NULL);
+    #####:   70:        var_setnil(res); /* must be initialized to ensure correct GC */
+    #####:   71:        c = be_newclass(vm, name, NULL);
+    #####:   72:        var_setclass(res, c);
+    #####:   73:        class_init(vm, c, lib); /* bind members */
+    #####:   74:        return c;
+        -:   75:    }
+    #####:   76:    return var_toobj(res);
+        -:   77:}
+        -:   78:
+    #####:   79:BERRY_API void be_regfunc(bvm *vm, const char *name, bntvfunc f)
+        -:   80:{
+        -:   81:    bvalue *var;
+    #####:   82:    bstring *s = be_newstr(vm, name);
+        -:   83:#if !BE_USE_PRECOMPILED_OBJECT
+        -:   84:    int idx = be_builtin_find(vm, s);
+        -:   85:    be_assert(idx == -1);
+        -:   86:    if (idx == -1) { /* new function */
+        -:   87:        idx = be_builtin_new(vm, s);
+        -:   88:#else
+    #####:   89:    int idx = be_global_find(vm, s);
+        -:   90:    be_assert(idx < be_builtin_count(vm));
+    #####:   91:    if (idx < be_builtin_count(vm)) { /* new function */
+    #####:   92:        idx = be_global_new(vm, s);
+        -:   93:#endif
+    #####:   94:        var = be_global_var(vm, idx);
+    #####:   95:        var_setntvfunc(var, f);
+        -:   96:    } /* error case, do nothing */
+    #####:   97:}
+        -:   98:
+    #####:   99:BERRY_API void be_regclass(bvm *vm, const char *name, const bnfuncinfo *lib)
+        -:  100:{
+        -:  101:    bvalue *var;
+    #####:  102:    bstring *s = be_newstr(vm, name);
+        -:  103:#if !BE_USE_PRECOMPILED_OBJECT
+        -:  104:    int idx = be_builtin_find(vm, s);
+        -:  105:    be_assert(idx == -1);
+        -:  106:    if (idx == -1) { /* new function */
+        -:  107:        idx = be_builtin_new(vm, s);
+        -:  108:#else
+    #####:  109:    int idx = be_global_find(vm, s);
+        -:  110:    be_assert(idx < be_builtin_count(vm));
+    #####:  111:    if (idx < be_builtin_count(vm)) { /* new function */
+    #####:  112:        idx = be_global_new(vm, s);
+        -:  113:#endif
+    #####:  114:        var = be_global_var(vm, idx);
+    #####:  115:        var_setclass(var, class_auto_make(vm, s, lib));
+        -:  116:    } /* error case, do nothing */
+    #####:  117:}
+        -:  118:
+       10:  119:BERRY_API int be_top(bvm *vm)
+        -:  120:{
+       10:  121:    return cast_int(vm->top - vm->reg);
+        -:  122:}
+        -:  123:
+        5:  124:BERRY_API void be_pop(bvm *vm, int n)
+        -:  125:{
+        -:  126:    be_assert(n <= vm->top - vm->reg);
+        5:  127:    be_stackpop(vm, n);
+        5:  128:}
+        -:  129:
+        2:  130:BERRY_API int be_absindex(bvm *vm, int index)
+        -:  131:{
+        2:  132:    if (index > 0) {
+    #####:  133:        return index;
+        -:  134:    }
+        -:  135:    be_assert(vm->reg <= vm->top + index);
+        2:  136:    return cast_int(vm->top + index - vm->reg + 1);
+        -:  137:}
+        -:  138:
+    #####:  139:BERRY_API bbool be_isnil(bvm *vm, int index)
+        -:  140:{
+    #####:  141:    bvalue *v = be_indexof(vm, index);
+    #####:  142:    return var_isnil(v);
+        -:  143:}
+        -:  144:
+    #####:  145:BERRY_API bbool be_isbool(bvm *vm, int index)
+        -:  146:{
+    #####:  147:    bvalue *v = be_indexof(vm, index);
+    #####:  148:    return var_isbool(v);
+        -:  149:}
+        -:  150:
+    #####:  151:BERRY_API bbool be_isint(bvm *vm, int index)
+        -:  152:{
+    #####:  153:    bvalue *v = be_indexof(vm, index);
+    #####:  154:    return var_isint(v);
+        -:  155:}
+        -:  156:
+    #####:  157:BERRY_API bbool be_isreal(bvm *vm, int index)
+        -:  158:{
+    #####:  159:    bvalue *v = be_indexof(vm, index);
+    #####:  160:    return var_isreal(v);
+        -:  161:}
+        -:  162:
+    #####:  163:BERRY_API bbool be_isnumber(bvm *vm, int index)
+        -:  164:{
+    #####:  165:    bvalue *v = be_indexof(vm, index);
+    #####:  166:    return var_isnumber(v);
+        -:  167:}
+        -:  168:
+    #####:  169:BERRY_API bbool be_isstring(bvm *vm, int index)
+        -:  170:{
+    #####:  171:    bvalue *v = be_indexof(vm, index);
+    #####:  172:    return var_isstr(v);
+        -:  173:}
+        -:  174:
+    #####:  175:BERRY_API bbool be_isclosure(bvm *vm, int index)
+        -:  176:{
+    #####:  177:    bvalue *v = be_indexof(vm, index);
+    #####:  178:    return var_isclosure(v);
+        -:  179:}
+        -:  180:
+    #####:  181:BERRY_API bbool be_isntvclos(bvm *vm, int index)
+        -:  182:{
+    #####:  183:    bvalue *v = be_indexof(vm, index);
+    #####:  184:    return var_isntvclos(v);
+        -:  185:}
+        -:  186:
+    #####:  187:BERRY_API bbool be_isfunction(bvm *vm, int index)
+        -:  188:{
+    #####:  189:    bvalue *v = be_indexof(vm, index);
+    #####:  190:    return var_isfunction(v);
+        -:  191:}
+        -:  192:
+    #####:  193:BERRY_API bbool be_isproto(bvm *vm, int index)
+        -:  194:{
+    #####:  195:    bvalue *v = be_indexof(vm, index);
+    #####:  196:    return var_isproto(v);
+        -:  197:}
+        -:  198:
+    #####:  199:BERRY_API bbool be_isclass(bvm *vm, int index)
+        -:  200:{
+    #####:  201:    bvalue *v = be_indexof(vm, index);
+    #####:  202:    return var_isclass(v);
+        -:  203:}
+        -:  204:
+    #####:  205:BERRY_API bbool be_isinstance(bvm *vm, int index)
+        -:  206:{
+    #####:  207:    bvalue *v = be_indexof(vm, index);
+    #####:  208:    return var_isinstance(v);
+        -:  209:}
+        -:  210:
+    #####:  211:BERRY_API bbool be_ismodule(bvm *vm, int index)
+        -:  212:{
+    #####:  213:    bvalue *v = be_indexof(vm, index);
+    #####:  214:    return var_ismodule(v);
+        -:  215:}
+        -:  216:
+    #####:  217:BERRY_API bbool be_islist(bvm *vm, int index)
+        -:  218:{
+    #####:  219:    bvalue *v = be_indexof(vm, index);
+    #####:  220:    return var_islist(v);
+        -:  221:}
+        -:  222:
+    #####:  223:BERRY_API bbool be_ismap(bvm *vm, int index)
+        -:  224:{
+    #####:  225:    bvalue *v = be_indexof(vm, index);
+    #####:  226:    return var_ismap(v);
+        -:  227:}
+        -:  228:
+    #####:  229:BERRY_API bbool be_iscomptr(bvm *vm, int index)
+        -:  230:{
+    #####:  231:    bvalue *v = be_indexof(vm, index);
+    #####:  232:    return var_istype(v, BE_COMPTR);
+        -:  233:}
+        -:  234:
+    #####:  235:BERRY_API bbool be_iscomobj(bvm *vm, int index)
+        -:  236:{
+    #####:  237:    bvalue *v = be_indexof(vm, index);
+    #####:  238:    return var_istype(v, BE_COMOBJ);
+        -:  239:}
+        -:  240:
+    #####:  241:BERRY_API bint be_toint(bvm *vm, int index)
+        -:  242:{
+    #####:  243:    bvalue *v = be_indexof(vm, index);
+    #####:  244:    return var_toint(v);
+        -:  245:}
+        -:  246:
+    #####:  247:BERRY_API breal be_toreal(bvm *vm, int index)
+        -:  248:{
+    #####:  249:    bvalue *v = be_indexof(vm, index);
+    #####:  250:    if (var_isreal(v)) {
+    #####:  251:        return var_toreal(v);
+        -:  252:    }
+    #####:  253:    if (var_isint(v)) {
+    #####:  254:        return cast(breal, var_toint(v));
+        -:  255:    }
+    #####:  256:    return cast(breal, 0.0);
+        -:  257:}
+        -:  258:
+    #####:  259:BERRY_API int be_toindex(bvm *vm, int index)
+        -:  260:{
+    #####:  261:    bvalue *v = be_indexof(vm, index);
+    #####:  262:    return var_toidx(v);
+        -:  263:}
+        -:  264:
+        7:  265:BERRY_API bbool be_tobool(bvm *vm, int index)
+        -:  266:{
+        7:  267:    bvalue *v = be_indexof(vm, index);
+        7:  268:    return be_value2bool(vm, v);
+        -:  269:}
+        -:  270:
+        2:  271:BERRY_API const char* be_tostring(bvm *vm, int index)
+        -:  272:{
+        2:  273:    bvalue *v = be_indexof(vm, index);
+        2:  274:    if (!var_isstr(v)) {
+    #####:  275:        be_val2str(vm, index);
+    #####:  276:        v = be_indexof(vm, index);
+        -:  277:    }
+        2:  278:    return str(var_tostr(v));
+        -:  279:}
+        -:  280:
+    #####:  281:BERRY_API void* be_tocomptr(bvm *vm, int index)
+        -:  282:{
+    #####:  283:    bvalue *v = be_indexof(vm, index);
+    #####:  284:    if (var_istype(v, BE_COMPTR)) {
+    #####:  285:        return var_toobj(v);
+        -:  286:    }
+    #####:  287:    if (var_istype(v, BE_COMOBJ)) {
+    #####:  288:        bcommomobj *obj = var_toobj(v);
+    #####:  289:        return obj->data;
+        -:  290:    }
+    #####:  291:    return NULL;
+        -:  292:}
+        -:  293:
+    #####:  294:BERRY_API void be_moveto(bvm *vm, int from, int to)
+        -:  295:{
+    #####:  296:    bvalue *src = be_indexof(vm, from);
+    #####:  297:    bvalue *dst = be_indexof(vm, to);
+    #####:  298:    var_setval(dst, src);
+    #####:  299:}
+        -:  300:
+    #####:  301:BERRY_API void be_pushnil(bvm *vm)
+        -:  302:{
+    #####:  303:    bvalue *reg = be_incrtop(vm);
+    #####:  304:    var_setnil(reg);
+    #####:  305:}
+        -:  306:
+    #####:  307:BERRY_API void be_pushbool(bvm *vm, int b)
+        -:  308:{
+    #####:  309:    bvalue *reg = be_incrtop(vm);
+    #####:  310:    var_setbool(reg, b != bfalse);
+    #####:  311:}
+        -:  312:
+    #####:  313:BERRY_API void be_pushint(bvm *vm, bint i)
+        -:  314:{
+    #####:  315:    bvalue *reg = be_incrtop(vm);
+    #####:  316:    var_setint(reg, i);
+    #####:  317:}
+        -:  318:
+    #####:  319:BERRY_API void be_pushreal(bvm *vm, breal r)
+        -:  320:{
+    #####:  321:    bvalue *reg = be_incrtop(vm);
+    #####:  322:    var_setreal(reg, r);
+    #####:  323:}
+        -:  324:
+        3:  325:BERRY_API void be_pushstring(bvm *vm, const char *str)
+        -:  326:{
+        -:  327:    /* to create a string and then push the top registor,
+        -:  328:     * otherwise the GC may crash due to uninitialized values.
+        -:  329:     **/
+        3:  330:    bstring *s = be_newstr(vm, str);
+        3:  331:    bvalue *reg = be_incrtop(vm);
+        -:  332:    be_assert(reg < vm->stacktop);
+        3:  333:    var_setstr(reg, s);
+        3:  334:}
+        -:  335:
+    #####:  336:BERRY_API void be_pushnstring(bvm *vm, const char *str, size_t n)
+        -:  337:{
+        -:  338:    /* to create a string and then push the top registor,
+        -:  339:     * otherwise the GC may crash due to uninitialized values.
+        -:  340:     **/
+    #####:  341:    bstring *s = be_newstrn(vm, str, n);
+    #####:  342:    bvalue *reg = be_incrtop(vm);
+    #####:  343:    var_setstr(reg, s);
+    #####:  344:}
+        -:  345:
+    #####:  346:BERRY_API const char* be_pushfstring(bvm *vm, const char *format, ...)
+        -:  347:{
+        -:  348:    const char* s;
+        -:  349:    va_list arg_ptr;
+    #####:  350:    va_start(arg_ptr, format);
+    #####:  351:    s = be_pushvfstr(vm, format, arg_ptr);
+    #####:  352:    va_end(arg_ptr);
+    #####:  353:    return s;
+        -:  354:}
+        -:  355:
+    #####:  356:BERRY_API void* be_pushbuffer(bvm *vm, size_t size)
+        -:  357:{
+    #####:  358:    bstring *s = be_newlongstr(vm, NULL, size);
+    #####:  359:    bvalue *reg = be_incrtop(vm);
+    #####:  360:    var_setstr(reg, s);
+    #####:  361:    return (void*)str(s);
+        -:  362:}
+        -:  363:
+        2:  364:BERRY_API void be_pushvalue(bvm *vm, int index)
+        -:  365:{
+        2:  366:    bvalue *reg = vm->top;
+        2:  367:    var_setval(reg, be_indexof(vm, index));
+        2:  368:    be_incrtop(vm);
+        2:  369:}
+        -:  370:
+    #####:  371:BERRY_API void be_pushclosure(bvm *vm, void *cl)
+        -:  372:{
+    #####:  373:    bvalue *reg = be_incrtop(vm);
+    #####:  374:    bclosure * closure = (bclosure*) cl;
+    #####:  375:    var_setclosure(reg, closure);
+    #####:  376:}
+        -:  377:
+    #####:  378:BERRY_API void be_pushntvclosure(bvm *vm, bntvfunc f, int nupvals)
+        -:  379:{
+        -:  380:    /* to create a native closure and then push the top registor,
+        -:  381:     * otherwise the GC may crash due to uninitialized values.
+        -:  382:     **/
+    #####:  383:    bntvclos *cl = be_newntvclosure(vm, f, nupvals);
+    #####:  384:    bvalue *top = be_incrtop(vm);
+    #####:  385:    var_setntvclos(top, cl);
+    #####:  386:}
+        -:  387:
+        2:  388:BERRY_API void be_pushntvfunction(bvm *vm, bntvfunc f)
+        -:  389:{
+        2:  390:    bvalue *top = be_incrtop(vm);
+        2:  391:    var_setntvfunc(top, f);
+        2:  392:}
+        -:  393:
+    #####:  394:BERRY_API void be_pushclass(bvm *vm, const char *name, const bnfuncinfo *lib)
+        -:  395:{
+        -:  396:    bclass *c;
+    #####:  397:    bstring *s = be_newstr(vm, name);
+    #####:  398:    bvalue *dst = be_incrtop(vm);
+    #####:  399:    var_setstr(dst, s);
+    #####:  400:    c = class_auto_make(vm, s, lib);
+    #####:  401:    var_setclass(vm->top - 1, c);
+    #####:  402:}
+        -:  403:
+    #####:  404:BERRY_API void be_pushntvclass(bvm *vm, const struct bclass * c)
+        -:  405:{
+    #####:  406:    bvalue *top = be_incrtop(vm);
+    #####:  407:    var_setclass(top, (bclass *) c);
+    #####:  408:}
+        -:  409:
+    #####:  410:BERRY_API void be_pushcomptr(bvm *vm, void *ptr)
+        -:  411:{
+    #####:  412:    bvalue *top = be_incrtop(vm);
+    #####:  413:    var_setobj(top, BE_COMPTR, ptr);
+    #####:  414:}
+        -:  415:
+        5:  416:BERRY_API void be_remove(bvm *vm, int index)
+        -:  417:{
+        5:  418:    bvalue *v = be_indexof(vm, index);
+        5:  419:    bvalue *top = --vm->top;
+        9:  420:    while (v < top) {
+        4:  421:        *v = v[1];
+        4:  422:        ++v;
+        -:  423:    }
+        5:  424:}
+        -:  425:
+    #####:  426:BERRY_API void be_strconcat(bvm *vm, int index)
+        -:  427:{
+        -:  428:    bstring *s;
+    #####:  429:    bvalue *dst = be_indexof(vm, index);
+    #####:  430:    bvalue *src = be_indexof(vm, -1);
+        -:  431:    be_assert(var_isstr(src) && var_isstr(dst));
+    #####:  432:    s = be_strcat(vm, var_tostr(dst), var_tostr(src));
+    #####:  433:    var_setstr(dst, s);
+    #####:  434:}
+        -:  435:
+    #####:  436:BERRY_API bbool be_setsuper(bvm *vm, int index)
+        -:  437:{
+    #####:  438:    bvalue *v = be_indexof(vm, index);
+    #####:  439:    bvalue *top = be_indexof(vm, -1);
+    #####:  440:    if (var_isclass(v) && var_isclass(top)) {
+    #####:  441:        bclass *c = var_toobj(v);
+    #####:  442:        if (!gc_isconst(c)) {
+    #####:  443:            bclass *super = var_toobj(top);
+    #####:  444:            be_class_setsuper(c, super);
+    #####:  445:            return btrue;
+        -:  446:        }
+        -:  447:    }
+    #####:  448:    return bfalse;
+        -:  449:}
+        -:  450:
+    #####:  451:BERRY_API void be_getsuper(bvm *vm, int index)
+        -:  452:{
+    #####:  453:    bvalue *v = be_indexof(vm, index);
+    #####:  454:    bvalue *top = be_incrtop(vm);
+    #####:  455:    if (var_isclass(v)) {
+    #####:  456:        bclass *c = var_toobj(v);
+    #####:  457:        c = be_class_super(c);
+    #####:  458:        if (c) {
+    #####:  459:            var_setclass(top, c);
+    #####:  460:            return;
+        -:  461:        }
+    #####:  462:    } else if (var_isinstance(v)) {
+    #####:  463:        binstance *o = var_toobj(v);
+    #####:  464:        o = be_instance_super(o);
+    #####:  465:        if (o) {
+    #####:  466:            var_setinstance(top, o);
+    #####:  467:            return;
+        -:  468:        }
+        -:  469:    }
+    #####:  470:    var_setnil(top);
+        -:  471:}
+        -:  472:
+    #####:  473:static bclass* _getclass(bvalue *v)
+        -:  474:{ 
+    #####:  475:    if (var_isinstance(v)) {
+    #####:  476:        binstance *ins = var_toobj(v);
+    #####:  477:        return be_instance_class(ins);
+        -:  478:    }
+    #####:  479:    return var_isclass(v) ? var_toobj(v) : NULL;
+        -:  480:}
+        -:  481:
+    #####:  482:BERRY_API bbool be_isderived(bvm *vm, int index)
+        -:  483:{
+    #####:  484:    bclass *sup = _getclass(be_indexof(vm, -1));
+    #####:  485:    if (sup) {
+    #####:  486:        bclass *c = _getclass(be_indexof(vm, index));
+    #####:  487:        while (c && c != sup)
+    #####:  488:            c = be_class_super(c);
+    #####:  489:        return c != NULL;
+        -:  490:    }
+    #####:  491:    return bfalse;
+        -:  492:}
+        -:  493:
+    #####:  494:BERRY_API const char *be_typename(bvm *vm, int index)
+        -:  495:{
+    #####:  496:    bvalue *v = be_indexof(vm, index);
+    #####:  497:    return be_vtype2str(v);
+        -:  498:}
+        -:  499:
+    #####:  500:BERRY_API const char *be_classname(bvm *vm, int index)
+        -:  501:{
+    #####:  502:    bvalue *v = be_indexof(vm, index);
+    #####:  503:    if (var_isclass(v)) {
+    #####:  504:        bclass *c = var_toobj(v);
+    #####:  505:        return str(be_class_name(c));
+        -:  506:    }
+    #####:  507:    if (var_isinstance(v)) {
+    #####:  508:        binstance *i = var_toobj(v);
+    #####:  509:        return str(be_instance_name(i));
+        -:  510:    }
+    #####:  511:    return NULL;
+        -:  512:}
+        -:  513:
+    #####:  514:BERRY_API bbool be_classof(bvm *vm, int index)
+        -:  515:{
+    #####:  516:    bvalue *v = be_indexof(vm, index);
+    #####:  517:    if (var_isinstance(v)) {
+    #####:  518:        bvalue *top = be_incrtop(vm);
+    #####:  519:        binstance *ins = var_toobj(v);
+    #####:  520:        var_setclass(top, be_instance_class(ins));
+    #####:  521:        return btrue;
+        -:  522:    }
+    #####:  523:    return bfalse;
+        -:  524:}
+        -:  525:
+    #####:  526:BERRY_API int be_strlen(bvm *vm, int index)
+        -:  527:{
+    #####:  528:    bvalue *v = be_indexof(vm, index);
+    #####:  529:    if (var_isstr(v)) {
+    #####:  530:        return str_len(var_tostr(v));
+        -:  531:    }
+    #####:  532:    return 0;
+        -:  533:}
+        -:  534:
+        1:  535:BERRY_API void be_newlist(bvm *vm)
+        -:  536:{
+        1:  537:    blist *list = be_list_new(vm);
+        1:  538:    bvalue *top = be_incrtop(vm);
+        1:  539:    var_setlist(top, list);
+        1:  540:}
+        -:  541:
+    #####:  542:BERRY_API void be_newmap(bvm *vm)
+        -:  543:{
+    #####:  544:    bmap *map = be_map_new(vm);
+    #####:  545:    bvalue *top = be_incrtop(vm);
+    #####:  546:    var_setobj(top, BE_MAP, map);
+    #####:  547:}
+        -:  548:
+    #####:  549:BERRY_API void be_newmodule(bvm *vm)
+        -:  550:{
+    #####:  551:    bmodule *mod = be_module_new(vm);
+    #####:  552:    bvalue *top = be_incrtop(vm);
+    #####:  553:    var_setobj(top, BE_MODULE, mod);
+    #####:  554:}
+        -:  555:
+        1:  556:BERRY_API void be_newobject(bvm *vm, const char *name)
+        -:  557:{
+        1:  558:    be_getbuiltin(vm, name);
+        1:  559:    be_call(vm, 0);
+        1:  560:    be_getmember(vm, -1, ".p");
+        1:  561:}
+        -:  562:
+    #####:  563:BERRY_API bbool be_setname(bvm *vm, int index, const char *name)
+        -:  564:{
+    #####:  565:    bvalue *v = be_indexof(vm, index);
+    #####:  566:    if (var_ismodule(v)) {
+    #####:  567:        bmodule *module = var_toobj(v);
+    #####:  568:        return be_module_setname(module, be_newstr(vm, name));
+        -:  569:    }
+    #####:  570:    return bfalse;
+        -:  571:}
+        -:  572:
+    #####:  573:BERRY_API bbool be_getglobal(bvm *vm, const char *name)
+        -:  574:{
+    #####:  575:    int idx = be_global_find(vm, be_newstr(vm, name));
+    #####:  576:    bvalue *top = be_incrtop(vm);
+    #####:  577:    if (idx > -1) {
+    #####:  578:        *top = *be_global_var(vm, idx);
+    #####:  579:        return btrue;
+        -:  580:    }
+    #####:  581:    var_setnil(top);
+    #####:  582:    return bfalse;
+        -:  583:}
+        -:  584:
+        1:  585:BERRY_API void be_setglobal(bvm *vm, const char *name)
+        -:  586:{
+        -:  587:    int idx;
+        1:  588:    bstring *s = be_newstr(vm, name);
+        1:  589:    bvalue *v = be_incrtop(vm);
+        1:  590:    var_setstr(v, s);
+        1:  591:    idx = be_global_new(vm, s);
+        1:  592:    v = be_global_var(vm, idx);
+        1:  593:    *v = *be_indexof(vm, -2);
+        1:  594:    be_stackpop(vm, 1);
+        1:  595:}
+        -:  596:
+        1:  597:BERRY_API bbool be_getbuiltin(bvm *vm, const char *name)
+        -:  598:{
+        1:  599:    int idx = be_builtin_find(vm, be_newstr(vm, name));
+        1:  600:    bvalue *top = be_incrtop(vm);
+        1:  601:    if (idx > -1) {
+        1:  602:        *top = *be_global_var(vm, idx);
+        1:  603:        return btrue;
+        -:  604:    }
+    #####:  605:    var_setnil(top);
+    #####:  606:    return bfalse;
+        -:  607:}
+        -:  608:
+        1:  609:BERRY_API bbool be_setmember(bvm *vm, int index, const char *k)
+        -:  610:{
+        1:  611:    bvalue *o = be_indexof(vm, index);
+        1:  612:    bvalue *v = be_indexof(vm, -1);
+        1:  613:    if (var_isinstance(o)) {
+        1:  614:        bstring *key = be_newstr(vm, k);
+        1:  615:        binstance *obj = var_toobj(o);
+        1:  616:        return be_instance_setmember(vm, obj, key, v);
+    #####:  617:    } else if (var_ismodule(o)) {
+    #####:  618:        bstring *key = be_newstr(vm, k);
+    #####:  619:        bmodule *mod = var_toobj(o);
+    #####:  620:        return be_module_setmember(vm, mod, key, v);
+        -:  621:    }
+    #####:  622:    return bfalse;
+        -:  623:}
+        -:  624:
+    #####:  625:BERRY_API bbool be_copy(bvm *vm, int index)
+        -:  626:{
+    #####:  627:    bvalue *v = be_indexof(vm, index);
+    #####:  628:    bvalue *top = be_incrtop(vm);
+    #####:  629:    if (var_type(v) == BE_LIST) {
+    #####:  630:        blist *list = be_list_copy(vm, var_toobj(v));
+    #####:  631:        var_setlist(top, list)
+    #####:  632:        return btrue;
+        -:  633:    }
+    #####:  634:    var_setnil(top);
+    #####:  635:    return bfalse;
+        -:  636:}
+        -:  637:
+        -:  638:/* `onlyins` limits the search to instance, and discards module. Makes sure getmethod does not return anything for module. */
+        1:  639:static int ins_member(bvm *vm, int index, const char *k, bbool onlyins)
+        -:  640:{
+        1:  641:    int type = BE_NIL;
+        1:  642:    bvalue *o = be_indexof(vm, index);
+        1:  643:    bvalue *top = be_incrtop(vm);
+        1:  644:    var_setnil(top);
+        1:  645:    if (var_isinstance(o)) {
+        1:  646:        binstance *obj = var_toobj(o);
+        1:  647:        type = be_instance_member(vm, obj, be_newstr(vm, k), top);
+    #####:  648:    } else if (var_isclass(o) && !onlyins) {
+    #####:  649:        bclass *cl = var_toobj(o);
+    #####:  650:        type = be_class_member(vm, cl, be_newstr(vm, k), top);
+    #####:  651:    } else if (var_ismodule(o) && !onlyins) {
+    #####:  652:        bmodule *module = var_toobj(o);
+    #####:  653:        type = be_module_attr(vm, module, be_newstr(vm, k), top);
+        -:  654:    }
+        1:  655:    if (type == BE_NONE) {
+    #####:  656:        type = BE_NIL;
+        -:  657:    }
+        1:  658:    return type;
+        -:  659:}
+        -:  660:
+        1:  661:BERRY_API bbool be_getmember(bvm *vm, int index, const char *k)
+        -:  662:{
+        1:  663:    return ins_member(vm, index, k, bfalse) != BE_NIL;
+        -:  664:}
+        -:  665:
+    #####:  666:BERRY_API bbool be_getmethod(bvm *vm, int index, const char *k)
+        -:  667:{
+    #####:  668:    return basetype(ins_member(vm, index, k, btrue)) == BE_FUNCTION;
+        -:  669:}
+        -:  670:
+    #####:  671:BERRY_API bbool be_getindex(bvm *vm, int index)
+        -:  672:{
+    #####:  673:    bvalue *o = be_indexof(vm, index);
+    #####:  674:    bvalue *k = be_indexof(vm, -1);
+    #####:  675:    bvalue *dst = be_incrtop(vm);
+    #####:  676:    switch (var_type(o)) {
+    #####:  677:    case BE_LIST:
+    #####:  678:        if (var_isint(k)) {
+    #####:  679:            blist *list = cast(blist*, var_toobj(o));
+    #####:  680:            int idx = var_toidx(k);
+    #####:  681:            bvalue *src = be_list_index(list, idx);
+    #####:  682:            if (src) {
+    #####:  683:                var_setval(dst, src);
+    #####:  684:                return btrue;
+        -:  685:            }
+        -:  686:        }
+    #####:  687:        break;
+    #####:  688:    case BE_MAP:
+    #####:  689:        if (!var_isnil(k)) {
+    #####:  690:            bmap *map = cast(bmap*, var_toobj(o));
+    #####:  691:            bvalue *src = be_map_find(vm, map, k);
+    #####:  692:            if (src) {
+    #####:  693:                var_setval(dst, src);
+    #####:  694:                return btrue;
+        -:  695:            }
+        -:  696:        }
+    #####:  697:        break;
+    #####:  698:    default:
+    #####:  699:        break;
+        -:  700:    }
+    #####:  701:    var_setnil(dst);
+    #####:  702:    return bfalse;
+        -:  703:}
+        -:  704:
+    #####:  705:static bvalue* list_setindex(blist *list, bvalue *key)
+        -:  706:{
+    #####:  707:    int idx = var_toidx(key);
+    #####:  708:    if (idx < be_list_count(list)) {
+    #####:  709:        return be_list_at(list, idx);
+        -:  710:    }
+    #####:  711:    return NULL;
+        -:  712:}
+        -:  713:
+    #####:  714:BERRY_API bbool be_setindex(bvm *vm, int index)
+        -:  715:{
+    #####:  716:    bvalue *dst = NULL;
+    #####:  717:    bvalue *o = be_indexof(vm, index);
+    #####:  718:    bvalue *k = be_indexof(vm, -2);
+    #####:  719:    bvalue *v = be_indexof(vm, -1);
+    #####:  720:    switch (var_type(o)) {
+    #####:  721:    case BE_LIST:
+    #####:  722:        if (var_isint(k)) {
+    #####:  723:            blist *list = var_toobj(o);
+    #####:  724:            dst = list_setindex(list, k);
+        -:  725:        }
+    #####:  726:        break;
+    #####:  727:    case BE_MAP:
+    #####:  728:        if (!var_isnil(k)) {
+    #####:  729:            bmap *map = var_toobj(o);
+    #####:  730:            dst = be_map_insert(vm, map, k, NULL);
+        -:  731:        }
+    #####:  732:        break;
+    #####:  733:    default:
+    #####:  734:        break;
+        -:  735:    }
+    #####:  736:    if (dst) {
+    #####:  737:        var_setval(dst, v);
+    #####:  738:        return btrue;
+        -:  739:    }
+    #####:  740:    return bfalse;
+        -:  741:}
+        -:  742:
+    #####:  743:BERRY_API void be_getupval(bvm *vm, int index, int pos)
+        -:  744:{
+    #####:  745:    bvalue *f = index ? be_indexof(vm, index) : vm->cf->func;
+    #####:  746:    bvalue *uv, *top = be_incrtop(vm);
+        -:  747:    be_assert(var_istype(f, BE_NTVCLOS));
+    #####:  748:    if (var_istype(f, BE_NTVCLOS)) {
+    #####:  749:        bntvclos *nf = var_toobj(f);
+        -:  750:        be_assert(pos >= 0 && pos < nf->nupvals);
+    #####:  751:        uv = be_ntvclos_upval(nf, pos)->value;
+    #####:  752:        var_setval(top, uv);
+        -:  753:    } else {
+    #####:  754:        var_setnil(top);
+        -:  755:    }
+    #####:  756:}
+        -:  757:
+    #####:  758:BERRY_API bbool be_setupval(bvm *vm, int index, int pos)
+        -:  759:{
+    #####:  760:    bvalue *f = index ? be_indexof(vm, index) : vm->cf->func;
+    #####:  761:    bvalue *uv, *v = be_indexof(vm, -1);
+        -:  762:    be_assert(var_istype(f, BE_NTVCLOS));
+    #####:  763:    if (var_istype(f, BE_NTVCLOS)) {
+    #####:  764:        bntvclos *nf = var_toobj(f);
+        -:  765:        be_assert(pos >= 0 && pos < nf->nupvals);
+    #####:  766:        uv = be_ntvclos_upval(nf, pos)->value;
+    #####:  767:        var_setval(uv, v);
+    #####:  768:        return btrue;
+        -:  769:    }
+    #####:  770:    return bfalse;
+        -:  771:}
+        -:  772:
+    #####:  773:BERRY_API int be_data_size(bvm *vm, int index)
+        -:  774:{
+    #####:  775:    bvalue *v = be_indexof(vm, index);
+    #####:  776:    if (var_islist(v)) {
+    #####:  777:        blist *list = var_toobj(v);
+    #####:  778:        return be_list_count(list);
+    #####:  779:    } else if (var_ismap(v)) {
+    #####:  780:        bmap *map = cast(bmap*, var_toobj(v));
+    #####:  781:        return be_map_count(map);
+        -:  782:    }
+    #####:  783:    return -1;
+        -:  784:}
+        -:  785:
+        1:  786:BERRY_API void be_data_push(bvm *vm, int index)
+        -:  787:{
+        1:  788:    bvalue *o = be_indexof(vm, index);
+        1:  789:    bvalue *v = be_indexof(vm, -1);
+        1:  790:    if (var_islist(o)) {
+        1:  791:        blist *list = var_toobj(o);
+        1:  792:        be_list_push(vm, list, v);
+        -:  793:    }
+        1:  794:}
+        -:  795:
+    #####:  796:BERRY_API bbool be_data_insert(bvm *vm, int index)
+        -:  797:{
+    #####:  798:    bvalue *o = be_indexof(vm, index);
+    #####:  799:    bvalue *k = be_indexof(vm, -2);
+    #####:  800:    bvalue *v = be_indexof(vm, -1);
+    #####:  801:    switch (var_type(o)) {
+    #####:  802:    case BE_MAP:
+    #####:  803:        if (!var_isnil(k)) {
+    #####:  804:            bmap *map = cast(bmap*, var_toobj(o));
+    #####:  805:            bvalue *dst = be_map_find(vm, map, k);
+    #####:  806:            if (dst == NULL) {
+    #####:  807:                return be_map_insert(vm, map, k, v) != NULL;
+        -:  808:            }
+        -:  809:        }
+    #####:  810:        break;
+    #####:  811:    case BE_LIST:
+    #####:  812:        if (var_isint(k)) {
+    #####:  813:            blist *list = cast(blist*, var_toobj(o));
+    #####:  814:            return be_list_insert(vm, list, var_toidx(k), v) != NULL;
+        -:  815:        }
+    #####:  816:        break;
+    #####:  817:    default:
+    #####:  818:        break;
+        -:  819:    }
+    #####:  820:    return bfalse;
+        -:  821:}
+        -:  822:
+    #####:  823:BERRY_API bbool be_data_remove(bvm *vm, int index)
+        -:  824:{
+    #####:  825:    bvalue *o = be_indexof(vm, index);
+    #####:  826:    bvalue *k = be_indexof(vm, -1);
+    #####:  827:    switch (var_type(o)) {
+    #####:  828:    case BE_MAP:
+    #####:  829:        if (!var_isnil(k)) {
+    #####:  830:            bmap *map = cast(bmap*, var_toobj(o));
+    #####:  831:            return be_map_remove(vm, map, k);
+        -:  832:        }
+    #####:  833:        break;
+    #####:  834:    case BE_LIST:
+    #####:  835:        if (var_isint(k)) {
+    #####:  836:            blist *list = cast(blist*, var_toobj(o));
+    #####:  837:            return be_list_remove(vm, list, var_toidx(k));
+        -:  838:        }
+    #####:  839:        break;
+    #####:  840:    default:
+    #####:  841:        break;
+        -:  842:    }
+    #####:  843:    return bfalse;
+        -:  844:}
+        -:  845:
+    #####:  846:BERRY_API bbool be_data_merge(bvm *vm, int index)
+        -:  847:{
+    #####:  848:    bvalue *a = be_indexof(vm, index);
+    #####:  849:    bvalue *b = be_indexof(vm, -1);
+    #####:  850:    if (var_islist(a) && var_islist(b)) {
+    #####:  851:        blist *dst = var_toobj(a), *src = var_toobj(b);
+    #####:  852:        be_list_merge(vm, dst, src);
+    #####:  853:        return btrue;
+        -:  854:    }
+    #####:  855:    return bfalse;
+        -:  856:}
+        -:  857:
+    #####:  858:BERRY_API void be_data_resize(bvm *vm, int index)
+        -:  859:{
+    #####:  860:    bvalue *o = be_indexof(vm, index);
+    #####:  861:    bvalue *v = be_indexof(vm, -1);
+    #####:  862:    if (var_islist(o)) {
+    #####:  863:        blist *list = var_toobj(o);
+    #####:  864:        if (var_isint(v)) {
+    #####:  865:            be_list_resize(vm, list, var_toidx(v));
+        -:  866:        }
+        -:  867:    }
+    #####:  868:}
+        -:  869:
+    #####:  870:BERRY_API void be_data_reverse(bvm *vm, int index)
+        -:  871:{
+    #####:  872:    bvalue *v = be_indexof(vm, index);
+    #####:  873:    if (var_type(v) == BE_LIST) {
+    #####:  874:        be_list_reverse(var_toobj(v));
+        -:  875:    }
+    #####:  876:}
+        -:  877:
+    #####:  878:BERRY_API bbool be_pushiter(bvm *vm, int index)
+        -:  879:{
+    #####:  880:    bvalue *v = be_indexof(vm, index);
+    #####:  881:    if (var_ismap(v)) {
+    #####:  882:        bvalue *iter = be_incrtop(vm);
+    #####:  883:        var_setobj(iter, BE_COMPTR, NULL);
+    #####:  884:        return btrue;
+    #####:  885:    } else if (var_islist(v)) {
+    #####:  886:        blist *list = var_toobj(v);
+    #####:  887:        bvalue *iter = be_incrtop(vm);
+    #####:  888:        var_setobj(iter, BE_COMPTR, be_list_data(list) - 1);
+    #####:  889:        return btrue;
+        -:  890:    }
+    #####:  891:    return bfalse;
+        -:  892:}
+        -:  893:
+    #####:  894:static int list_next(bvm *vm)
+        -:  895:{
+    #####:  896:    bvalue *iter = be_indexof(vm, -1);
+    #####:  897:    bvalue *next, *dst = be_incrtop(vm);
+    #####:  898:    next = cast(bvalue*, var_toobj(iter)) + 1;
+    #####:  899:    var_setobj(iter, BE_COMPTR, next);
+    #####:  900:    var_setval(dst, next);
+    #####:  901:    return 1;
+        -:  902:}
+        -:  903:
+    #####:  904:static bbool list_hasnext(bvm *vm, bvalue *v)
+        -:  905:{
+        -:  906:    bvalue *next;
+    #####:  907:    bvalue *iter = be_indexof(vm, -1);
+    #####:  908:    blist *obj = var_toobj(v);
+    #####:  909:    next = cast(bvalue*, var_toobj(iter)) + 1;
+    #####:  910:    return next >= be_list_data(obj) && next < be_list_end(obj);
+        -:  911:}
+        -:  912:
+    #####:  913:static int map_next(bvm *vm, bvalue *v)
+        -:  914:{
+        -:  915:    bmapiter iter;
+        -:  916:    bmapnode *entry;
+    #####:  917:    bvalue *dst = vm->top;
+    #####:  918:    bvalue *itvar = be_indexof(vm, -1);
+    #####:  919:    iter = var_toobj(itvar);
+    #####:  920:    entry = be_map_next(var_toobj(v), &iter);
+    #####:  921:    var_setobj(itvar, BE_COMPTR, iter);
+    #####:  922:    if (entry) {
+    #####:  923:        be_map_key2value(dst, entry);
+    #####:  924:        var_setval(dst + 1, &entry->value);
+    #####:  925:        vm->top += 2;
+    #####:  926:        return 2;
+        -:  927:    }
+    #####:  928:    return 0;
+        -:  929:}
+        -:  930:
+    #####:  931:static bbool map_hasnext(bvm *vm, bvalue *v)
+        -:  932:{
+    #####:  933:    bvalue *node = be_indexof(vm, -1);
+    #####:  934:    bmapiter iter = var_toobj(node);
+    #####:  935:    return be_map_next(var_toobj(v), &iter) != NULL;
+        -:  936:}
+        -:  937:
+    #####:  938:BERRY_API int be_iter_next(bvm *vm, int index)
+        -:  939:{
+    #####:  940:    bvalue *o = be_indexof(vm, index);
+    #####:  941:    if (var_islist(o)) {
+    #####:  942:        return list_next(vm);
+    #####:  943:    } else if (var_ismap(o)) {
+    #####:  944:        return map_next(vm, o);
+        -:  945:    }
+    #####:  946:    return 0;
+        -:  947:}
+        -:  948:
+    #####:  949:BERRY_API bbool be_iter_hasnext(bvm *vm, int index)
+        -:  950:{
+    #####:  951:    bvalue *o = be_indexof(vm, index);
+    #####:  952:    if (var_islist(o)) {
+    #####:  953:        return list_hasnext(vm, o);
+    #####:  954:    } else if (var_ismap(o)) {
+    #####:  955:        return map_hasnext(vm, o);
+        -:  956:    }
+    #####:  957:    return bfalse;
+        -:  958:}
+        -:  959:
+    #####:  960:BERRY_API bbool be_refcontains(bvm *vm, int index)
+        -:  961:{
+    #####:  962:    bvalue *v = be_indexof(vm, index);
+    #####:  963:    binstance **ref = be_stack_base(&vm->refstack);
+    #####:  964:    binstance **top = be_stack_top(&vm->refstack);
+    #####:  965:    binstance *ins = var_toobj(v);
+        -:  966:    be_assert(var_isinstance(v));
+    #####:  967:    if (ref) {
+    #####:  968:        while (ref <= top && *ref != ins) {
+    #####:  969:            ++ref;
+        -:  970:        }
+    #####:  971:        return ref <= top;
+        -:  972:    }
+    #####:  973:    return bfalse;
+        -:  974:}
+        -:  975:
+    #####:  976:BERRY_API void be_refpush(bvm *vm, int index)
+        -:  977:{
+    #####:  978:    bvalue *v = be_indexof(vm, index);
+    #####:  979:    binstance *ins = var_toobj(v);
+        -:  980:    be_assert(var_isinstance(v));
+    #####:  981:    be_stack_push(vm, &vm->refstack, &ins);
+    #####:  982:}
+        -:  983:
+    #####:  984:BERRY_API void be_refpop(bvm *vm)
+        -:  985:{
+    #####:  986:    be_stack_pop(&vm->refstack);
+    #####:  987:    if (be_stack_isempty(&vm->refstack)) {
+    #####:  988:        be_vector_release(vm, &vm->refstack);
+        -:  989:    }
+    #####:  990:}
+        -:  991:
+    #####:  992:BERRY_API int be_returnvalue(bvm *vm)
+        -:  993:{
+    #####:  994:    bvalue *src = vm->top - 1;
+    #####:  995:    bvalue *ret = retreg(vm);
+    #####:  996:    var_setval(ret, src);
+    #####:  997:    return 0;
+        -:  998:}
+        -:  999:
+        9: 1000:BERRY_API int be_returnnilvalue(bvm *vm)
+        -: 1001:{
+        9: 1002:    bvalue *ret = retreg(vm);
+        9: 1003:    var_setnil(ret);
+        9: 1004:    return 0;
+        -: 1005:}
+        -: 1006:
+        1: 1007:BERRY_API void be_call(bvm *vm, int argc)
+        -: 1008:{
+        1: 1009:    bvalue *fval = vm->top - argc - 1;
+        1: 1010:    be_dofunc(vm, fval, argc);
+        1: 1011:}
+        -: 1012:
+        3: 1013:BERRY_API int be_pcall(bvm *vm, int argc)
+        -: 1014:{
+        3: 1015:    bvalue *f = vm->top - argc - 1;
+        3: 1016:    return be_protectedcall(vm, f, argc);
+        -: 1017:}
+        -: 1018:
+        1: 1019:BERRY_API void be_raise(bvm *vm, const char *except, const char *msg)
+        -: 1020:{
+        1: 1021:    be_pushstring(vm, except);
+        1: 1022:    if (msg) {
+        1: 1023:        be_pushstring(vm, msg);
+        -: 1024:    } else {
+    #####: 1025:        be_pushnil(vm);
+        -: 1026:    }
+        1: 1027:    be_pop(vm, 2);
+        1: 1028:    be_save_stacktrace(vm);
+        1: 1029:    be_throw(vm, BE_EXCEPTION);
+    #####: 1030:}
+        -: 1031:
+    #####: 1032:BERRY_API void be_stop_iteration(bvm *vm)
+        -: 1033:{
+    #####: 1034:    be_raise(vm, "stop_iteration", NULL);
+    #####: 1035:}
+        -: 1036:
+    #####: 1037:BERRY_API int be_getexcept(bvm *vm, int code)
+        -: 1038:{
+    #####: 1039:    if (code == BE_EXCEPTION) {
+    #####: 1040:        if (be_isstring(vm, -2)) {
+    #####: 1041:            const char *except = be_tostring(vm, -2);
+    #####: 1042:            if (!strcmp(except, "syntax_error")) {
+    #####: 1043:                return BE_SYNTAX_ERROR;
+        -: 1044:            }
+    #####: 1045:            if (!strcmp(except, "io_error")) {
+    #####: 1046:                return BE_IO_ERROR;
+        -: 1047:            }
+        -: 1048:        }
+    #####: 1049:        return BE_EXEC_ERROR;
+        -: 1050:    }
+    #####: 1051:    return code;
+        -: 1052:}
+        -: 1053:
+        2: 1054:static int _dvfunc(bvm *vm, bbool esc)
+        -: 1055:{
+        2: 1056:    const char* s = esc ?
+       2*: 1057:        be_toescape(vm, 1, 'x') : be_tostring(vm, 1);
+        2: 1058:    be_writestring(s);
+        2: 1059:    be_return_nil(vm);
+        -: 1060:}
+        -: 1061:
+    #####: 1062:static int _dumpesc(bvm *vm)
+        -: 1063:{
+    #####: 1064:    return _dvfunc(vm, btrue);
+        -: 1065:}
+        -: 1066:
+        2: 1067:static int _dumpdir(bvm *vm)
+        -: 1068:{
+        2: 1069:    return _dvfunc(vm, bfalse);
+        -: 1070:}
+        -: 1071:
+        2: 1072:static int dump_value(bvm *vm, int index, bbool esc)
+        -: 1073:{
+        2: 1074:    int res, top = be_top(vm) + 1;
+        2: 1075:    index = be_absindex(vm, index);
+       2*: 1076:    be_pushntvfunction(vm, esc ? _dumpesc : _dumpdir);
+        2: 1077:    be_pushvalue(vm, index);
+        2: 1078:    res = be_pcall(vm, 1); /* using index to store result */
+        2: 1079:    be_remove(vm, top); /* remove '_dumpvalue' function */
+        2: 1080:    be_remove(vm, top); /* remove the value */
+        2: 1081:    if (res == BE_EXCEPTION) {
+    #####: 1082:        be_dumpexcept(vm);
+        -: 1083:    }
+        2: 1084:    return res;
+        -: 1085:}
+        -: 1086:
+    #####: 1087:BERRY_API void be_dumpvalue(bvm *vm, int index)
+        -: 1088:{
+    #####: 1089:    if (dump_value(vm, index, btrue) == BE_OK) {
+    #####: 1090:        be_writenewline();
+        -: 1091:    }
+    #####: 1092:}
+        -: 1093:
+        1: 1094:BERRY_API void be_dumpexcept(bvm *vm)
+        -: 1095:{
+        -: 1096:    do {
+        -: 1097:        /* print exception value */
+       1*: 1098:        if (dump_value(vm, -2, bfalse)) break;
+        1: 1099:        be_writestring(": ");
+        -: 1100:        /* print exception argument */
+       1*: 1101:        if (dump_value(vm, -1, bfalse)) break;
+        1: 1102:        be_writenewline();
+        -: 1103:        /* print stack traceback */
+        1: 1104:        be_tracestack(vm);
+        -: 1105:    } while (0);
+        1: 1106:    be_pop(vm, 2); /* pop the exception value & argument */
+        1: 1107:}
+        -: 1108:
+    #####: 1109:BERRY_API bbool be_iseq(bvm *vm)
+        -: 1110:{
+        -: 1111:    be_assert(vm->reg + 2 <= vm->top);
+    #####: 1112:    return be_vm_iseq(vm, vm->top - 2, vm->top - 1);
+        -: 1113:}
+        -: 1114:
+    #####: 1115:BERRY_API bbool be_isneq(bvm *vm)
+        -: 1116:{
+        -: 1117:    be_assert(vm->reg + 2 <= vm->top);
+    #####: 1118:    return be_vm_isneq(vm, vm->top - 2, vm->top - 1);
+        -: 1119:}
+        -: 1120:
+    #####: 1121:BERRY_API bbool be_islt(bvm *vm)
+        -: 1122:{
+        -: 1123:    be_assert(vm->reg + 2 <= vm->top);
+    #####: 1124:    return be_vm_islt(vm, vm->top - 2, vm->top - 1);
+        -: 1125:}
+        -: 1126:
+    #####: 1127:BERRY_API bbool be_isle(bvm *vm)
+        -: 1128:{
+        -: 1129:    be_assert(vm->reg + 2 <= vm->top);
+    #####: 1130:    return be_vm_isle(vm, vm->top - 2, vm->top - 1);
+        -: 1131:}
+        -: 1132:
+    #####: 1133:BERRY_API bbool be_isgt(bvm *vm)
+        -: 1134:{
+        -: 1135:    be_assert(vm->reg + 2 <= vm->top);
+    #####: 1136:    return be_vm_isgt(vm, vm->top - 2, vm->top - 1);
+        -: 1137:}
+        -: 1138:
+    #####: 1139:BERRY_API bbool be_isge(bvm *vm)
+        -: 1140:{
+        -: 1141:    be_assert(vm->reg + 2 <= vm->top);
+    #####: 1142:    return be_vm_isge(vm, vm->top - 2, vm->top - 1);
+        -: 1143:}
+        -: 1144:
+    #####: 1145:BERRY_API int be_register(bvm *vm, int index)
+        -: 1146:{
+        -: 1147:    bvalue *v;
+    #####: 1148:    if (!vm->registry) {
+    #####: 1149:        vm->registry = be_list_new(vm);
+    #####: 1150:        be_list_pool_init(vm, vm->registry);
+        -: 1151:    }
+        -: 1152:    be_assert(vm->registry != NULL);
+    #####: 1153:    v = be_indexof(vm, index);
+    #####: 1154:    return be_list_pool_alloc(vm, vm->registry, v);
+        -: 1155:}
+        -: 1156:
+    #####: 1157:BERRY_API void be_unregister(bvm *vm, int id)
+        -: 1158:{
+        -: 1159:    be_assert(vm->registry != NULL);
+    #####: 1160:    be_list_pool_free(vm->registry, id);
+    #####: 1161:}
+        -: 1162:
+    #####: 1163:BERRY_API void be_getregister(bvm *vm, int id)
+        -: 1164:{
+    #####: 1165:    blist *reg = vm->registry;
+        -: 1166:    be_assert(reg && id > 0 && id < be_list_count(reg));
+    #####: 1167:    var_setval(vm->top, be_list_at(reg, id));
+    #####: 1168:    be_incrtop(vm);
+    #####: 1169:}

@@ -1,0 +1,441 @@
+        -:    0:Source:src/be_jsonlib.c
+        -:    0:Graph:./src/be_jsonlib.gcno
+        -:    0:Data:./src/be_jsonlib.gcda
+        -:    0:Runs:1
+        -:    1:/********************************************************************
+        -:    2:** Copyright (c) 2018-2020 Guan Wenliang
+        -:    3:** This file is part of the Berry default interpreter.
+        -:    4:** skiars@qq.com, https://github.com/Skiars/berry
+        -:    5:** See Copyright Notice in the LICENSE file or at
+        -:    6:** https://github.com/Skiars/berry/blob/master/LICENSE
+        -:    7:********************************************************************/
+        -:    8:#include "be_object.h"
+        -:    9:#include "be_mem.h"
+        -:   10:#include <string.h>
+        -:   11:
+        -:   12:#if BE_USE_JSON_MODULE
+        -:   13:
+        -:   14:#define MAX_INDENT      24
+        -:   15:#define INDENT_WIDTH    2
+        -:   16:#define INDENT_CHAR     ' '
+        -:   17:
+        -:   18:static const char* parser_value(bvm *vm, const char *json);
+        -:   19:static void value_dump(bvm *vm, int *indent, int idx, int fmt);
+        -:   20:
+    #####:   21:static const char* skip_space(const char *s)
+        -:   22:{
+        -:   23:    int c;
+    #####:   24:    while (((c = *s) != '\0') && ((c == ' ')
+    #####:   25:        || (c == '\t') || (c == '\r') || (c == '\n'))) {
+    #####:   26:        ++s;
+        -:   27:    }
+    #####:   28:    return s;
+        -:   29:}
+        -:   30:
+    #####:   31:static int is_digit(int c)
+        -:   32:{
+    #####:   33:    return c >= '0' && c <= '9';
+        -:   34:}
+        -:   35:
+    #####:   36:static const char* match_char(const char *json, int ch)
+        -:   37:{
+    #####:   38:    json = skip_space(json);
+    #####:   39:    if (*json == ch) {
+    #####:   40:        return skip_space(json + 1);
+        -:   41:    }
+    #####:   42:    return NULL;
+        -:   43:}
+        -:   44:
+    #####:   45:static int is_object(bvm *vm, const char *class, int idx)
+        -:   46:{
+    #####:   47:    if (be_isinstance(vm, idx)) {
+    #####:   48:        const char *name = be_classname(vm, idx);
+    #####:   49:        return !strcmp(name, class);
+        -:   50:    }
+    #####:   51:    return  0;
+        -:   52:}
+        -:   53:
+    #####:   54:static int json_strlen(const char *json)
+        -:   55:{
+        -:   56:    int ch;
+    #####:   57:    const char *s = json + 1; /* skip '"' */
+        -:   58:    /* get string length "(\\.|[^"])*" */
+    #####:   59:    while ((ch = *s) != '\0' && ch != '"') {
+    #####:   60:        ++s;
+    #####:   61:        if (ch == '\\') {
+    #####:   62:            ch = *s++;
+    #####:   63:            if (ch == '\0') {
+    #####:   64:                return -1;
+        -:   65:            }
+        -:   66:        }
+        -:   67:    }
+    #####:   68:    return ch ? cast_int(s - json - 1) : -1;
+        -:   69:}
+        -:   70:
+    #####:   71:static void json2berry(bvm *vm, const char *class)
+        -:   72:{
+    #####:   73:    be_getbuiltin(vm, class);
+    #####:   74:    be_pushvalue(vm, -2);
+    #####:   75:    be_call(vm, 1);
+    #####:   76:    be_moveto(vm, -2, -3);
+    #####:   77:    be_pop(vm, 2);
+    #####:   78:}
+        -:   79:
+    #####:   80:static const char* parser_true(bvm *vm, const char *json)
+        -:   81:{
+    #####:   82:    if (!strncmp(json, "true", 4)) {
+    #####:   83:        be_pushbool(vm, btrue);
+    #####:   84:        return json + 4;
+        -:   85:    }
+    #####:   86:    return NULL;
+        -:   87:}
+        -:   88:
+    #####:   89:static const char* parser_false(bvm *vm, const char *json)
+        -:   90:{
+    #####:   91:    if (!strncmp(json, "false", 5)) {
+    #####:   92:        be_pushbool(vm, bfalse);
+    #####:   93:        return json + 5;
+        -:   94:    }
+    #####:   95:    return NULL;
+        -:   96:}
+        -:   97:
+    #####:   98:static const char* parser_null(bvm *vm, const char *json)
+        -:   99:{
+    #####:  100:    if (!strncmp(json, "null", 4)) {
+    #####:  101:        be_pushnil(vm);
+    #####:  102:        return json + 4;
+        -:  103:    }
+    #####:  104:    return NULL;
+        -:  105:}
+        -:  106:
+    #####:  107:static char* load_unicode(char *dst, const char *json)
+        -:  108:{
+    #####:  109:    int ucode = 0, i = 4;
+    #####:  110:    while (i--) {
+    #####:  111:        int ch = *json++;
+    #####:  112:        if (ch >= '0' && ch <= '9') {
+    #####:  113:            ucode = (ucode << 4) | (ch - '0');
+    #####:  114:        } else if (ch >= 'A' && ch <= 'F') {
+    #####:  115:            ucode = (ucode << 4) | (ch - 'A' + 0x0A);
+    #####:  116:        } else if (ch >= 'a' && ch <= 'f') {
+    #####:  117:            ucode = (ucode << 4) | (ch - 'a' + 0x0A);
+        -:  118:        } else {
+    #####:  119:            return NULL;
+        -:  120:        }
+        -:  121:    }
+        -:  122:    /* convert unicode to utf8 */
+    #####:  123:    if (ucode < 0x007F) {
+        -:  124:        /* unicode: 0000 - 007F -> utf8: 0xxxxxxx */
+    #####:  125:        *dst++ = (char)(ucode & 0x7F);
+    #####:  126:    } else if (ucode < 0x7FF) {
+        -:  127:        /* unicode: 0080 - 07FF -> utf8: 110xxxxx 10xxxxxx */
+    #####:  128:        *dst++ = (char)(((ucode >> 6) & 0x1F) | 0xC0);
+    #####:  129:        *dst++ = (char)((ucode & 0x3F) | 0x80);
+        -:  130:    } else {
+        -:  131:        /* unicode: 0800 - FFFF -> utf8: 1110xxxx 10xxxxxx 10xxxxxx */
+    #####:  132:        *dst++ = (char)(((ucode >> 12) & 0x0F) | 0xE0);
+    #####:  133:        *dst++ = (char)(((ucode >> 6) & 0x03F) | 0x80);
+    #####:  134:        *dst++ = (char)((ucode & 0x3F) | 0x80);
+        -:  135:    }
+    #####:  136:    return dst;
+        -:  137:}
+        -:  138:
+    #####:  139:static const char* parser_string(bvm *vm, const char *json)
+        -:  140:{
+    #####:  141:    if (*json == '"') {
+    #####:  142:        int len = json_strlen(json++);
+    #####:  143:        if (len > -1) {
+        -:  144:            int ch;
+    #####:  145:            char *buf, *dst = buf = be_malloc(vm, len);
+    #####:  146:            while ((ch = *json) != '\0' && ch != '"') {
+    #####:  147:                ++json;
+    #####:  148:                if (ch == '\\') {
+    #####:  149:                    ch = *json++; /* skip '\' */
+    #####:  150:                    switch (ch) {
+    #####:  151:                    case '"': *dst++ = '"'; break;
+    #####:  152:                    case '\\': *dst++ = '\\'; break;
+    #####:  153:                    case '/': *dst++ = '/'; break;
+    #####:  154:                    case 'b': *dst++ = '\b'; break;
+    #####:  155:                    case 'f': *dst++ = '\f'; break;
+    #####:  156:                    case 'n': *dst++ = '\n'; break;
+    #####:  157:                    case 'r': *dst++ = '\r'; break;
+    #####:  158:                    case 't': *dst++ = '\t'; break;
+    #####:  159:                    case 'u': { /* load unicode */
+    #####:  160:                        dst = load_unicode(dst, json);
+    #####:  161:                        if (dst == NULL) {
+    #####:  162:                            be_free(vm, buf, len);
+    #####:  163:                            return NULL;
+        -:  164:                        }
+    #####:  165:                        json += 4;
+    #####:  166:                        break;
+        -:  167:                    }
+    #####:  168:                    default: be_free(vm, buf, len); return NULL; /* error */
+        -:  169:                    }
+        -:  170:                } else {
+    #####:  171:                    *dst++ = (char)ch;
+        -:  172:                }
+        -:  173:            }
+        -:  174:            be_assert(ch == '"');
+    #####:  175:            be_pushnstring(vm, buf, cast_int(dst - buf));
+    #####:  176:            be_free(vm, buf, len);
+    #####:  177:            return json + 1; /* skip '"' */
+        -:  178:        }
+        -:  179:    }
+    #####:  180:    return NULL;
+        -:  181:}
+        -:  182:
+    #####:  183:static const char* parser_field(bvm *vm, const char *json)
+        -:  184:{
+    #####:  185:    if (json && *json == '"') {
+    #####:  186:        json = parser_string(vm, json);
+    #####:  187:        if (json) {
+    #####:  188:            json = match_char(json, ':');
+    #####:  189:            if (json) {
+    #####:  190:                json = parser_value(vm, json);
+    #####:  191:                if (json) {
+    #####:  192:                    be_data_insert(vm, -3);
+    #####:  193:                    be_pop(vm, 2); /* pop key and value */
+    #####:  194:                    return json;
+        -:  195:                }
+        -:  196:            }
+    #####:  197:            be_pop(vm, 1); /* pop key */
+        -:  198:        }
+        -:  199:    }
+    #####:  200:    return NULL;
+        -:  201:}
+        -:  202:
+    #####:  203:static const char* parser_object(bvm *vm, const char *json)
+        -:  204:{
+    #####:  205:    json = match_char(json, '{');
+    #####:  206:    be_newmap(vm);
+    #####:  207:    if (*json != '}') {
+        -:  208:        const char *s;
+    #####:  209:        json = parser_field(vm, json);
+    #####:  210:        if (json == NULL) {
+    #####:  211:            be_pop(vm, 1); /* pop map */
+    #####:  212:            return NULL;
+        -:  213:        }
+    #####:  214:        while ((s = match_char(json, ',')) != NULL) {
+    #####:  215:            json = parser_field(vm, s);
+    #####:  216:            if (json == NULL) {
+    #####:  217:                be_pop(vm, 1); /* pop map */
+    #####:  218:                return NULL;
+        -:  219:            }
+        -:  220:        }
+        -:  221:    }
+    #####:  222:    if ((json = match_char(json, '}')) == NULL) {
+    #####:  223:        be_pop(vm, 1); /* pop map */
+    #####:  224:        return NULL;
+        -:  225:    }
+    #####:  226:    json2berry(vm, "map");
+    #####:  227:    return json;
+        -:  228:}
+        -:  229:
+    #####:  230:static const char* parser_array(bvm *vm, const char *json)
+        -:  231:{
+    #####:  232:    json = match_char(json, '[');
+    #####:  233:    be_newlist(vm);
+    #####:  234:    if (*json != ']') {
+        -:  235:        const char *s;
+    #####:  236:        json = parser_value(vm, json);
+    #####:  237:        if (json == NULL) {
+    #####:  238:            be_pop(vm, 1); /* pop map */
+    #####:  239:            return NULL;
+        -:  240:        }
+    #####:  241:        be_data_push(vm, -2);
+    #####:  242:        be_pop(vm, 1); /* pop value */
+    #####:  243:        while ((s = match_char(json, ',')) != NULL) {
+    #####:  244:            json = parser_value(vm, s);
+    #####:  245:            if (json == NULL) {
+    #####:  246:                be_pop(vm, 1); /* pop map */
+    #####:  247:                return NULL;
+        -:  248:            }
+    #####:  249:            be_data_push(vm, -2);
+    #####:  250:            be_pop(vm, 1); /* pop value */
+        -:  251:        }
+        -:  252:    }
+    #####:  253:    if ((json = match_char(json, ']')) == NULL) {
+    #####:  254:        be_pop(vm, 1); /* pop map */
+    #####:  255:        return NULL;
+        -:  256:    }
+    #####:  257:    json2berry(vm, "list");
+    #####:  258:    return json;
+        -:  259:}
+        -:  260:
+        -:  261:/* parser json value */
+    #####:  262:static const char* parser_value(bvm *vm, const char *json)
+        -:  263:{
+    #####:  264:    json = skip_space(json);
+    #####:  265:    switch (*json) {
+    #####:  266:    case '{': /* object */
+    #####:  267:        return parser_object(vm, json);
+    #####:  268:    case '[': /* array */
+    #####:  269:        return parser_array(vm, json);
+    #####:  270:    case '"': /* string */
+    #####:  271:        return parser_string(vm, json);
+    #####:  272:    case 't': /* true */
+    #####:  273:        return parser_true(vm, json);
+    #####:  274:    case 'f': /* false */
+    #####:  275:        return parser_false(vm, json);
+    #####:  276:    case 'n': /* null */
+    #####:  277:        return parser_null(vm, json);
+    #####:  278:    default: /* number */
+    #####:  279:        if (*json == '-' || is_digit(*json)) {
+        -:  280:            /* check invalid JSON syntax: 0\d+ */
+    #####:  281:            if (json[0] == '0' && is_digit(json[1])) {
+    #####:  282:                return NULL;
+        -:  283:            }
+    #####:  284:            return be_str2num(vm, json);
+        -:  285:        }
+        -:  286:    }
+    #####:  287:    return NULL;
+        -:  288:}
+        -:  289:
+    #####:  290:static int m_json_load(bvm *vm)
+        -:  291:{
+    #####:  292:    if (be_isstring(vm, 1)) {
+    #####:  293:        const char *json = be_tostring(vm, 1);
+    #####:  294:        json = parser_value(vm, json);
+    #####:  295:        if (json != NULL && *json == '\0') {
+    #####:  296:            be_return(vm);
+        -:  297:        }
+        -:  298:    }
+    #####:  299:    be_return_nil(vm);
+        -:  300:}
+        -:  301:
+    #####:  302:static void make_indent(bvm *vm, int stridx, int indent)
+        -:  303:{
+    #####:  304:    if (indent) {
+        -:  305:        char buf[MAX_INDENT * INDENT_WIDTH + 1];
+    #####:  306:        indent = (indent < MAX_INDENT ? indent : MAX_INDENT) * INDENT_WIDTH;
+    #####:  307:        memset(buf, INDENT_CHAR, indent);
+    #####:  308:        buf[indent] = '\0';
+    #####:  309:        stridx = be_absindex(vm, stridx);
+    #####:  310:        be_pushstring(vm, buf);
+    #####:  311:        be_strconcat(vm, stridx);
+    #####:  312:        be_pop(vm, 1);
+        -:  313:    }
+    #####:  314:}
+        -:  315:
+    #####:  316:void string_dump(bvm *vm, int index)
+        -:  317:{
+    #####:  318:    be_tostring(vm, index); /* convert value to string */
+    #####:  319:    be_toescape(vm, index, 'u');
+    #####:  320:    be_pushvalue(vm, index);
+    #####:  321:}
+        -:  322:
+    #####:  323:static void object_dump(bvm *vm, int *indent, int idx, int fmt)
+        -:  324:{
+    #####:  325:    be_getmember(vm, idx, ".p");
+    #####:  326:    be_pushstring(vm, fmt ? "{\n" : "{");
+    #####:  327:    be_pushiter(vm, -2); /* map iterator use 1 register */
+    #####:  328:    *indent += fmt;
+    #####:  329:    while (be_iter_hasnext(vm, -3)) {
+    #####:  330:        make_indent(vm, -2, fmt ? *indent : 0);
+    #####:  331:        be_iter_next(vm, -3);
+        -:  332:        /* key.tostring() */
+    #####:  333:        string_dump(vm, -2);
+    #####:  334:        be_strconcat(vm, -5);
+    #####:  335:        be_pop(vm, 1);
+    #####:  336:        be_pushstring(vm, fmt ? ": " : ":"); /* add ': ' */
+    #####:  337:        be_strconcat(vm, -5);
+    #####:  338:        be_pop(vm, 1);
+        -:  339:        /* value.tostring() */
+    #####:  340:        value_dump(vm, indent, -1, fmt);
+    #####:  341:        be_strconcat(vm, -5);
+    #####:  342:        be_pop(vm, 3);
+    #####:  343:        if (be_iter_hasnext(vm, -3)) {
+    #####:  344:            be_pushstring(vm, fmt ? ",\n" : ",");
+    #####:  345:            be_strconcat(vm, -3);
+    #####:  346:            be_pop(vm, 1);
+    #####:  347:        } else if (fmt) {
+    #####:  348:            be_pushstring(vm, "\n");
+    #####:  349:            be_strconcat(vm, -3);
+    #####:  350:            be_pop(vm, 1);
+        -:  351:        }
+        -:  352:    }
+    #####:  353:    *indent -= fmt;
+    #####:  354:    be_pop(vm, 1); /* pop iterator */
+    #####:  355:    make_indent(vm, -1,  fmt ? *indent : 0);
+    #####:  356:    be_pushstring(vm, "}");
+    #####:  357:    be_strconcat(vm, -2);
+    #####:  358:    be_moveto(vm, -2, -3);
+    #####:  359:    be_pop(vm, 2);
+    #####:  360:}
+        -:  361:
+    #####:  362:static void array_dump(bvm *vm, int *indent, int idx, int fmt)
+        -:  363:{
+    #####:  364:    be_getmember(vm, idx, ".p");
+    #####:  365:    be_pushstring(vm, fmt ? "[\n" : "[");
+    #####:  366:    be_pushiter(vm, -2);
+    #####:  367:    *indent += fmt;
+    #####:  368:    while (be_iter_hasnext(vm, -3)) {
+    #####:  369:        make_indent(vm, -2,  fmt ? *indent : 0);
+    #####:  370:        be_iter_next(vm, -3);
+    #####:  371:        value_dump(vm, indent, -1, fmt);
+    #####:  372:        be_strconcat(vm, -4);
+    #####:  373:        be_pop(vm, 2);
+    #####:  374:        if (be_iter_hasnext(vm, -3)) {
+    #####:  375:            be_pushstring(vm, fmt ? ",\n" : ",");
+    #####:  376:            be_strconcat(vm, -3);
+    #####:  377:            be_pop(vm, 1);
+    #####:  378:        } else if (fmt) {
+    #####:  379:            be_pushstring(vm, "\n");
+    #####:  380:            be_strconcat(vm, -3);
+    #####:  381:            be_pop(vm, 1);
+        -:  382:        }
+        -:  383:    }
+    #####:  384:    *indent -= fmt;
+    #####:  385:    be_pop(vm, 1); /* pop iterator */
+    #####:  386:    make_indent(vm, -1,  fmt ? *indent : 0);
+    #####:  387:    be_pushstring(vm, "]");
+    #####:  388:    be_strconcat(vm, -2);
+    #####:  389:    be_moveto(vm, -2, -3);
+    #####:  390:    be_pop(vm, 2);
+    #####:  391:}
+        -:  392:
+    #####:  393:static void value_dump(bvm *vm, int *indent, int idx, int fmt)
+        -:  394:{
+    #####:  395:    if (is_object(vm, "map", idx)) { /* convert to json object */
+    #####:  396:        object_dump(vm, indent, idx, fmt);
+    #####:  397:    } else if (is_object(vm, "list", idx)) { /* convert to json array */
+    #####:  398:        array_dump(vm, indent, idx, fmt);
+    #####:  399:    } else if (be_isnil(vm, idx)) { /* convert to json null */
+    #####:  400:        be_pushstring(vm, "null");
+    #####:  401:    } else if (be_isnumber(vm, idx) || be_isbool(vm, idx)) { /* convert to json number and boolean */
+    #####:  402:        be_tostring(vm, idx);
+    #####:  403:        be_pushvalue(vm, idx); /* push to top */
+        -:  404:    } else { /* convert to string */
+    #####:  405:        string_dump(vm, idx);
+        -:  406:    }
+    #####:  407:}
+        -:  408:
+    #####:  409:static int m_json_dump(bvm *vm)
+        -:  410:{
+    #####:  411:    int indent = 0, argc = be_top(vm);
+    #####:  412:    int fmt = 0;
+    #####:  413:    if (argc > 1) {
+    #####:  414:        fmt = !strcmp(be_tostring(vm, 2), "format");
+        -:  415:    }
+    #####:  416:    value_dump(vm, &indent, 1, fmt);
+    #####:  417:    be_return(vm);
+        -:  418:}
+        -:  419:
+        -:  420:#if !BE_USE_PRECOMPILED_OBJECT
+        -:  421:be_native_module_attr_table(json) {
+        -:  422:    be_native_module_function("load", m_json_load),
+        -:  423:    be_native_module_function("dump", m_json_dump)
+        -:  424:};
+        -:  425:
+        -:  426:be_define_native_module(json, NULL);
+        -:  427:#else
+        -:  428:/* @const_object_info_begin
+        -:  429:module json (scope: global, depend: BE_USE_JSON_MODULE) {
+        -:  430:    load, func(m_json_load)
+        -:  431:    dump, func(m_json_dump)
+        -:  432:}
+        -:  433:@const_object_info_end */
+        -:  434:#include "../generate/be_fixed_json.h"
+        -:  435:#endif
+        -:  436:
+        -:  437:#endif /* BE_USE_JSON_MODULE */

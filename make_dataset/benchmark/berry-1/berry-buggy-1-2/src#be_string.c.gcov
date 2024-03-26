@@ -1,0 +1,300 @@
+        -:    0:Source:src/be_string.c
+        -:    0:Graph:./src/be_string.gcno
+        -:    0:Data:./src/be_string.gcda
+        -:    0:Runs:1
+        -:    1:/********************************************************************
+        -:    2:** Copyright (c) 2018-2020 Guan Wenliang
+        -:    3:** This file is part of the Berry default interpreter.
+        -:    4:** skiars@qq.com, https://github.com/Skiars/berry
+        -:    5:** See Copyright Notice in the LICENSE file or at
+        -:    6:** https://github.com/Skiars/berry/blob/master/LICENSE
+        -:    7:********************************************************************/
+        -:    8:#include "be_string.h"
+        -:    9:#include "be_vm.h"
+        -:   10:#include "be_mem.h"
+        -:   11:#include "be_constobj.h"
+        -:   12:#include <string.h>
+        -:   13:
+        -:   14:#define next(_s)    cast(void*, cast(bstring*, (_s)->next))
+        -:   15:#define sstr(_s)    cast(char*, cast(bsstring*, _s) + 1)
+        -:   16:#define lstr(_s)    cast(char*, cast(blstring*, _s) + 1)
+        -:   17:#define cstr(_s)    (cast(bcstring*, _s)->s)
+        -:   18:
+        -:   19:#define be_define_const_str(_name, _s, _hash, _extra, _len, _next) \
+        -:   20:    BERRY_LOCAL const bcstring be_const_str_##_name = {            \
+        -:   21:        .next = (bgcobject *)_next,                                \
+        -:   22:        .type = BE_STRING,                                         \
+        -:   23:        .marked = GC_CONST,                                        \
+        -:   24:        .extra = _extra,                                           \
+        -:   25:        .slen = _len,                                              \
+        -:   26:        .hash = _hash,                                             \
+        -:   27:        .s = _s                                                    \
+        -:   28:    }
+        -:   29:
+        -:   30:/* const string table */
+        -:   31:struct bconststrtab {
+        -:   32:    const bstring* const *table;
+        -:   33:    int count; /* string count */
+        -:   34:    int size;
+        -:   35:};
+        -:   36:
+        -:   37:#if BE_USE_PRECOMPILED_OBJECT
+        -:   38:#include "../generate/be_const_strtab_def.h"
+        -:   39:#endif
+        -:   40:
+       39:   41:int be_eqstr(bstring *s1, bstring *s2)
+        -:   42:{
+        -:   43:    int slen;
+       39:   44:    if (s1 == s2) { /* short string or the same string */
+       39:   45:        return 1;
+        -:   46:    }
+    #####:   47:    slen = s1->slen;
+        -:   48:    /* discard different lengths */
+    #####:   49:    if (slen != s2->slen) {
+    #####:   50:        return 0;
+        -:   51:    }
+        -:   52:    /* long string */
+    #####:   53:    if (slen == 255) {  /* s2->slen is also 255 */
+    #####:   54:        blstring *ls1 = cast(blstring*, s1);
+    #####:   55:        blstring *ls2 = cast(blstring*, s2);
+    #####:   56:        return ls1->llen == ls2->llen && !strcmp(lstr(ls1), lstr(ls2));
+        -:   57:    }
+        -:   58:    /* const short strings */
+    #####:   59:    if (gc_isconst(s1) || gc_isconst(s2)) { /* one of the two string is short const */
+    #####:   60:        if (cast(bcstring*, s1)->hash && cast(bcstring*, s2)->hash) {
+    #####:   61:            return 0; /* if they both have a hash, then we know they are different */
+        -:   62:        }
+    #####:   63:        return !strcmp(str(s1), str(s2));
+        -:   64:    }
+        -:   65:
+    #####:   66:    return 0;
+        -:   67:}
+        -:   68:
+        1:   69:static void resize(bvm *vm, int size)
+        -:   70:{
+        -:   71:    int i;
+        1:   72:    struct bstringtable *tab = &vm->strtab;
+        1:   73:    if (size > tab->size) {
+        2:   74:        tab->table = be_realloc(vm, tab->table,
+        1:   75:            tab->size * sizeof(bstring*), size * sizeof(bstring*));
+        9:   76:        for (i = tab->size; i < size; ++i) {
+        8:   77:            tab->table[i] = NULL;
+        -:   78:        }
+        -:   79:    }
+       1*:   80:    for (i = 0; i < tab->size; ++i) { /* rehash */
+    #####:   81:        bstring *p = tab->table[i];
+    #####:   82:        tab->table[i] = NULL;
+    #####:   83:        while (p) { /* for each node in the list */
+    #####:   84:            bstring *hnext = next(p);
+    #####:   85:            uint32_t hash = be_strhash(p) & (size - 1);
+    #####:   86:            p->next = cast(void*, tab->table[hash]);
+    #####:   87:            tab->table[hash] = p;
+    #####:   88:            p = hnext;
+        -:   89:        }
+        -:   90:    }
+        1:   91:    if (size < tab->size) {
+    #####:   92:        for (i = size; i < tab->size; ++i) {
+    #####:   93:            tab->table[i] = NULL;
+        -:   94:        }
+    #####:   95:        tab->table = be_realloc(vm, tab->table,
+    #####:   96:            tab->size * sizeof(bstring*), size * sizeof(bstring*));
+        -:   97:    }
+        1:   98:    tab->size = size;
+        1:   99:}
+        -:  100:
+        7:  101:static void free_sstring(bvm *vm, bstring *str)
+        -:  102:{
+        7:  103:    be_free(vm, str, sizeof(bsstring) + str->slen + 1);
+        7:  104:}
+        -:  105:
+        -:  106:/* FNV-1a Hash */
+      149:  107:static uint32_t str_hash(const char *str, size_t len)
+        -:  108:{
+      149:  109:    uint32_t hash = 2166136261u;
+        -:  110:    be_assert(str || len);
+      737:  111:    while (len--) {
+      588:  112:        hash = (hash ^ (unsigned char)*str++) * 16777619u;
+        -:  113:    }
+      149:  114:    return hash;
+        -:  115:}
+        -:  116:
+        1:  117:void be_string_init(bvm *vm)
+        -:  118:{
+        1:  119:    resize(vm, 8);
+        -:  120:#if !BE_USE_PRECOMPILED_OBJECT
+        -:  121:    /* the destructor name deinit needs to exist all the time, to ensure
+        -:  122:     * that it does not need to be created when the heap is exhausted. */
+        -:  123:    be_gc_fix(vm, cast(bgcobject*, str_literal(vm, "deinit")));
+        -:  124:#endif
+        -:  125:    /* be_const_str_deinit --> for precompiled */
+        1:  126:}
+        -:  127:
+        1:  128:void be_string_deleteall(bvm *vm)
+        -:  129:{
+        -:  130:    int i;
+        1:  131:    struct bstringtable *tab = &vm->strtab;
+        9:  132:    for (i = 0; i < tab->size; ++i) {
+        8:  133:        bstring *node = tab->table[i];
+       15:  134:        while (node) {
+        7:  135:            bstring *next = next(node);
+        7:  136:            free_sstring(vm, node);
+        7:  137:            node = next;
+        -:  138:        }
+        -:  139:    }
+        1:  140:    be_free(vm, tab->table, tab->size * sizeof(bstring*));
+        1:  141:}
+        -:  142:
+        7:  143:static bstring* createstrobj(bvm *vm, size_t len, int islong)
+        -:  144:{
+        7:  145:    size_t size = (islong ? sizeof(blstring)
+       7*:  146:                : sizeof(bsstring)) + len + 1;
+        7:  147:    bgcobject *gco = be_gc_newstr(vm, size, islong);
+       7*:  148:    bstring *s = cast_str(gco);
+        7:  149:    if (s) {
+       7*:  150:        s->slen = islong ? 255 : (bbyte)len;
+       7*:  151:        char *str = cast(char *, islong ? lstr(s) : sstr(s));
+        7:  152:        str[len] = '\0';
+        -:  153:    }
+        7:  154:    return s;
+        -:  155:}
+        -:  156:
+        -:  157:#if BE_USE_PRECOMPILED_OBJECT
+       69:  158:static bstring* find_conststr(const char *str, size_t len)
+        -:  159:{
+       69:  160:    const struct bconststrtab *tab = &m_const_string_table;
+       69:  161:    uint32_t hash = str_hash(str, len);
+       69:  162:    bcstring *s = (bcstring*)tab->table[hash % tab->size];
+      184:  163:    for (; s != NULL; s = next(s)) {
+      172:  164:        if (len == s->slen && !strncmp(str, s->s, len)) {
+       57:  165:            return (bstring*)s;
+        -:  166:        }
+        -:  167:    }
+       12:  168:    return NULL;
+        -:  169:}
+        -:  170:#endif
+        -:  171:
+       12:  172:static bstring* newshortstr(bvm *vm, const char *str, size_t len)
+        -:  173:{
+        -:  174:    bstring *s;
+       12:  175:    int size = vm->strtab.size;
+       12:  176:    uint32_t hash = str_hash(str, len);
+       12:  177:    bstring **list = vm->strtab.table + (hash & (size - 1));
+        -:  178:
+       14:  179:    for (s = *list; s != NULL; s = next(s)) {
+        7:  180:        if (len == s->slen && !strncmp(str, sstr(s), len)) {
+        5:  181:            return s;
+        -:  182:        }
+        -:  183:    }
+        7:  184:    s = createstrobj(vm, len, 0);
+        7:  185:    if (s) {
+        7:  186:        memcpy(cast(char *, sstr(s)), str, len);
+        7:  187:        s->extra = 0;
+        7:  188:        s->next = cast(void*, *list);
+        -:  189:#if BE_USE_STR_HASH_CACHE
+        -:  190:        cast(bsstring*, s)->hash = hash;
+        -:  191:#endif
+        7:  192:        *list = s;
+        7:  193:        vm->strtab.count++;
+        7:  194:        if (vm->strtab.count > size << 2) {
+    #####:  195:            resize(vm, size << 1);
+        -:  196:        }
+        -:  197:    }
+        7:  198:    return s;
+        -:  199:}
+        -:  200:
+    #####:  201:bstring* be_newlongstr(bvm *vm, const char *str, size_t len)
+        -:  202:{
+        -:  203:    bstring *s;
+        -:  204:    blstring *ls;
+    #####:  205:    s = createstrobj(vm, len, 1);
+    #####:  206:    ls = cast(blstring*, s);
+    #####:  207:    s->extra = 0;
+    #####:  208:    ls->llen = cast_int(len);
+    #####:  209:    if (str) { /* if the argument 'str' is NULL, we just allocate space */
+    #####:  210:        memcpy(cast(char *, lstr(s)), str, len);
+        -:  211:    }
+    #####:  212:    return s;
+        -:  213:}
+        -:  214:
+       54:  215:bstring* be_newstr(bvm *vm, const char *str)
+        -:  216:{
+       54:  217:    return be_newstrn(vm, str, strlen(str));
+        -:  218:}
+        -:  219:
+       69:  220:bstring *be_newstrn(bvm *vm, const char *str, size_t len)
+        -:  221:{
+       69:  222:    if (len <= SHORT_STR_MAX_LEN) {
+        -:  223:#if BE_USE_PRECOMPILED_OBJECT
+       69:  224:        bstring *s = find_conststr(str, len);
+       69:  225:        return s ? s : newshortstr(vm, str, len);
+        -:  226:#else
+        -:  227:        return newshortstr(vm, str, len);
+        -:  228:#endif
+        -:  229:    }
+    #####:  230:    return be_newlongstr(vm, str, len); /* long string */
+        -:  231:}
+        -:  232:
+        1:  233:void be_gcstrtab(bvm *vm)
+        -:  234:{
+        1:  235:    struct bstringtable *tab = &vm->strtab;
+        1:  236:    int size = tab->size, i;
+        9:  237:    for (i = 0; i < size; ++i) {
+        8:  238:        bstring **list = tab->table + i;
+        8:  239:        bstring *prev = NULL, *node, *next;
+       8*:  240:        for (node = *list; node; node = next) {
+    #####:  241:            next = next(node);
+    #####:  242:            if (!gc_isfixed(node) && gc_iswhite(node)) {
+    #####:  243:                free_sstring(vm, node);
+    #####:  244:                tab->count--;
+    #####:  245:                if (prev) { /* link list */
+    #####:  246:                    prev->next = cast(void*, next);
+        -:  247:                } else {
+    #####:  248:                    *list = next;
+        -:  249:                }
+        -:  250:            } else {
+    #####:  251:                prev = node;
+    #####:  252:                gc_setwhite(node);
+        -:  253:            }
+        -:  254:        }
+        -:  255:    }
+        1:  256:    if (tab->count < size >> 2 && size > 8) {
+    #####:  257:        resize(vm, size >> 1);
+        -:  258:    }
+        1:  259:}
+        -:  260:
+      172:  261:uint32_t be_strhash(const bstring *s)
+        -:  262:{
+      172:  263:    if (gc_isconst(s)) {
+      104:  264:        bcstring* cs = cast(bcstring*, s);
+      104:  265:        if (cs->hash) {  /* if hash is null we need to compute it */
+      104:  266:            return cs->hash;
+        -:  267:        } else {
+    #####:  268:            return str_hash(cstr(s), str_len(s));
+        -:  269:        }
+        -:  270:    }
+        -:  271:#if BE_USE_STR_HASH_CACHE
+        -:  272:    if (s->slen != 255) {
+        -:  273:        return cast(bsstring*, s)->hash;
+        -:  274:    }
+        -:  275:#endif
+      68*:  276:    return str_hash(str(s), str_len(s));
+        -:  277:}
+        -:  278:
+       74:  279:const char* be_str2cstr(const bstring *s)
+        -:  280:{
+        -:  281:    be_assert(cast_str(s) != NULL);
+       74:  282:    if (gc_isconst(s)) {
+    #####:  283:        return cstr(s);
+        -:  284:    }
+       74:  285:    if (s->slen == 255) {
+    #####:  286:        return lstr(s);
+        -:  287:    }
+       74:  288:    return sstr(s);
+        -:  289:}
+        -:  290:
+       22:  291:void be_str_setextra(bstring *s, int extra)
+        -:  292:{
+       22:  293:    if (!gc_isconst(s)) {
+    #####:  294:        s->extra = cast(bbyte, extra);
+        -:  295:    }
+       22:  296:}
