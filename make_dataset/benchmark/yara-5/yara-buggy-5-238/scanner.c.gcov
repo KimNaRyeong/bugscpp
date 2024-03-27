@@ -1,0 +1,750 @@
+        -:    0:Source:scanner.c
+        -:    0:Graph:/home/workspace/libyara/scanner.gcno
+        -:    0:Data:/home/workspace/libyara/scanner.gcda
+        -:    0:Runs:7
+        -:    1:/*
+        -:    2:Copyright (c) 2018. The YARA Authors. All Rights Reserved.
+        -:    3:
+        -:    4:Redistribution and use in source and binary forms, with or without modification,
+        -:    5:are permitted provided that the following conditions are met:
+        -:    6:
+        -:    7:1. Redistributions of source code must retain the above copyright notice, this
+        -:    8:list of conditions and the following disclaimer.
+        -:    9:
+        -:   10:2. Redistributions in binary form must reproduce the above copyright notice,
+        -:   11:this list of conditions and the following disclaimer in the documentation and/or
+        -:   12:other materials provided with the distribution.
+        -:   13:
+        -:   14:3. Neither the name of the copyright holder nor the names of its contributors
+        -:   15:may be used to endorse or promote products derived from this software without
+        -:   16:specific prior written permission.
+        -:   17:
+        -:   18:THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+        -:   19:ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+        -:   20:WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+        -:   21:DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+        -:   22:ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+        -:   23:(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+        -:   24:LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+        -:   25:ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        -:   26:(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+        -:   27:SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        -:   28:*/
+        -:   29:
+        -:   30:#include <stdlib.h>
+        -:   31:
+        -:   32:#include <yara/ahocorasick.h>
+        -:   33:#include <yara/error.h>
+        -:   34:#include <yara/exec.h>
+        -:   35:#include <yara/exefiles.h>
+        -:   36:#include <yara/mem.h>
+        -:   37:#include <yara/object.h>
+        -:   38:#include <yara/proc.h>
+        -:   39:#include <yara/scanner.h>
+        -:   40:#include <yara/types.h>
+        -:   41:#include <yara/libyara.h>
+        -:   42:
+        -:   43:#include "exception.h"
+        -:   44:
+        -:   45:
+    #####:   46:static int _yr_scanner_scan_mem_block(
+        -:   47:    YR_SCANNER* scanner,
+        -:   48:    const uint8_t* block_data,
+        -:   49:    YR_MEMORY_BLOCK* block)
+        -:   50:{
+    #####:   51:  YR_RULES* rules = scanner->rules;
+    #####:   52:  YR_AC_TRANSITION* transition_table = rules->ac_transition_table;
+    #####:   53:  uint32_t* match_table = rules->ac_match_table;
+        -:   54:
+        -:   55:  YR_AC_MATCH* match;
+        -:   56:  YR_AC_TRANSITION transition;
+        -:   57:
+    #####:   58:  size_t i = 0;
+    #####:   59:  uint32_t state = YR_AC_ROOT_STATE;
+        -:   60:  uint16_t index;
+        -:   61:
+    #####:   62:  while (i < block->size)
+        -:   63:  {
+    #####:   64:    if (i % 4096 == 0 && scanner->timeout > 0)
+        -:   65:    {
+    #####:   66:      if (yr_stopwatch_elapsed_ns(&scanner->stopwatch) > scanner->timeout)
+    #####:   67:        return ERROR_SCAN_TIMEOUT;
+        -:   68:    }
+        -:   69:
+    #####:   70:    if (match_table[state] != 0)
+        -:   71:    {
+        -:   72:      // If the entry corresponding to state N in the match table is zero, it
+        -:   73:      // means that there's no match associated to the state. If it's non-zero,
+        -:   74:      // its value is the 1-based index within ac_match_pool where the first
+        -:   75:      // match resides.
+        -:   76:
+    #####:   77:      match = &rules->ac_match_pool[match_table[state] - 1];
+        -:   78:
+    #####:   79:      while (match != NULL)
+        -:   80:      {
+    #####:   81:        if (match->backtrack <= i)
+        -:   82:        {
+    #####:   83:          FAIL_ON_ERROR(yr_scan_verify_match(
+        -:   84:              scanner,
+        -:   85:              match,
+        -:   86:              block_data,
+        -:   87:              block->size,
+        -:   88:              block->base,
+        -:   89:              i - match->backtrack));
+        -:   90:        }
+        -:   91:
+    #####:   92:        match = match->next;
+        -:   93:      }
+        -:   94:    }
+        -:   95:
+        -:   96:
+    #####:   97:    index = block_data[i++] + 1;
+    #####:   98:    transition = transition_table[state + index];
+        -:   99:
+    #####:  100:    while (YR_AC_INVALID_TRANSITION(transition, index))
+        -:  101:    {
+    #####:  102:      if (state != YR_AC_ROOT_STATE)
+        -:  103:      {
+    #####:  104:        state = YR_AC_NEXT_STATE(transition_table[state]);
+    #####:  105:        transition = transition_table[state + index];
+        -:  106:      }
+        -:  107:      else
+        -:  108:      {
+    #####:  109:        transition = 0;
+    #####:  110:        break;
+        -:  111:      }
+        -:  112:    }
+        -:  113:
+    #####:  114:    state = YR_AC_NEXT_STATE(transition);
+        -:  115:  }
+        -:  116:
+    #####:  117:  if (match_table[state] != 0)
+        -:  118:  {
+    #####:  119:    match = &rules->ac_match_pool[match_table[state] - 1];
+        -:  120:
+    #####:  121:    while (match != NULL)
+        -:  122:    {
+    #####:  123:      if (match->backtrack <= i)
+        -:  124:      {
+    #####:  125:        FAIL_ON_ERROR(yr_scan_verify_match(
+        -:  126:            scanner,
+        -:  127:            match,
+        -:  128:            block_data,
+        -:  129:            block->size,
+        -:  130:            block->base,
+        -:  131:            i - match->backtrack));
+        -:  132:      }
+        -:  133:
+    #####:  134:      match = match->next;
+        -:  135:    }
+        -:  136:  }
+        -:  137:
+    #####:  138:  return ERROR_SUCCESS;
+        -:  139:}
+        -:  140:
+        -:  141:
+    #####:  142:static void _yr_scanner_clean_matches(
+        -:  143:    YR_SCANNER* scanner)
+        -:  144:{
+    #####:  145:  memset(
+    #####:  146:      scanner->rule_matches_flags, 0,
+    #####:  147:      sizeof(YR_BITMASK) * YR_BITMASK_SIZE(scanner->rules->num_rules));
+        -:  148:
+    #####:  149:  memset(
+    #####:  150:      scanner->ns_unsatisfied_flags, 0,
+    #####:  151:      sizeof(YR_BITMASK) * YR_BITMASK_SIZE(scanner->rules->num_namespaces));
+        -:  152:
+    #####:  153:  memset(
+    #####:  154:      scanner->matches, 0,
+    #####:  155:      sizeof(YR_MATCHES) * scanner->rules->num_strings);
+        -:  156:
+    #####:  157:  memset(
+    #####:  158:      scanner->unconfirmed_matches, 0,
+    #####:  159:      sizeof(YR_MATCHES) * scanner->rules->num_strings);
+    #####:  160:}
+        -:  161:
+        -:  162:
+    #####:  163:YR_API int yr_scanner_create(
+        -:  164:    YR_RULES* rules,
+        -:  165:    YR_SCANNER** scanner)
+        -:  166:{
+        -:  167:  YR_EXTERNAL_VARIABLE* external;
+        -:  168:  YR_SCANNER* new_scanner;
+        -:  169:
+    #####:  170:  new_scanner = (YR_SCANNER*) yr_calloc(1, sizeof(YR_SCANNER));
+        -:  171:
+    #####:  172:  if (new_scanner == NULL)
+    #####:  173:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  174:
+    #####:  175:  FAIL_ON_ERROR_WITH_CLEANUP(
+        -:  176:      yr_hash_table_create(64, &new_scanner->objects_table),
+        -:  177:      yr_free(new_scanner));
+        -:  178:
+    #####:  179:  new_scanner->rules = rules;
+    #####:  180:  new_scanner->entry_point = YR_UNDEFINED;
+    #####:  181:  new_scanner->canary = rand();
+        -:  182:
+        -:  183:  // By default report both matching and non-matching rules.
+    #####:  184:  new_scanner->flags = \
+        -:  185:      SCAN_FLAGS_REPORT_RULES_MATCHING |
+        -:  186:      SCAN_FLAGS_REPORT_RULES_NOT_MATCHING;
+        -:  187:
+    #####:  188:  new_scanner->rule_matches_flags = (YR_BITMASK*) yr_calloc(
+    #####:  189:      sizeof(YR_BITMASK), YR_BITMASK_SIZE(rules->num_rules));
+        -:  190:
+    #####:  191:  new_scanner->ns_unsatisfied_flags = (YR_BITMASK*) yr_calloc(
+    #####:  192:      sizeof(YR_BITMASK), YR_BITMASK_SIZE(rules->num_namespaces));
+        -:  193:
+    #####:  194:  new_scanner->matches = (YR_MATCHES*) yr_calloc(
+    #####:  195:      rules->num_strings, sizeof(YR_MATCHES));
+        -:  196:
+    #####:  197:  new_scanner->unconfirmed_matches = (YR_MATCHES*) yr_calloc(
+    #####:  198:      rules->num_strings, sizeof(YR_MATCHES));
+        -:  199:
+        -:  200:  #ifdef YR_PROFILING_ENABLED
+        -:  201:  new_scanner->profiling_info = yr_calloc(rules->num_rules,  sizeof(YR_PROFILING_INFO));
+        -:  202:
+        -:  203:  if (new_scanner->profiling_info == NULL)
+        -:  204:  {
+        -:  205:    yr_scanner_destroy(new_scanner);
+        -:  206:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  207:  }
+        -:  208:  #else
+    #####:  209:  new_scanner->profiling_info = NULL;
+        -:  210:  #endif
+        -:  211:
+    #####:  212:  external = rules->externals_list_head;
+        -:  213:
+    #####:  214:  while (!EXTERNAL_VARIABLE_IS_NULL(external))
+        -:  215:  {
+        -:  216:    YR_OBJECT* object;
+        -:  217:
+    #####:  218:    FAIL_ON_ERROR_WITH_CLEANUP(
+        -:  219:        yr_object_from_external_variable(external, &object),
+        -:  220:        // cleanup
+        -:  221:        yr_scanner_destroy(new_scanner));
+        -:  222:
+    #####:  223:    FAIL_ON_ERROR_WITH_CLEANUP(
+        -:  224:        yr_hash_table_add(
+        -:  225:            new_scanner->objects_table,
+        -:  226:            external->identifier,
+        -:  227:            NULL,
+        -:  228:            (void*) object),
+        -:  229:        // cleanup
+        -:  230:        yr_object_destroy(object);
+        -:  231:        yr_scanner_destroy(new_scanner));
+        -:  232:
+    #####:  233:    yr_object_set_canary(object, new_scanner->canary);
+    #####:  234:    external++;
+        -:  235:  }
+        -:  236:
+    #####:  237:  *scanner = new_scanner;
+        -:  238:
+    #####:  239:  return ERROR_SUCCESS;
+        -:  240:}
+        -:  241:
+        -:  242:
+    #####:  243:YR_API void yr_scanner_destroy(
+        -:  244:    YR_SCANNER* scanner)
+        -:  245:{
+        -:  246:  RE_FIBER* fiber;
+        -:  247:  RE_FIBER* next_fiber;
+        -:  248:
+    #####:  249:  fiber = scanner->re_fiber_pool.fibers.head;
+        -:  250:
+    #####:  251:  while (fiber != NULL)
+        -:  252:  {
+    #####:  253:    next_fiber = fiber->next;
+    #####:  254:    yr_free(fiber);
+    #####:  255:    fiber = next_fiber;
+        -:  256:  }
+        -:  257:
+    #####:  258:  if (scanner->objects_table != NULL)
+        -:  259:  {
+    #####:  260:    yr_hash_table_destroy(
+        -:  261:        scanner->objects_table,
+        -:  262:        (YR_HASH_TABLE_FREE_VALUE_FUNC) yr_object_destroy);
+        -:  263:  }
+        -:  264:
+        -:  265:  #ifdef YR_PROFILING_ENABLED
+        -:  266:  yr_free(scanner->profiling_info);
+        -:  267:  #endif
+        -:  268:
+    #####:  269:  yr_free(scanner->rule_matches_flags);
+    #####:  270:  yr_free(scanner->ns_unsatisfied_flags);
+    #####:  271:  yr_free(scanner->matches);
+    #####:  272:  yr_free(scanner->unconfirmed_matches);
+    #####:  273:  yr_free(scanner);
+    #####:  274:}
+        -:  275:
+        -:  276:
+    #####:  277:YR_API void yr_scanner_set_callback(
+        -:  278:    YR_SCANNER* scanner,
+        -:  279:    YR_CALLBACK_FUNC callback,
+        -:  280:    void* user_data)
+        -:  281:{
+    #####:  282:  scanner->callback = callback;
+    #####:  283:  scanner->user_data = user_data;
+    #####:  284:}
+        -:  285:
+        -:  286:
+    #####:  287:YR_API void yr_scanner_set_timeout(
+        -:  288:    YR_SCANNER* scanner,
+        -:  289:    int timeout)
+        -:  290:{
+    #####:  291:  scanner->timeout = timeout * 1000000000L;  // convert timeout to nanoseconds.
+    #####:  292:}
+        -:  293:
+        -:  294:
+    #####:  295:YR_API void yr_scanner_set_flags(
+        -:  296:    YR_SCANNER* scanner,
+        -:  297:    int flags)
+        -:  298:{
+        -:  299:  // For backward compatibility, if neither SCAN_FLAGS_REPORT_RULES_MATCHING
+        -:  300:  // nor SCAN_FLAGS_REPORT_RULES_NOT_MATCHING are specified, both are assumed.
+        -:  301:
+    #####:  302:  if (!(flags & SCAN_FLAGS_REPORT_RULES_MATCHING) &&
+    #####:  303:      !(flags & SCAN_FLAGS_REPORT_RULES_NOT_MATCHING))
+        -:  304:  {
+    #####:  305:    flags |= SCAN_FLAGS_REPORT_RULES_MATCHING |
+        -:  306:             SCAN_FLAGS_REPORT_RULES_NOT_MATCHING;
+        -:  307:  }
+        -:  308:
+    #####:  309:  scanner->flags = flags;
+    #####:  310:}
+        -:  311:
+        -:  312:
+    #####:  313:YR_API int yr_scanner_define_integer_variable(
+        -:  314:    YR_SCANNER* scanner,
+        -:  315:    const char* identifier,
+        -:  316:    int64_t value)
+        -:  317:{
+    #####:  318:  YR_OBJECT* obj = (YR_OBJECT*) yr_hash_table_lookup(
+        -:  319:      scanner->objects_table,
+        -:  320:      identifier,
+        -:  321:      NULL);
+        -:  322:
+    #####:  323:  if (obj == NULL)
+    #####:  324:    return ERROR_INVALID_ARGUMENT;
+        -:  325:
+    #####:  326:  if (obj->type != OBJECT_TYPE_INTEGER)
+    #####:  327:    return ERROR_INVALID_EXTERNAL_VARIABLE_TYPE;
+        -:  328:
+    #####:  329:  return yr_object_set_integer(value, obj, NULL);
+        -:  330:}
+        -:  331:
+        -:  332:
+    #####:  333:YR_API int yr_scanner_define_boolean_variable(
+        -:  334:    YR_SCANNER* scanner,
+        -:  335:    const char* identifier,
+        -:  336:    int value)
+        -:  337:{
+    #####:  338:  return yr_scanner_define_integer_variable(scanner, identifier, value);
+        -:  339:}
+        -:  340:
+        -:  341:
+    #####:  342:YR_API int yr_scanner_define_float_variable(
+        -:  343:    YR_SCANNER* scanner,
+        -:  344:    const char* identifier,
+        -:  345:    double value)
+        -:  346:{
+    #####:  347:  YR_OBJECT* obj = (YR_OBJECT*) yr_hash_table_lookup(
+        -:  348:      scanner->objects_table,
+        -:  349:      identifier,
+        -:  350:      NULL);
+        -:  351:
+    #####:  352:  if (obj == NULL)
+    #####:  353:    return ERROR_INVALID_ARGUMENT;
+        -:  354:
+    #####:  355:  if (obj->type != OBJECT_TYPE_FLOAT)
+    #####:  356:    return ERROR_INVALID_EXTERNAL_VARIABLE_TYPE;
+        -:  357:
+    #####:  358:  return yr_object_set_float(value, obj, NULL);
+        -:  359:}
+        -:  360:
+        -:  361:
+    #####:  362:YR_API int yr_scanner_define_string_variable(
+        -:  363:    YR_SCANNER* scanner,
+        -:  364:    const char* identifier,
+        -:  365:    const char* value)
+        -:  366:{
+    #####:  367:  YR_OBJECT* obj = (YR_OBJECT*) yr_hash_table_lookup(
+        -:  368:      scanner->objects_table,
+        -:  369:      identifier,
+        -:  370:      NULL);
+        -:  371:
+    #####:  372:  if (obj == NULL)
+    #####:  373:    return ERROR_INVALID_ARGUMENT;
+        -:  374:
+    #####:  375:  if (obj->type != OBJECT_TYPE_STRING)
+    #####:  376:    return ERROR_INVALID_EXTERNAL_VARIABLE_TYPE;
+        -:  377:
+    #####:  378:  return yr_object_set_string(value, strlen(value), obj, NULL);
+        -:  379:}
+        -:  380:
+        -:  381:
+    #####:  382:YR_API int yr_scanner_scan_mem_blocks(
+        -:  383:    YR_SCANNER* scanner,
+        -:  384:    YR_MEMORY_BLOCK_ITERATOR* iterator)
+        -:  385:{
+        -:  386:  YR_RULES* rules;
+        -:  387:  YR_RULE* rule;
+        -:  388:  YR_MEMORY_BLOCK* block;
+        -:  389:
+        -:  390:  uint32_t max_match_data;
+        -:  391:
+    #####:  392:  int i, result = ERROR_SUCCESS;
+        -:  393:
+    #####:  394:  if (scanner->callback == NULL)
+    #####:  395:    return ERROR_CALLBACK_REQUIRED;
+        -:  396:
+    #####:  397:  FAIL_ON_ERROR(yr_get_configuration(
+        -:  398:      YR_CONFIG_MAX_MATCH_DATA,
+        -:  399:      &max_match_data))
+        -:  400:
+    #####:  401:  scanner->iterator = iterator;
+    #####:  402:  rules = scanner->rules;
+    #####:  403:  block = iterator->first(iterator);
+        -:  404:
+    #####:  405:  if (block == NULL)
+    #####:  406:    return ERROR_SUCCESS;
+        -:  407:
+    #####:  408:  scanner->file_size = block->size;
+        -:  409:
+        -:  410:  // Create the notebook that will hold the YR_MATCH structures representing
+        -:  411:  // each match found. This notebook will also contain snippets of the matching
+        -:  412:  // data (the "data" field in YR_MATCH points to the snippet corresponding to
+        -:  413:  // the match). Each notebook's page can store up to 1024 matches.
+    #####:  414:  result = yr_notebook_create(
+    #####:  415:      1024 * (sizeof(YR_MATCH) + max_match_data),
+        -:  416:      &scanner->matches_notebook);
+        -:  417:
+    #####:  418:  if (result != ERROR_SUCCESS)
+    #####:  419:    goto _exit;
+        -:  420:
+    #####:  421:  yr_stopwatch_start(&scanner->stopwatch);
+        -:  422:
+    #####:  423:  while (block != NULL)
+        -:  424:  {
+    #####:  425:    const uint8_t* data = block->fetch_data(block);
+        -:  426:
+        -:  427:    // fetch may fail
+    #####:  428:    if (data == NULL)
+        -:  429:    {
+    #####:  430:      block = iterator->next(iterator);
+    #####:  431:      continue;
+        -:  432:    }
+        -:  433:
+    #####:  434:    if (scanner->entry_point == YR_UNDEFINED)
+        -:  435:    {
+    #####:  436:      YR_TRYCATCH(
+        -:  437:        !(scanner->flags & SCAN_FLAGS_NO_TRYCATCH),
+        -:  438:        {
+        -:  439:          if (scanner->flags & SCAN_FLAGS_PROCESS_MEMORY)
+        -:  440:            scanner->entry_point = yr_get_entry_point_address(
+        -:  441:                data,
+        -:  442:                block->size,
+        -:  443:                block->base);
+        -:  444:          else
+        -:  445:            scanner->entry_point = yr_get_entry_point_offset(
+        -:  446:                data,
+        -:  447:                block->size);
+        -:  448:        },{});
+        -:  449:    }
+        -:  450:
+    #####:  451:    YR_TRYCATCH(
+        -:  452:      !(scanner->flags & SCAN_FLAGS_NO_TRYCATCH),
+        -:  453:      {
+        -:  454:        result = _yr_scanner_scan_mem_block(
+        -:  455:            scanner,
+        -:  456:            data,
+        -:  457:            block);
+        -:  458:      },{
+        -:  459:        result = ERROR_COULD_NOT_MAP_FILE;
+        -:  460:      });
+        -:  461:
+    #####:  462:    if (result != ERROR_SUCCESS)
+    #####:  463:      goto _exit;
+        -:  464:
+    #####:  465:    block = iterator->next(iterator);
+        -:  466:  }
+        -:  467:
+    #####:  468:  YR_TRYCATCH(
+        -:  469:    !(scanner->flags & SCAN_FLAGS_NO_TRYCATCH),
+        -:  470:    {
+        -:  471:      result = yr_execute_code(scanner);
+        -:  472:    },{
+        -:  473:      result = ERROR_COULD_NOT_MAP_FILE;
+        -:  474:    });
+        -:  475:
+    #####:  476:  if (result != ERROR_SUCCESS)
+    #####:  477:    goto _exit;
+        -:  478:
+    #####:  479:  for (i = 0, rule = rules->rules_list_head;
+    #####:  480:       !RULE_IS_NULL(rule);
+    #####:  481:       i++, rule++)
+        -:  482:  {
+    #####:  483:    int message = 0;
+        -:  484:
+    #####:  485:    if (yr_bitmask_is_set(scanner->rule_matches_flags, i) &&
+    #####:  486:        yr_bitmask_is_not_set(scanner->ns_unsatisfied_flags, rule->ns->idx))
+        -:  487:    {
+    #####:  488:      if (scanner->flags & SCAN_FLAGS_REPORT_RULES_MATCHING)
+    #####:  489:        message = CALLBACK_MSG_RULE_MATCHING;
+        -:  490:    }
+        -:  491:    else
+        -:  492:    {
+    #####:  493:      if (scanner->flags & SCAN_FLAGS_REPORT_RULES_NOT_MATCHING)
+    #####:  494:        message = CALLBACK_MSG_RULE_NOT_MATCHING;
+        -:  495:    }
+        -:  496:
+    #####:  497:    if (message != 0 && !RULE_IS_PRIVATE(rule))
+        -:  498:    {
+    #####:  499:      switch (scanner->callback(scanner, message, rule, scanner->user_data))
+        -:  500:      {
+    #####:  501:        case CALLBACK_ABORT:
+    #####:  502:          result = ERROR_SUCCESS;
+    #####:  503:          goto _exit;
+        -:  504:
+    #####:  505:        case CALLBACK_ERROR:
+    #####:  506:          result = ERROR_CALLBACK_ERROR;
+    #####:  507:          goto _exit;
+        -:  508:      }
+        -:  509:    }
+        -:  510:  }
+        -:  511:
+    #####:  512:  scanner->callback(
+        -:  513:      scanner,
+        -:  514:      CALLBACK_MSG_SCAN_FINISHED,
+        -:  515:      NULL,
+        -:  516:      scanner->user_data);
+        -:  517:
+    #####:  518:_exit:
+        -:  519:
+    #####:  520:  _yr_scanner_clean_matches(scanner);
+        -:  521:
+    #####:  522:  if (scanner->matches_notebook != NULL)
+        -:  523:  {
+    #####:  524:    yr_notebook_destroy(scanner->matches_notebook);
+    #####:  525:    scanner->matches_notebook = NULL;
+        -:  526:  }
+        -:  527:
+    #####:  528:  return result;
+        -:  529:}
+        -:  530:
+        -:  531:
+    #####:  532:static YR_MEMORY_BLOCK* _yr_get_first_block(
+        -:  533:    YR_MEMORY_BLOCK_ITERATOR* iterator)
+        -:  534:{
+    #####:  535:  return (YR_MEMORY_BLOCK*) iterator->context;
+        -:  536:}
+        -:  537:
+        -:  538:
+    #####:  539:static YR_MEMORY_BLOCK* _yr_get_next_block(
+        -:  540:    YR_MEMORY_BLOCK_ITERATOR* iterator)
+        -:  541:{
+    #####:  542:  return NULL;
+        -:  543:}
+        -:  544:
+        -:  545:
+    #####:  546:static const uint8_t* _yr_fetch_block_data(
+        -:  547:    YR_MEMORY_BLOCK* block)
+        -:  548:{
+    #####:  549:  return (const uint8_t*) block->context;
+        -:  550:}
+        -:  551:
+        -:  552:
+    #####:  553:YR_API int yr_scanner_scan_mem(
+        -:  554:    YR_SCANNER* scanner,
+        -:  555:    const uint8_t* buffer,
+        -:  556:    size_t buffer_size)
+        -:  557:{
+        -:  558:  YR_MEMORY_BLOCK block;
+        -:  559:  YR_MEMORY_BLOCK_ITERATOR iterator;
+        -:  560:
+    #####:  561:  block.size = buffer_size;
+    #####:  562:  block.base = 0;
+    #####:  563:  block.fetch_data = _yr_fetch_block_data;
+    #####:  564:  block.context = (void*) buffer;
+        -:  565:
+    #####:  566:  iterator.context = &block;
+    #####:  567:  iterator.first = _yr_get_first_block;
+    #####:  568:  iterator.next = _yr_get_next_block;
+        -:  569:
+    #####:  570:  return yr_scanner_scan_mem_blocks(scanner, &iterator);
+        -:  571:}
+        -:  572:
+        -:  573:
+    #####:  574:YR_API int yr_scanner_scan_file(
+        -:  575:    YR_SCANNER* scanner,
+        -:  576:    const char* filename)
+        -:  577:{
+        -:  578:  YR_MAPPED_FILE mfile;
+        -:  579:
+    #####:  580:  int result = yr_filemap_map(filename, &mfile);
+        -:  581:
+    #####:  582:  if (result == ERROR_SUCCESS)
+        -:  583:  {
+    #####:  584:    result = yr_scanner_scan_mem(scanner, mfile.data, mfile.size);
+    #####:  585:    yr_filemap_unmap(&mfile);
+        -:  586:  }
+        -:  587:
+    #####:  588:  return result;
+        -:  589:}
+        -:  590:
+        -:  591:
+    #####:  592:YR_API int yr_scanner_scan_fd(
+        -:  593:    YR_SCANNER* scanner,
+        -:  594:    YR_FILE_DESCRIPTOR fd)
+        -:  595:{
+        -:  596:  YR_MAPPED_FILE mfile;
+        -:  597:
+    #####:  598:  int result = yr_filemap_map_fd(fd, 0, 0, &mfile);
+        -:  599:
+    #####:  600:  if (result == ERROR_SUCCESS)
+        -:  601:  {
+    #####:  602:    result = yr_scanner_scan_mem(scanner, mfile.data, mfile.size);
+    #####:  603:    yr_filemap_unmap_fd(&mfile);
+        -:  604:  }
+        -:  605:
+    #####:  606:  return result;
+        -:  607:}
+        -:  608:
+        -:  609:
+    #####:  610:YR_API int yr_scanner_scan_proc(
+        -:  611:    YR_SCANNER* scanner,
+        -:  612:    int pid)
+        -:  613:{
+        -:  614:  YR_MEMORY_BLOCK_ITERATOR iterator;
+        -:  615:
+    #####:  616:  int result = yr_process_open_iterator(pid, &iterator);
+        -:  617:
+    #####:  618:  if (result == ERROR_SUCCESS)
+        -:  619:  {
+    #####:  620:    int prev_flags = scanner->flags;
+    #####:  621:    scanner->flags |= SCAN_FLAGS_PROCESS_MEMORY;
+    #####:  622:    result = yr_scanner_scan_mem_blocks(scanner, &iterator);
+    #####:  623:    scanner->flags = prev_flags;
+    #####:  624:    yr_process_close_iterator(&iterator);
+        -:  625:  }
+        -:  626:
+    #####:  627:  return result;
+        -:  628:}
+        -:  629:
+        -:  630:
+    #####:  631:YR_API YR_STRING* yr_scanner_last_error_string(
+        -:  632:    YR_SCANNER* scanner)
+        -:  633:{
+    #####:  634:  return scanner->last_error_string;
+        -:  635:}
+        -:  636:
+        -:  637:
+    #####:  638:YR_API YR_RULE* yr_scanner_last_error_rule(
+        -:  639:    YR_SCANNER* scanner)
+        -:  640:{
+    #####:  641:  if (scanner->last_error_string == NULL)
+    #####:  642:    return NULL;
+        -:  643:
+    #####:  644:  return &scanner->rules->rules_list_head[scanner->last_error_string->rule_idx];
+        -:  645:}
+        -:  646:
+        -:  647:
+    #####:  648:static int sort_by_cost_desc(
+        -:  649:    const struct YR_RULE_PROFILING_INFO* r1,
+        -:  650:    const struct YR_RULE_PROFILING_INFO* r2)
+        -:  651:{
+    #####:  652:  if (r1->cost < r2->cost)
+    #####:  653:    return 1;
+        -:  654:
+    #####:  655:  if (r1->cost > r2->cost)
+    #####:  656:    return -1;
+        -:  657:
+    #####:  658:  return 0;
+        -:  659:}
+        -:  660:
+        -:  661://
+        -:  662:// yr_scanner_get_profiling_info
+        -:  663://
+        -:  664:// Returns a pointer to an array of YR_RULE_PROFILING_INFO structures with
+        -:  665:// information about the cost of each rule. The rules are sorted by cost
+        -:  666:// in descending order and the last item in the array has rule == NULL.
+        -:  667:// The caller is responsible for freeing the returned array by calling
+        -:  668:// yr_free. Calling this function only makes sense if YR_PROFILING_ENABLED
+        -:  669:// is defined, if not, the cost for each rule won't be computed, it will be
+        -:  670:// set to 0 for all rules.
+        -:  671://
+    #####:  672:YR_API YR_RULE_PROFILING_INFO* yr_scanner_get_profiling_info(
+        -:  673:    YR_SCANNER* scanner)
+        -:  674:{
+    #####:  675:  YR_RULE_PROFILING_INFO* profiling_info = yr_malloc(
+    #####:  676:      (scanner->rules->num_rules + 1) * sizeof(YR_RULE_PROFILING_INFO));
+        -:  677:
+    #####:  678:  if (profiling_info == NULL)
+    #####:  679:    return NULL;
+        -:  680:
+    #####:  681:  for (uint32_t i = 0; i < scanner->rules->num_rules; i++)
+        -:  682:  {
+    #####:  683:    profiling_info[i].rule = &scanner->rules->rules_list_head[i];
+        -:  684:    #ifdef YR_PROFILING_ENABLED
+        -:  685:    profiling_info[i].cost = \
+        -:  686:        scanner->profiling_info[i].exec_time +
+        -:  687:        (scanner->profiling_info[i].atom_matches *
+        -:  688:         scanner->profiling_info[i].match_time) /
+        -:  689:        YR_MATCH_VERIFICATION_PROFILING_RATE;
+        -:  690:    #else
+    #####:  691:    memset(&profiling_info[i], 0, sizeof(YR_RULE_PROFILING_INFO));
+        -:  692:    #endif
+        -:  693:  }
+        -:  694:
+    #####:  695:  qsort(
+        -:  696:      profiling_info,
+    #####:  697:      scanner->rules->num_rules,
+        -:  698:      sizeof(YR_RULE_PROFILING_INFO),
+        -:  699:      (int (*)(const void *, const void *)) sort_by_cost_desc);
+        -:  700:
+    #####:  701:  profiling_info[scanner->rules->num_rules].rule = NULL;
+    #####:  702:  profiling_info[scanner->rules->num_rules].cost = 0;
+        -:  703:
+    #####:  704:  return profiling_info;
+        -:  705:}
+        -:  706:
+        -:  707:
+    #####:  708:YR_API void yr_scanner_reset_profiling_info(
+        -:  709:    YR_SCANNER* scanner)
+        -:  710:{
+        -:  711:  #ifdef YR_PROFILING_ENABLED
+        -:  712:  memset(
+        -:  713:    scanner->profiling_info, 0,
+        -:  714:    scanner->rules->num_rules * sizeof(YR_PROFILING_INFO));
+        -:  715:  #endif
+    #####:  716:}
+        -:  717:
+    #####:  718:YR_API int yr_scanner_print_profiling_info(
+        -:  719:    YR_SCANNER* scanner)
+        -:  720:{
+    #####:  721:  printf("\n===== PROFILING INFORMATION =====\n\n");
+        -:  722:
+    #####:  723:  YR_RULE_PROFILING_INFO* info = yr_scanner_get_profiling_info(scanner);
+        -:  724:
+    #####:  725:  if (info == NULL)
+    #####:  726:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  727:
+    #####:  728:  YR_RULE_PROFILING_INFO* rpi = info;
+        -:  729:
+    #####:  730:  while (rpi->rule != NULL)
+        -:  731:  {
+    #####:  732:    printf(
+        -:  733:        "%10" PRIu64 " %s:%s: \n",
+        -:  734:        rpi->cost,
+    #####:  735:        rpi->rule->ns->name,
+    #####:  736:        rpi->rule->identifier);
+        -:  737:
+    #####:  738:    rpi++;
+        -:  739:  }
+        -:  740:
+    #####:  741:  printf("\n=================================\n");
+        -:  742:
+    #####:  743:  yr_free(info);
+        -:  744:
+    #####:  745:  return ERROR_SUCCESS;
+        -:  746:}

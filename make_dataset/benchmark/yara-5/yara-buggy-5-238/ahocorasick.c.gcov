@@ -1,0 +1,957 @@
+        -:    0:Source:ahocorasick.c
+        -:    0:Graph:/home/workspace/libyara/ahocorasick.gcno
+        -:    0:Data:/home/workspace/libyara/ahocorasick.gcda
+        -:    0:Runs:7
+        -:    1:/*
+        -:    2:Copyright (c) 2013. The YARA Authors. All Rights Reserved.
+        -:    3:
+        -:    4:Redistribution and use in source and binary forms, with or without modification,
+        -:    5:are permitted provided that the following conditions are met:
+        -:    6:
+        -:    7:1. Redistributions of source code must retain the above copyright notice, this
+        -:    8:list of conditions and the following disclaimer.
+        -:    9:
+        -:   10:2. Redistributions in binary form must reproduce the above copyright notice,
+        -:   11:this list of conditions and the following disclaimer in the documentation and/or
+        -:   12:other materials provided with the distribution.
+        -:   13:
+        -:   14:3. Neither the name of the copyright holder nor the names of its contributors
+        -:   15:may be used to endorse or promote products derived from this software without
+        -:   16:specific prior written permission.
+        -:   17:
+        -:   18:THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+        -:   19:ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+        -:   20:WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+        -:   21:DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+        -:   22:ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+        -:   23:(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+        -:   24:LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+        -:   25:ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        -:   26:(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+        -:   27:SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        -:   28:*/
+        -:   29:
+        -:   30:#include <assert.h>
+        -:   31:#include <stddef.h>
+        -:   32:#include <string.h>
+        -:   33:
+        -:   34:#include <yara/arena.h>
+        -:   35:#include <yara/ahocorasick.h>
+        -:   36:#include <yara/compiler.h>
+        -:   37:#include <yara/error.h>
+        -:   38:#include <yara/utils.h>
+        -:   39:#include <yara/mem.h>
+        -:   40:
+        -:   41:
+        -:   42:typedef struct _QUEUE_NODE
+        -:   43:{
+        -:   44:  YR_AC_STATE* value;
+        -:   45:
+        -:   46:  struct _QUEUE_NODE*  previous;
+        -:   47:  struct _QUEUE_NODE*  next;
+        -:   48:
+        -:   49:} QUEUE_NODE;
+        -:   50:
+        -:   51:
+        -:   52:typedef struct _QUEUE
+        -:   53:{
+        -:   54:  QUEUE_NODE* head;
+        -:   55:  QUEUE_NODE* tail;
+        -:   56:
+        -:   57:} QUEUE;
+        -:   58:
+        -:   59:
+        -:   60://
+        -:   61:// _yr_ac_queue_push
+        -:   62://
+        -:   63:// Pushes a state in a queue.
+        -:   64://
+        -:   65:// Args:
+        -:   66://    QUEUE* queue     - The queue
+        -:   67://    YR_AC_STATE* state  - The state
+        -:   68://
+        -:   69:// Returns:
+        -:   70://    ERROR_SUCCESS if succeed or the corresponding error code otherwise.
+        -:   71://
+        -:   72:
+    #####:   73:static int _yr_ac_queue_push(
+        -:   74:    QUEUE* queue,
+        -:   75:    YR_AC_STATE* value)
+        -:   76:{
+        -:   77:  QUEUE_NODE* pushed_node;
+        -:   78:
+    #####:   79:  pushed_node = (QUEUE_NODE*) yr_malloc(sizeof(QUEUE_NODE));
+        -:   80:
+    #####:   81:  if (pushed_node == NULL)
+    #####:   82:    return ERROR_INSUFFICIENT_MEMORY;
+        -:   83:
+    #####:   84:  pushed_node->previous = queue->tail;
+    #####:   85:  pushed_node->next = NULL;
+    #####:   86:  pushed_node->value = value;
+        -:   87:
+    #####:   88:  if (queue->tail != NULL)
+    #####:   89:    queue->tail->next = pushed_node;
+        -:   90:  else // queue is empty
+    #####:   91:    queue->head = pushed_node;
+        -:   92:
+    #####:   93:  queue->tail = pushed_node;
+        -:   94:
+    #####:   95:  return ERROR_SUCCESS;
+        -:   96:}
+        -:   97:
+        -:   98:
+        -:   99://
+        -:  100:// _yr_ac_queue_pop
+        -:  101://
+        -:  102:// Pops a state from a queue.
+        -:  103://
+        -:  104:// Args:
+        -:  105://    QUEUE* queue     - The queue
+        -:  106://
+        -:  107:// Returns:
+        -:  108://    Pointer to the poped state.
+        -:  109://
+        -:  110:
+    #####:  111:static YR_AC_STATE* _yr_ac_queue_pop(
+        -:  112:    QUEUE* queue)
+        -:  113:{
+        -:  114:  YR_AC_STATE* result;
+        -:  115:  QUEUE_NODE* popped_node;
+        -:  116:
+    #####:  117:  if (queue->head == NULL)
+    #####:  118:    return NULL;
+        -:  119:
+    #####:  120:  popped_node = queue->head;
+    #####:  121:  queue->head = popped_node->next;
+        -:  122:
+    #####:  123:  if (queue->head)
+    #####:  124:    queue->head->previous = NULL;
+        -:  125:  else // queue is empty
+    #####:  126:    queue->tail = NULL;
+        -:  127:
+    #####:  128:  result = popped_node->value;
+        -:  129:
+    #####:  130:  yr_free(popped_node);
+    #####:  131:  return result;
+        -:  132:}
+        -:  133:
+        -:  134:
+        -:  135://
+        -:  136:// _yr_ac_queue_is_empty
+        -:  137://
+        -:  138:// Checks if a queue is empty.
+        -:  139://
+        -:  140:// Args:
+        -:  141://    QUEUE* queue     - The queue
+        -:  142://
+        -:  143:// Returns:
+        -:  144://    true if queue is empty, false otherwise.
+        -:  145://
+        -:  146:
+    #####:  147:static int _yr_ac_queue_is_empty(
+        -:  148:    QUEUE* queue)
+        -:  149:{
+    #####:  150:  return queue->head == NULL;
+        -:  151:}
+        -:  152:
+        -:  153:
+        -:  154://
+        -:  155:// _yr_ac_next_state
+        -:  156://
+        -:  157:// Given an automaton state and an input symbol, returns the new state
+        -:  158:// after reading the input symbol.
+        -:  159://
+        -:  160:// Args:
+        -:  161://    YR_AC_STATE* state     - Automaton state
+        -:  162://    uint8_t input       - Input symbol
+        -:  163://
+        -:  164:// Returns:
+        -:  165://   Pointer to the next automaton state.
+        -:  166://
+        -:  167:
+     1864:  168:static YR_AC_STATE* _yr_ac_next_state(
+        -:  169:    YR_AC_STATE* state,
+        -:  170:    uint8_t input)
+        -:  171:{
+     1864:  172:  YR_AC_STATE* next_state = state->first_child;
+        -:  173:
+    67264:  174:  while (next_state != NULL)
+        -:  175:  {
+    66195:  176:    if (next_state->input == input)
+      795:  177:      return next_state;
+        -:  178:
+    65400:  179:    next_state = next_state->siblings;
+        -:  180:  }
+        -:  181:
+     1069:  182:  return NULL;
+        -:  183:}
+        -:  184:
+        -:  185:
+        -:  186://
+        -:  187:// _yr_ac_state_create
+        -:  188://
+        -:  189:// Creates a new automaton state, the automaton will transition from
+        -:  190:// the given state to the new state after reading the input symbol.
+        -:  191://
+        -:  192:// Args:
+        -:  193://   YR_AC_STATE* state  - Origin state
+        -:  194://   uint8_t input       - Input symbol
+        -:  195://
+        -:  196:// Returns:
+        -:  197://   YR_AC_STATE* pointer to the newly allocated state or NULL in case
+        -:  198://   of error.
+        -:  199:
+     1069:  200:static YR_AC_STATE* _yr_ac_state_create(
+        -:  201:    YR_AC_STATE* state,
+        -:  202:    uint8_t input)
+        -:  203:{
+     1069:  204:  YR_AC_STATE* new_state = (YR_AC_STATE*) yr_malloc(sizeof(YR_AC_STATE));
+        -:  205:
+     1069:  206:  if (new_state == NULL)
+    #####:  207:    return NULL;
+        -:  208:
+     1069:  209:  new_state->input = input;
+     1069:  210:  new_state->depth = state->depth + 1;
+     1069:  211:  new_state->matches_ref = YR_ARENA_NULL_REF;
+     1069:  212:  new_state->failure = NULL;
+     1069:  213:  new_state->t_table_slot = 0;
+     1069:  214:  new_state->first_child = NULL;
+     1069:  215:  new_state->siblings = state->first_child;
+     1069:  216:  state->first_child = new_state;
+        -:  217:
+     1069:  218:  return new_state;
+        -:  219:}
+        -:  220:
+        -:  221:
+        -:  222://
+        -:  223:// _yr_ac_state_destroy
+        -:  224://
+        -:  225:
+     1075:  226:static int _yr_ac_state_destroy(
+        -:  227:    YR_AC_STATE* state)
+        -:  228:{
+     1075:  229:  YR_AC_STATE* child_state = state->first_child;
+        -:  230:
+     2144:  231:  while (child_state != NULL)
+        -:  232:  {
+     1069:  233:    YR_AC_STATE* next_child_state = child_state->siblings;
+     1069:  234:    _yr_ac_state_destroy(child_state);
+     1069:  235:    child_state = next_child_state;
+        -:  236:  }
+        -:  237:
+     1075:  238:  yr_free(state);
+        -:  239:
+     1075:  240:  return ERROR_SUCCESS;
+        -:  241:}
+        -:  242:
+        -:  243:
+        -:  244://
+        -:  245:// _yr_ac_create_failure_links
+        -:  246://
+        -:  247:// Create failure links for each automaton state. This function must
+        -:  248:// be called after all the strings have been added to the automaton.
+        -:  249://
+        -:  250:
+    #####:  251:static int _yr_ac_create_failure_links(
+        -:  252:    YR_AC_AUTOMATON* automaton)
+        -:  253:{
+        -:  254:  YR_AC_STATE* current_state;
+        -:  255:  YR_AC_STATE* failure_state;
+        -:  256:  YR_AC_STATE* temp_state;
+        -:  257:  YR_AC_STATE* state;
+        -:  258:  YR_AC_STATE* transition_state;
+        -:  259:  YR_AC_STATE* root_state;
+        -:  260:  YR_AC_MATCH* match;
+        -:  261:
+        -:  262:  QUEUE queue;
+        -:  263:
+    #####:  264:  queue.head = NULL;
+    #####:  265:  queue.tail = NULL;
+        -:  266:
+    #####:  267:  root_state = automaton->root;
+        -:  268:
+        -:  269:  // Set the failure link of root state to itself.
+    #####:  270:  root_state->failure = root_state;
+        -:  271:
+        -:  272:  // Push root's children and set their failure link to root.
+    #####:  273:  state = root_state->first_child;
+        -:  274:
+    #####:  275:  while (state != NULL)
+        -:  276:  {
+    #####:  277:    FAIL_ON_ERROR(_yr_ac_queue_push(&queue, state));
+    #####:  278:    state->failure = root_state;
+    #####:  279:    state = state->siblings;
+        -:  280:  }
+        -:  281:
+        -:  282:  // Traverse the trie in BFS order calculating the failure link
+        -:  283:  // for each state.
+        -:  284:
+    #####:  285:  while (!_yr_ac_queue_is_empty(&queue))
+        -:  286:  {
+    #####:  287:    current_state = _yr_ac_queue_pop(&queue);
+    #####:  288:    match = yr_arena_ref_to_ptr(
+        -:  289:        automaton->arena, &current_state->matches_ref);
+        -:  290:
+    #####:  291:    if (match != NULL)
+        -:  292:    {
+        -:  293:      // Find the last match in the list of matches.
+    #####:  294:      while (match->next != NULL)
+    #####:  295:        match = match->next;
+        -:  296:
+    #####:  297:      if (match->backtrack > 0)
+    #####:  298:        match->next = yr_arena_ref_to_ptr(
+        -:  299:            automaton->arena, &root_state->matches_ref);
+        -:  300:    }
+        -:  301:    else
+        -:  302:    {
+        -:  303:      // This state doesn't have any matches, its matches will be those
+        -:  304:      // in the root state, if any.
+    #####:  305:      current_state->matches_ref = root_state->matches_ref;
+        -:  306:    }
+        -:  307:
+        -:  308:    // Iterate over all the states that the current state can transition to.
+    #####:  309:    transition_state = current_state->first_child;
+        -:  310:
+    #####:  311:    while (transition_state != NULL)
+        -:  312:    {
+    #####:  313:      FAIL_ON_ERROR(_yr_ac_queue_push(&queue, transition_state));
+    #####:  314:      failure_state = current_state->failure;
+        -:  315:
+        -:  316:      while (1)
+        -:  317:      {
+    #####:  318:        temp_state = _yr_ac_next_state(
+    #####:  319:            failure_state, transition_state->input);
+        -:  320:
+    #####:  321:        if (temp_state != NULL)
+        -:  322:        {
+    #####:  323:          transition_state->failure = temp_state;
+        -:  324:
+    #####:  325:          if (YR_ARENA_IS_NULL_REF(transition_state->matches_ref))
+        -:  326:          {
+    #####:  327:            transition_state->matches_ref = temp_state->matches_ref;
+        -:  328:          }
+        -:  329:          else
+        -:  330:          {
+    #####:  331:            match = yr_arena_ref_to_ptr(
+        -:  332:                automaton->arena, &transition_state->matches_ref);
+        -:  333:
+    #####:  334:            assert(match != NULL);
+        -:  335:
+        -:  336:            // Find the last match in the list of matches.
+    #####:  337:            while (match->next != NULL)
+    #####:  338:              match = match->next;
+        -:  339:
+    #####:  340:            match->next = yr_arena_ref_to_ptr(
+        -:  341:                automaton->arena, &temp_state->matches_ref);
+        -:  342:          }
+        -:  343:
+    #####:  344:          break;
+        -:  345:        }
+        -:  346:        else
+        -:  347:        {
+    #####:  348:          if (failure_state == root_state)
+        -:  349:          {
+    #####:  350:            transition_state->failure = root_state;
+    #####:  351:            break;
+        -:  352:          }
+        -:  353:          else
+        -:  354:          {
+    #####:  355:            failure_state = failure_state->failure;
+        -:  356:          }
+        -:  357:        }
+        -:  358:      } // while(1)
+        -:  359:
+    #####:  360:      transition_state = transition_state->siblings;
+        -:  361:    }
+        -:  362:
+        -:  363:  } // while(!__yr_ac_queue_is_empty(&queue))
+        -:  364:
+    #####:  365:  return ERROR_SUCCESS;
+        -:  366:}
+        -:  367:
+        -:  368:
+        -:  369://
+        -:  370:// _yr_ac_transitions_subset
+        -:  371://
+        -:  372:// Returns true if the transitions for state s2 are a subset of the transitions
+        -:  373:// for state s1. In other words, if at state s2 input X is accepted, it must be
+        -:  374:// accepted in s1 too.
+        -:  375://
+        -:  376:
+    #####:  377:static bool _yr_ac_transitions_subset(
+        -:  378:    YR_AC_STATE* s1,
+        -:  379:    YR_AC_STATE* s2)
+        -:  380:{
+        -:  381:  uint8_t set[32];
+        -:  382:
+    #####:  383:  YR_AC_STATE* state = s1->first_child;
+        -:  384:
+    #####:  385:  memset(set, 0, 32);
+        -:  386:
+    #####:  387:  while (state != NULL)
+        -:  388:  {
+    #####:  389:    set[state->input / 8] |= 1 << state->input % 8;
+    #####:  390:    state = state->siblings;
+        -:  391:  }
+        -:  392:
+    #####:  393:  state = s2->first_child;
+        -:  394:
+    #####:  395:  while (state != NULL)
+        -:  396:  {
+    #####:  397:    if (!(set[state->input / 8] & 1 << state->input % 8))
+    #####:  398:      return false;
+        -:  399:
+    #####:  400:    state = state->siblings;
+        -:  401:  }
+        -:  402:
+    #####:  403:  return true;
+        -:  404:}
+        -:  405:
+        -:  406:
+        -:  407://
+        -:  408:// _yr_ac_optimize_failure_links
+        -:  409://
+        -:  410:// Removes unnecessary failure links.
+        -:  411://
+        -:  412:
+    #####:  413:static int _yr_ac_optimize_failure_links(
+        -:  414:    YR_AC_AUTOMATON* automaton)
+        -:  415:{
+    #####:  416:  QUEUE queue = { NULL, NULL};
+        -:  417:
+        -:  418:  // Push root's children.
+    #####:  419:  YR_AC_STATE* root_state = automaton->root;
+    #####:  420:  YR_AC_STATE* state = root_state->first_child;
+        -:  421:
+    #####:  422:  while (state != NULL)
+        -:  423:  {
+    #####:  424:    FAIL_ON_ERROR(_yr_ac_queue_push(&queue, state));
+    #####:  425:    state = state->siblings;
+        -:  426:  }
+        -:  427:
+    #####:  428:  while (!_yr_ac_queue_is_empty(&queue))
+        -:  429:  {
+    #####:  430:    YR_AC_STATE* current_state = _yr_ac_queue_pop(&queue);
+        -:  431:
+    #####:  432:    if (current_state->failure != root_state)
+        -:  433:    {
+    #####:  434:      if (_yr_ac_transitions_subset(current_state, current_state->failure))
+    #####:  435:        current_state->failure = current_state->failure->failure;
+        -:  436:    }
+        -:  437:
+        -:  438:    // Push children of current_state
+    #####:  439:    state = current_state->first_child;
+        -:  440:
+    #####:  441:    while (state != NULL)
+        -:  442:    {
+    #####:  443:      FAIL_ON_ERROR(_yr_ac_queue_push(&queue, state));
+    #####:  444:      state = state->siblings;
+        -:  445:    }
+        -:  446:  }
+        -:  447:
+    #####:  448:  return ERROR_SUCCESS;
+        -:  449:}
+        -:  450:
+        -:  451:
+        -:  452://
+        -:  453:// _yr_ac_find_suitable_transition_table_slot
+        -:  454://
+        -:  455:// Find a place within the automaton's transition table where the transitions
+        -:  456:// for the given state can be put. The function first create a bitmask for the
+        -:  457:// state's transition table, then searches for an offset within the automaton's
+        -:  458:// bitmask where the state's bitmask can be put without bit collisions.
+        -:  459://
+        -:  460:
+    #####:  461:static int _yr_ac_find_suitable_transition_table_slot(
+        -:  462:    YR_AC_AUTOMATON* automaton,
+        -:  463:    YR_ARENA* arena,
+        -:  464:    YR_AC_STATE* state,
+        -:  465:    uint32_t* slot)
+        -:  466:{
+        -:  467:  // The state's transition table has 257 entries, 1 for the failure link and
+        -:  468:  // 256 for each possible input byte, so the state's bitmask has 257 bits.
+        -:  469:  YR_BITMASK state_bitmask[YR_BITMASK_SIZE(257)];
+        -:  470:
+    #####:  471:  YR_AC_STATE* child_state = state->first_child;
+        -:  472:
+        -:  473:  // Start with all bits set to zero.
+    #####:  474:  yr_bitmask_clear_all(state_bitmask);
+        -:  475:
+        -:  476:  // The first slot in the transition table is for the state's failure link,
+        -:  477:  // so the first bit in the bitmask must be set to one.
+    #####:  478:  yr_bitmask_set(state_bitmask, 0);
+        -:  479:
+    #####:  480:  while (child_state != NULL)
+        -:  481:  {
+    #####:  482:    yr_bitmask_set(state_bitmask, child_state->input + 1);
+    #####:  483:    child_state = child_state->siblings;
+        -:  484:  }
+        -:  485:
+    #####:  486:  *slot = yr_bitmask_find_non_colliding_offset(
+        -:  487:      automaton->bitmask,
+        -:  488:      state_bitmask,
+        -:  489:      automaton->tables_size,
+        -:  490:      257,
+        -:  491:      &automaton->t_table_unused_candidate);
+        -:  492:
+        -:  493:  // Make sure that we are not going beyond the maximum size of the transition
+        -:  494:  // table, starting at the slot found there must be at least 257 other slots
+        -:  495:  // for accommodating the state's transition table.
+    #####:  496:  assert(*slot + 257 < YR_AC_MAX_TRANSITION_TABLE_SIZE);
+        -:  497:
+    #####:  498:  if (*slot > automaton->tables_size - 257)
+        -:  499:  {
+    #####:  500:      FAIL_ON_ERROR(yr_arena_allocate_zeroed_memory(
+        -:  501:          arena,
+        -:  502:          YR_AC_TRANSITION_TABLE,
+        -:  503:          257 * sizeof(YR_AC_TRANSITION),
+        -:  504:          NULL));
+        -:  505:
+    #####:  506:      FAIL_ON_ERROR(yr_arena_allocate_zeroed_memory(
+        -:  507:          arena,
+        -:  508:          YR_AC_STATE_MATCHES_TABLE,
+        -:  509:          257 * sizeof(uint8_t*),
+        -:  510:          NULL));
+        -:  511:
+    #####:  512:      size_t bm_len = YR_BITMASK_SIZE(automaton->tables_size) *
+        -:  513:           sizeof(YR_BITMASK);
+        -:  514:
+    #####:  515:      size_t bm_len_incr = YR_BITMASK_SIZE(257) * sizeof(YR_BITMASK);
+        -:  516:
+    #####:  517:      automaton->bitmask = yr_realloc(automaton->bitmask, bm_len + bm_len_incr);
+        -:  518:
+    #####:  519:      if (automaton->bitmask == NULL)
+    #####:  520:        return ERROR_INSUFFICIENT_MEMORY;
+        -:  521:
+    #####:  522:      memset((uint8_t*) automaton->bitmask + bm_len, 0, bm_len_incr);
+        -:  523:
+    #####:  524:      automaton->tables_size += 257;
+        -:  525:  }
+        -:  526:
+    #####:  527:  return ERROR_SUCCESS;
+        -:  528:}
+        -:  529:
+        -:  530://
+        -:  531:// _yr_ac_build_transition_table
+        -:  532://
+        -:  533:// Builds the transition table for the automaton. The transition table (T) is a
+        -:  534:// large array of 32-bits integers. Each state in the automaton is represented
+        -:  535:// by an index S within the array. The integer stored in T[S] is the failure
+        -:  536:// link for state S, it contains the index of the next state when no valid
+        -:  537:// transition exists for the next input byte.
+        -:  538://
+        -:  539:// At position T[S+1+B] (where B is a byte) we can find the transition (if any)
+        -:  540:// that must be followed from state S if the next input is B. The value in
+        -:  541:// T[S+1+B] contains the index for next state or zero. A zero value means that
+        -:  542:// no valid transition exists from state S when next input is B, and the failure
+        -:  543:// link must be used instead.
+        -:  544://
+        -:  545:// The transition table for state S starts at T[S] and spans the next 257
+        -:  546:// slots in the array (1 for the failure link and 256 for all the possible
+        -:  547:// transitions). But many of those slots are for invalid transitions, so
+        -:  548:// the transitions for multiple states can be interleaved as long as they don't
+        -:  549:// collide. For example, instead of having this transition table with state S1
+        -:  550:// and S2 separated by a large number of slots:
+        -:  551://
+        -:  552:// S1                                             S2
+        -:  553:// +------+------+------+------+--   ~   --+------+------+------+--   ~   --+
+        -:  554:// | FLS1 |   X  |   -  |   -  |     -     |  Y   | FLS2 |   Z  |     -     |
+        -:  555:// +------+------+------+------+--   ~   --+------+------+------+--   ~   --+
+        -:  556://
+        -:  557:// We can interleave the transitions for states S1 and S2 and get this other
+        -:  558:// transition table, which is more compact:
+        -:  559://
+        -:  560:// S1            S2
+        -:  561:// +------+------+------+------+--   ~   --+------+
+        -:  562:// | FLS1 |  X   | FLS2 |   Z  |     -     |  Y   |
+        -:  563:// +------+------+------+------+--   ~   --+------+
+        -:  564://
+        -:  565:// And how do we know that transition Z belongs to state S2 and not S1? Or that
+        -:  566:// transition Y belongs to S1 and not S2? Because each slot of the array not
+        -:  567:// only contains the index for the state where the transition points to, it
+        -:  568:// also contains the offset of the transition relative to its owner state. So,
+        -:  569:// the value for the owner offset would be 1 for transitions X, because X
+        -:  570:// belongs to state S1 and it's located 1 position away from S1. The same occurs
+        -:  571:// for Z, it belongs to S2 and it's located one position away from S2 so its
+        -:  572:// owner offset is 1. If we are in S1 and next byte is 2, we are going to read
+        -:  573:// the transition at T[S1+1+2] which is Z. But we know that transition Z is not
+        -:  574:// a valid transition for state S1 because the owner offset for Z is 1 not 3.
+        -:  575://
+        -:  576:// Each 32-bit slot in the transition table has 23 bits for storing the index
+        -:  577:// of the target state and 9 bits for storing the offset of the slot relative
+        -:  578:// to its own state. The offset can be any value from 0 to 256, both inclusive,
+        -:  579:// hence 9 bits are required for it. The layout for the slot goes like:
+        -:  580://
+        -:  581:// 32                      23        0
+        -:  582:// +-----------------------+---------+
+        -:  583:// | Target state's index  |  Offset |
+        -:  584:// +-----------------------+---------+
+        -:  585://
+        -:  586:// A more detailed description can be found in: http://goo.gl/lE6zG
+        -:  587:
+    #####:  588:static int _yr_ac_build_transition_table(
+        -:  589:    YR_AC_AUTOMATON* automaton)
+        -:  590:{
+        -:  591:  YR_AC_TRANSITION* t_table;
+        -:  592:  uint32_t* m_table;
+        -:  593:  YR_AC_STATE* state;
+        -:  594:  YR_AC_STATE* child_state;
+    #####:  595:  YR_AC_STATE* root_state = automaton->root;
+        -:  596:
+        -:  597:  uint32_t slot;
+        -:  598:
+    #####:  599:  QUEUE queue = { NULL, NULL };
+        -:  600:
+        -:  601:  // Both t_table and m_table have 512 slots initially, which is enough for the
+        -:  602:  // root node's transition table.
+    #####:  603:  automaton->tables_size = 512;
+        -:  604:
+    #####:  605:  automaton->bitmask = yr_calloc(
+    #####:  606:      YR_BITMASK_SIZE(automaton->tables_size), sizeof(YR_BITMASK));
+        -:  607:
+    #####:  608:  if (automaton->bitmask == NULL)
+    #####:  609:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  610:
+    #####:  611:  FAIL_ON_ERROR(yr_arena_allocate_zeroed_memory(
+        -:  612:      automaton->arena,
+        -:  613:      YR_AC_TRANSITION_TABLE,
+        -:  614:      automaton->tables_size * sizeof(YR_AC_TRANSITION),
+        -:  615:      NULL));
+        -:  616:
+    #####:  617:  FAIL_ON_ERROR(yr_arena_allocate_zeroed_memory(
+        -:  618:      automaton->arena,
+        -:  619:      YR_AC_STATE_MATCHES_TABLE,
+        -:  620:      automaton->tables_size * sizeof(uint32_t),
+        -:  621:      NULL));
+        -:  622:
+    #####:  623:  t_table = yr_arena_get_ptr(automaton->arena, YR_AC_TRANSITION_TABLE, 0);
+    #####:  624:  m_table = yr_arena_get_ptr(automaton->arena, YR_AC_STATE_MATCHES_TABLE, 0);
+        -:  625:
+        -:  626:  // The failure link for the root node points to itself.
+    #####:  627:  t_table[0] = YR_AC_MAKE_TRANSITION(0, 0);
+        -:  628:
+        -:  629:  // Initialize the entry corresponding to the root node in the match table.
+        -:  630:  // Entries in this table are the index within YR_AC_MATCH_POOL where resides
+        -:  631:  // the YR_AC_MATCH structure that corresponds to the head of the matches list
+        -:  632:  // for the node. The indexes start counting at 1, the zero is used for
+        -:  633:  // indicating that the node has no associated matches.
+    #####:  634:  if (!YR_ARENA_IS_NULL_REF(root_state->matches_ref))
+    #####:  635:    m_table[0] = root_state->matches_ref.offset / sizeof(YR_AC_MATCH) + 1;
+        -:  636:
+        -:  637:  // Mark the first slot in the transition table as used.
+    #####:  638:  yr_bitmask_set(automaton->bitmask, 0);
+        -:  639:
+        -:  640:  // Index 0 is for root node. Unused indexes start at 1.
+    #####:  641:  automaton->t_table_unused_candidate = 1;
+        -:  642:
+    #####:  643:  child_state = root_state->first_child;
+        -:  644:
+    #####:  645:  while (child_state != NULL)
+        -:  646:  {
+        -:  647:    // Each state stores its slot number.
+    #####:  648:    child_state->t_table_slot = child_state->input + 1;
+        -:  649:
+    #####:  650:    t_table[child_state->input + 1] = YR_AC_MAKE_TRANSITION(
+        -:  651:        0, child_state->input + 1);
+        -:  652:
+    #####:  653:    yr_bitmask_set(automaton->bitmask, child_state->input + 1);
+        -:  654:
+    #####:  655:    FAIL_ON_ERROR(_yr_ac_queue_push(&queue, child_state));
+    #####:  656:    child_state = child_state->siblings;
+        -:  657:  }
+        -:  658:
+    #####:  659:  while (!_yr_ac_queue_is_empty(&queue))
+        -:  660:  {
+    #####:  661:    state = _yr_ac_queue_pop(&queue);
+        -:  662:
+    #####:  663:    FAIL_ON_ERROR(_yr_ac_find_suitable_transition_table_slot(
+        -:  664:        automaton, automaton->arena, state, &slot));
+        -:  665:
+        -:  666:    // _yr_ac_find_suitable_transition_table_slot can allocate more space in
+        -:  667:    // both tables and cause the tables to be moved to a different memory
+        -:  668:    // location, we must get their up-to-date addresses.
+    #####:  669:    t_table = yr_arena_get_ptr(automaton->arena, YR_AC_TRANSITION_TABLE, 0);
+    #####:  670:    m_table = yr_arena_get_ptr(automaton->arena, YR_AC_STATE_MATCHES_TABLE, 0);
+        -:  671:
+    #####:  672:    t_table[state->t_table_slot] |= (slot << YR_AC_SLOT_OFFSET_BITS);
+    #####:  673:    t_table[slot] = YR_AC_MAKE_TRANSITION(state->failure->t_table_slot, 0);
+        -:  674:
+        -:  675:    // The match table is an array of indexes within YR_AC_MATCHES_POOL. The
+        -:  676:    // N-th item in the array is the index for the YR_AC_MATCH structure that
+        -:  677:    // represents the head of the matches list for state N. The indexes start
+        -:  678:    // at 1, the 0 indicates that there are no matches for the state.
+    #####:  679:    if (YR_ARENA_IS_NULL_REF(state->matches_ref))
+    #####:  680:      m_table[slot] = 0;
+        -:  681:    else
+    #####:  682:      m_table[slot] = state->matches_ref.offset / sizeof(YR_AC_MATCH) + 1;
+        -:  683:
+    #####:  684:    state->t_table_slot = slot;
+        -:  685:
+    #####:  686:    yr_bitmask_set(automaton->bitmask, slot);
+        -:  687:
+        -:  688:    // Push children of current_state
+    #####:  689:    child_state = state->first_child;
+        -:  690:
+    #####:  691:    while (child_state != NULL)
+        -:  692:    {
+    #####:  693:      child_state->t_table_slot = slot + child_state->input + 1;
+        -:  694:
+    #####:  695:      t_table[child_state->t_table_slot] = YR_AC_MAKE_TRANSITION(
+        -:  696:          0, child_state->input + 1);
+        -:  697:
+    #####:  698:      yr_bitmask_set(automaton->bitmask, child_state->t_table_slot);
+        -:  699:
+    #####:  700:      FAIL_ON_ERROR(_yr_ac_queue_push(&queue, child_state));
+        -:  701:
+    #####:  702:      child_state = child_state->siblings;
+        -:  703:    }
+        -:  704:  }
+        -:  705:
+    #####:  706:  return ERROR_SUCCESS;
+        -:  707:}
+        -:  708:
+        -:  709:
+        -:  710://
+        -:  711:// _yr_ac_print_automaton_state
+        -:  712://
+        -:  713:// Prints automaton state for debug purposes. This function is invoked by
+        -:  714:// yr_ac_print_automaton, is not intended to be used stand-alone.
+        -:  715://
+    #####:  716:static void _yr_ac_print_automaton_state(
+        -:  717:    YR_AC_AUTOMATON* automaton,
+        -:  718:    YR_AC_STATE* state)
+        -:  719:{
+        -:  720:  int child_count;
+        -:  721:
+        -:  722:  YR_AC_MATCH* match;
+        -:  723:  YR_AC_STATE* child_state;
+        -:  724:
+    #####:  725:  for (int i = 0; i < state->depth; i++)
+    #####:  726:    printf(" ");
+        -:  727:
+    #####:  728:  child_state = state->first_child;
+    #####:  729:  child_count = 0;
+        -:  730:
+    #####:  731:  while(child_state != NULL)
+        -:  732:  {
+    #####:  733:    child_count++;
+    #####:  734:    child_state = child_state->siblings;
+        -:  735:  }
+        -:  736:
+    #####:  737:  printf("%p childs:%d depth:%d failure:%p",
+    #####:  738:         state, child_count, state->depth, state->failure);
+        -:  739:
+    #####:  740:  match = yr_arena_ref_to_ptr(automaton->arena, &state->matches_ref);
+        -:  741:
+    #####:  742:  while (match != NULL)
+        -:  743:  {
+    #####:  744:    printf("\n");
+        -:  745:
+    #####:  746:    for (int i = 0; i < state->depth + 1; i++)
+    #####:  747:      printf(" ");
+        -:  748:
+    #####:  749:    printf("%s = ", match->string->identifier);
+        -:  750:
+    #####:  751:    if (STRING_IS_HEX(match->string))
+        -:  752:    {
+    #####:  753:      printf("{ ");
+        -:  754:
+    #####:  755:      for (int i = 0; i < yr_min(match->string->length, 10); i++)
+    #####:  756:        printf("%02x ", match->string->string[i]);
+        -:  757:
+    #####:  758:      printf("}");
+        -:  759:    }
+    #####:  760:    else if (STRING_IS_REGEXP(match->string))
+        -:  761:    {
+    #####:  762:      printf("/");
+        -:  763:
+    #####:  764:      for (int i = 0; i < yr_min(match->string->length, 10); i++)
+    #####:  765:        printf("%c", match->string->string[i]);
+        -:  766:
+    #####:  767:      printf("/");
+        -:  768:    }
+        -:  769:    else
+        -:  770:    {
+    #####:  771:      printf("\"");
+        -:  772:
+    #####:  773:      for (int i = 0; i < yr_min(match->string->length, 10); i++)
+    #####:  774:        printf("%c", match->string->string[i]);
+        -:  775:
+    #####:  776:      printf("\"");
+        -:  777:    }
+        -:  778:
+    #####:  779:    match = match->next;
+        -:  780:  }
+        -:  781:
+    #####:  782:  printf("\n");
+        -:  783:
+    #####:  784:  child_state = state->first_child;
+        -:  785:
+    #####:  786:  while(child_state != NULL)
+        -:  787:  {
+    #####:  788:    _yr_ac_print_automaton_state(automaton, child_state);
+    #####:  789:    child_state = child_state->siblings;
+        -:  790:  }
+    #####:  791:}
+        -:  792:
+        -:  793:
+        -:  794://
+        -:  795:// yr_ac_automaton_create
+        -:  796://
+        -:  797:// Creates a new automaton
+        -:  798://
+        -:  799:
+        7:  800:int yr_ac_automaton_create(
+        -:  801:    YR_ARENA* arena,
+        -:  802:    YR_AC_AUTOMATON** automaton)
+        -:  803:{
+        -:  804:  YR_AC_AUTOMATON* new_automaton;
+        -:  805:  YR_AC_STATE* root_state;
+        -:  806:
+        7:  807:  new_automaton = (YR_AC_AUTOMATON*) yr_malloc(sizeof(YR_AC_AUTOMATON));
+        7:  808:  root_state = (YR_AC_STATE*) yr_malloc(sizeof(YR_AC_STATE));
+        -:  809:
+        7:  810:  if (new_automaton == NULL || root_state == NULL)
+        -:  811:  {
+    #####:  812:    yr_free(new_automaton);
+    #####:  813:    yr_free(root_state);
+        -:  814:
+    #####:  815:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  816:  }
+        -:  817:
+        7:  818:  root_state->depth = 0;
+        7:  819:  root_state->matches_ref = YR_ARENA_NULL_REF;
+        7:  820:  root_state->failure = NULL;
+        7:  821:  root_state->first_child = NULL;
+        7:  822:  root_state->siblings = NULL;
+        7:  823:  root_state->t_table_slot = 0;
+        -:  824:
+        7:  825:  new_automaton->arena = arena;
+        7:  826:  new_automaton->root = root_state;
+        7:  827:  new_automaton->bitmask = NULL;
+        7:  828:  new_automaton->tables_size = 0;
+        -:  829:
+        7:  830:  *automaton = new_automaton;
+        -:  831:
+        7:  832:  return ERROR_SUCCESS;
+        -:  833:}
+        -:  834:
+        -:  835:
+        -:  836://
+        -:  837:// yr_ac_automaton_destroy
+        -:  838://
+        -:  839:// Destroys automaton
+        -:  840://
+        -:  841:
+        6:  842:int yr_ac_automaton_destroy(
+        -:  843:    YR_AC_AUTOMATON* automaton)
+        -:  844:{
+        6:  845:  _yr_ac_state_destroy(automaton->root);
+        -:  846:
+        6:  847:  yr_free(automaton->bitmask);
+        6:  848:  yr_free(automaton);
+        -:  849:
+        6:  850:  return ERROR_SUCCESS;
+        -:  851:}
+        -:  852:
+        -:  853:
+        -:  854://
+        -:  855:// yr_ac_add_string
+        -:  856://
+        -:  857:// Adds a string to the automaton. This function is invoked once for each
+        -:  858:// string defined in the rules.
+        -:  859://
+        -:  860:
+        6:  861:int yr_ac_add_string(
+        -:  862:    YR_AC_AUTOMATON* automaton,
+        -:  863:    YR_STRING* string,
+        -:  864:    uint32_t string_idx,
+        -:  865:    YR_ATOM_LIST_ITEM* atom,
+        -:  866:    YR_ARENA* arena)
+        -:  867:{
+      537:  868:  while (atom != NULL)
+        -:  869:  {
+      531:  870:    YR_AC_STATE* state = automaton->root;
+        -:  871:
+     2395:  872:    for (int i = 0; i < atom->atom.length; i++)
+        -:  873:    {
+     1864:  874:      YR_AC_STATE* next_state = _yr_ac_next_state(state, atom->atom.bytes[i]);
+        -:  875:
+     1864:  876:      if (next_state == NULL)
+        -:  877:      {
+     1069:  878:        next_state = _yr_ac_state_create(state, atom->atom.bytes[i]);
+        -:  879:
+     1069:  880:        if (next_state == NULL)
+    #####:  881:          return ERROR_INSUFFICIENT_MEMORY;
+        -:  882:      }
+        -:  883:
+     1864:  884:      state = next_state;
+        -:  885:    }
+        -:  886:
+        -:  887:    YR_ARENA_REF new_match_ref;
+        -:  888:
+     531*:  889:    FAIL_ON_ERROR(yr_arena_allocate_struct(
+        -:  890:        arena,
+        -:  891:        YR_AC_STATE_MATCHES_POOL,
+        -:  892:        sizeof(YR_AC_MATCH),
+        -:  893:        &new_match_ref,
+        -:  894:        offsetof(YR_AC_MATCH, string),
+        -:  895:        offsetof(YR_AC_MATCH, forward_code),
+        -:  896:        offsetof(YR_AC_MATCH, backward_code),
+        -:  897:        offsetof(YR_AC_MATCH, next),
+        -:  898:        EOL));
+        -:  899:
+      531:  900:    YR_AC_MATCH* new_match = yr_arena_ref_to_ptr(arena, &new_match_ref);
+        -:  901:
+      531:  902:    new_match->backtrack = state->depth + atom->backtrack;
+      531:  903:    new_match->string = yr_arena_get_ptr(
+        -:  904:        arena, YR_STRINGS_TABLE, string_idx * sizeof(struct YR_STRING));
+        -:  905:
+      531:  906:    new_match->forward_code = yr_arena_ref_to_ptr(
+        -:  907:        arena, &atom->forward_code_ref);
+        -:  908:
+      531:  909:    new_match->backward_code = yr_arena_ref_to_ptr(
+        -:  910:        arena, &atom->backward_code_ref);
+        -:  911:
+        -:  912:    // Add newly created match to the list of matches for the state.
+      531:  913:    new_match->next = yr_arena_ref_to_ptr(arena, &state->matches_ref);
+      531:  914:    state->matches_ref = new_match_ref;
+        -:  915:
+      531:  916:    atom = atom->next;
+        -:  917:  }
+        -:  918:
+        6:  919:  return ERROR_SUCCESS;
+        -:  920:}
+        -:  921:
+        -:  922:
+        -:  923://
+        -:  924:// yr_ac_compile
+        -:  925://
+        -:  926:// Compiles the Aho-Corasick automaton, the resulting data structures are
+        -:  927:// are written in the provided arena.
+        -:  928://
+        -:  929:
+    #####:  930:int yr_ac_compile(
+        -:  931:    YR_AC_AUTOMATON* automaton,
+        -:  932:    YR_ARENA* arena)
+        -:  933:{
+    #####:  934:  FAIL_ON_ERROR(_yr_ac_create_failure_links(automaton));
+    #####:  935:  FAIL_ON_ERROR(_yr_ac_optimize_failure_links(automaton));
+    #####:  936:  FAIL_ON_ERROR(_yr_ac_build_transition_table(automaton));
+        -:  937:  
+    #####:  938:  return ERROR_SUCCESS;
+        -:  939:}
+        -:  940:
+        -:  941:
+        -:  942://
+        -:  943:// yr_ac_print_automaton
+        -:  944://
+        -:  945:// Prints automaton for debug purposes.
+        -:  946://
+    #####:  947:void yr_ac_print_automaton(YR_AC_AUTOMATON* automaton)
+        -:  948:{
+    #####:  949:  printf("-------------------------------------------------------\n");
+    #####:  950:  _yr_ac_print_automaton_state(automaton, automaton->root);
+    #####:  951:  printf("-------------------------------------------------------\n");
+    #####:  952:}
+        -:  953:

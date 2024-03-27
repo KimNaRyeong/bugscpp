@@ -1,0 +1,304 @@
+        -:    0:Source:libyara.c
+        -:    0:Graph:/home/workspace/libyara/libyara.gcno
+        -:    0:Data:/home/workspace/libyara/libyara.gcda
+        -:    0:Runs:10
+        -:    1:/*
+        -:    2:Copyright (c) 2013. The YARA Authors. All Rights Reserved.
+        -:    3:
+        -:    4:Redistribution and use in source and binary forms, with or without modification,
+        -:    5:are permitted provided that the following conditions are met:
+        -:    6:
+        -:    7:1. Redistributions of source code must retain the above copyright notice, this
+        -:    8:list of conditions and the following disclaimer.
+        -:    9:
+        -:   10:2. Redistributions in binary form must reproduce the above copyright notice,
+        -:   11:this list of conditions and the following disclaimer in the documentation and/or
+        -:   12:other materials provided with the distribution.
+        -:   13:
+        -:   14:3. Neither the name of the copyright holder nor the names of its contributors
+        -:   15:may be used to endorse or promote products derived from this software without
+        -:   16:specific prior written permission.
+        -:   17:
+        -:   18:THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+        -:   19:ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+        -:   20:WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+        -:   21:DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+        -:   22:ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+        -:   23:(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+        -:   24:LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+        -:   25:ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        -:   26:(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+        -:   27:SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        -:   28:*/
+        -:   29:
+        -:   30:#if defined(JEMALLOC)
+        -:   31:#include <jemalloc/jemalloc.h>
+        -:   32:#endif
+        -:   33:
+        -:   34:#include <string.h>
+        -:   35:#include <stdio.h>
+        -:   36:#include <ctype.h>
+        -:   37:
+        -:   38:#include <yara/globals.h>
+        -:   39:#include <yara/error.h>
+        -:   40:#include <yara/re.h>
+        -:   41:#include <yara/modules.h>
+        -:   42:#include <yara/mem.h>
+        -:   43:#include <yara/threading.h>
+        -:   44:
+        -:   45:#include "crypto.h"
+        -:   46:
+        -:   47:#if defined(_WIN32) || defined(__CYGWIN__)
+        -:   48:#if !defined(_MSC_VER) || (defined(_MSC_VER) && (_MSC_VER < 1900))
+        -:   49:#define snprintf _snprintf
+        -:   50:#endif
+        -:   51:#endif
+        -:   52:
+        -:   53:YR_THREAD_STORAGE_KEY yr_yyfatal_trampoline_tls;
+        -:   54:YR_THREAD_STORAGE_KEY yr_trycatch_trampoline_tls;
+        -:   55:
+        -:   56:static int init_count = 0;
+        -:   57:
+        -:   58:static struct yr_config_var
+        -:   59:{
+        -:   60:  union
+        -:   61:  {
+        -:   62:    size_t   sz;
+        -:   63:    uint32_t ui32;
+        -:   64:    uint64_t ui64;
+        -:   65:    char*    str;
+        -:   66:  };
+        -:   67:
+        -:   68:} yr_cfgs[YR_CONFIG_LAST];
+        -:   69:
+        -:   70:
+        -:   71:// Global variables. See globals.h for their descriptions.
+        -:   72:
+        -:   73:uint8_t yr_lowercase[256];
+        -:   74:uint8_t yr_altercase[256];
+        -:   75:
+        -:   76:
+        -:   77:#if defined(HAVE_LIBCRYPTO) && OPENSSL_VERSION_NUMBER < 0x10100000L
+        -:   78:
+        -:   79:// The OpenSSL library before version 1.1 requires some locks in order
+        -:   80:// to be thread-safe. These locks are initialized in yr_initialize
+        -:   81:// function.
+        -:   82:
+        -:   83:static YR_MUTEX *openssl_locks;
+        -:   84:
+        -:   85:
+        -:   86:static void _thread_id(CRYPTO_THREADID *id)
+        -:   87:{
+        -:   88:  CRYPTO_THREADID_set_numeric(id, (unsigned long) yr_current_thread_id());
+        -:   89:}
+        -:   90:
+        -:   91:
+        -:   92:static void _locking_function(
+        -:   93:    int mode,
+        -:   94:    int n,
+        -:   95:    const char *file,
+        -:   96:    int line)
+        -:   97:{
+        -:   98:  if (mode & CRYPTO_LOCK)
+        -:   99:    yr_mutex_lock(&openssl_locks[n]);
+        -:  100:  else
+        -:  101:    yr_mutex_unlock(&openssl_locks[n]);
+        -:  102:}
+        -:  103:
+        -:  104:#endif
+        -:  105:
+        -:  106://
+        -:  107:// yr_initialize
+        -:  108://
+        -:  109:// Should be called by main thread before using any other
+        -:  110:// function from libyara.
+        -:  111://
+        -:  112:
+        6:  113:YR_API int yr_initialize(void)
+        -:  114:{
+        6:  115:  uint32_t def_stack_size = DEFAULT_STACK_SIZE;
+        6:  116:  uint32_t def_max_strings_per_rule = DEFAULT_MAX_STRINGS_PER_RULE;
+        6:  117:  uint32_t def_max_match_data = DEFAULT_MAX_MATCH_DATA;
+        -:  118:
+        -:  119:  int i;
+        -:  120:
+        6:  121:  init_count++;
+        -:  122:
+        6:  123:  if (init_count > 1)
+    #####:  124:    return ERROR_SUCCESS;
+        -:  125:
+        -:  126:  // Initialize random number generator, as it is used for generating object
+        -:  127:  // canaries.
+        6:  128:  srand((unsigned) time(NULL));
+        -:  129:
+     1542:  130:  for (i = 0; i < 256; i++)
+        -:  131:  {
+     1536:  132:    if (i >= 'a' && i <= 'z')
+      156:  133:      yr_altercase[i] = i - 32;
+     1380:  134:    else if (i >= 'A' && i <= 'Z')
+      156:  135:      yr_altercase[i] = i + 32;
+        -:  136:    else
+     1224:  137:      yr_altercase[i] = i;
+        -:  138:
+     1536:  139:    yr_lowercase[i] = tolower(i);
+        -:  140:  }
+        -:  141:
+       6*:  142:  FAIL_ON_ERROR(yr_heap_alloc());
+       6*:  143:  FAIL_ON_ERROR(yr_thread_storage_create(&yr_yyfatal_trampoline_tls));
+       6*:  144:  FAIL_ON_ERROR(yr_thread_storage_create(&yr_trycatch_trampoline_tls));
+        -:  145:
+        -:  146:  #if defined HAVE_LIBCRYPTO && OPENSSL_VERSION_NUMBER < 0x10100000L
+        -:  147:
+        -:  148:  openssl_locks = (YR_MUTEX*) OPENSSL_malloc(
+        -:  149:      CRYPTO_num_locks() * sizeof(YR_MUTEX));
+        -:  150:
+        -:  151:  for (i = 0; i < CRYPTO_num_locks(); i++)
+        -:  152:    yr_mutex_create(&openssl_locks[i]);
+        -:  153:
+        -:  154:  CRYPTO_THREADID_set_callback(_thread_id);
+        -:  155:  CRYPTO_set_locking_callback(_locking_function);
+        -:  156:
+        -:  157:  #elif defined(HAVE_WINCRYPT_H)
+        -:  158:
+        -:  159:  if (!CryptAcquireContext(&yr_cryptprov, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        -:  160:    return ERROR_INTERNAL_FATAL_ERROR;
+        -:  161:  }
+        -:  162:
+        -:  163:  #elif defined(HAVE_COMMON_CRYPTO)
+        -:  164:
+        -:  165:  ...
+        -:  166:
+        -:  167:  #endif
+        -:  168:
+       6*:  169:  FAIL_ON_ERROR(yr_modules_initialize());
+        -:  170:
+        -:  171:  // Initialize default configuration options
+       6*:  172:  FAIL_ON_ERROR(yr_set_configuration(
+        -:  173:      YR_CONFIG_STACK_SIZE, &def_stack_size));
+        -:  174:
+       6*:  175:  FAIL_ON_ERROR(yr_set_configuration(
+        -:  176:      YR_CONFIG_MAX_STRINGS_PER_RULE, &def_max_strings_per_rule));
+        -:  177:
+       6*:  178:  FAIL_ON_ERROR(yr_set_configuration(
+        -:  179:      YR_CONFIG_MAX_MATCH_DATA, &def_max_match_data));
+        -:  180:
+        6:  181:  return ERROR_SUCCESS;
+        -:  182:}
+        -:  183:
+        -:  184:
+        -:  185://
+        -:  186:// yr_finalize
+        -:  187://
+        -:  188:// Should be called by main thread before exiting.
+        -:  189://
+        -:  190:
+        5:  191:YR_API int yr_finalize(void)
+        -:  192:{
+        -:  193:  #if defined HAVE_LIBCRYPTO && OPENSSL_VERSION_NUMBER < 0x10100000L
+        -:  194:  int i;
+        -:  195:  #endif
+        -:  196:
+        -:  197:  // yr_finalize shouldn't be called without calling yr_initialize first
+        -:  198:
+        5:  199:  if (init_count == 0)
+    #####:  200:    return ERROR_INTERNAL_FATAL_ERROR;
+        -:  201:
+        5:  202:  init_count--;
+        -:  203:
+        5:  204:  if (init_count > 0)
+    #####:  205:    return ERROR_SUCCESS;
+        -:  206:
+        -:  207:  #if defined HAVE_LIBCRYPTO && OPENSSL_VERSION_NUMBER < 0x10100000L
+        -:  208:
+        -:  209:  for (i = 0; i < CRYPTO_num_locks(); i ++)
+        -:  210:    yr_mutex_destroy(&openssl_locks[i]);
+        -:  211:
+        -:  212:  OPENSSL_free(openssl_locks);
+        -:  213:  CRYPTO_THREADID_set_callback(NULL);
+        -:  214:  CRYPTO_set_locking_callback(NULL);
+        -:  215:
+        -:  216:  #elif defined(HAVE_WINCRYPT_H)
+        -:  217:
+        -:  218:  CryptReleaseContext(yr_cryptprov, 0);
+        -:  219:
+        -:  220:  #endif
+        -:  221:
+       5*:  222:  FAIL_ON_ERROR(yr_thread_storage_destroy(&yr_yyfatal_trampoline_tls));
+       5*:  223:  FAIL_ON_ERROR(yr_thread_storage_destroy(&yr_trycatch_trampoline_tls));
+       5*:  224:  FAIL_ON_ERROR(yr_modules_finalize());
+       5*:  225:  FAIL_ON_ERROR(yr_heap_free());
+        -:  226:
+        -:  227:  #if defined(JEMALLOC)
+        -:  228:  malloc_stats_print(NULL, NULL, NULL);
+        -:  229:  mallctl("prof.dump", NULL, NULL, NULL, 0);
+        -:  230:  #endif
+        -:  231:
+        5:  232:  return ERROR_SUCCESS;
+        -:  233:}
+        -:  234:
+        -:  235:
+        -:  236:
+        -:  237://
+        -:  238:// yr_set_configuration
+        -:  239://
+        -:  240:// Sets a configuration option. This function receives a configuration name,
+        -:  241:// as defined by the YR_CONFIG_NAME enum, and a pointer to the value being
+        -:  242:// set. The type of the value depends on the configuration name.
+        -:  243://
+        -:  244:// Args:
+        -:  245://    YR_CONFIG_NAME  name   - Any of the values defined by the YR_CONFIG_NAME
+        -:  246://                             enum. Possible values are:
+        -:  247://
+        -:  248://       YR_CONFIG_STACK_SIZE             data type: uint32_t
+        -:  249://       YR_CONFIG_MAX_STRINGS_PER_RULE   data type: uint32_t
+        -:  250://       YR_CONFIG_MAX_MATCH_DATA         data type: uint32_t
+        -:  251://
+        -:  252://    void *src              - Pointer to the value being set for the option.
+        -:  253://
+        -:  254:// Returns:
+        -:  255://    An error code.
+        -:  256:
+       18:  257:YR_API int yr_set_configuration(
+        -:  258:    YR_CONFIG_NAME name,
+        -:  259:    void *src)
+        -:  260:{
+       18:  261:  if (src == NULL)
+    #####:  262:    return ERROR_INTERNAL_FATAL_ERROR;
+        -:  263:
+       18:  264:  switch (name)
+        -:  265:  { // lump all the cases using same types together in one cascade
+       18:  266:    case YR_CONFIG_STACK_SIZE:
+        -:  267:    case YR_CONFIG_MAX_STRINGS_PER_RULE:
+        -:  268:    case YR_CONFIG_MAX_MATCH_DATA:
+       18:  269:      yr_cfgs[name].ui32 = *(uint32_t*) src;
+       18:  270:      break;
+        -:  271:
+    #####:  272:    default:
+    #####:  273:      return ERROR_INTERNAL_FATAL_ERROR;
+        -:  274:  }
+        -:  275:
+       18:  276:  return ERROR_SUCCESS;
+        -:  277:}
+        -:  278:
+        -:  279:
+    #####:  280:YR_API int yr_get_configuration(
+        -:  281:    YR_CONFIG_NAME name,
+        -:  282:    void *dest)
+        -:  283:{
+    #####:  284:  if (dest == NULL)
+    #####:  285:    return ERROR_INTERNAL_FATAL_ERROR;
+        -:  286:
+    #####:  287:  switch (name)
+        -:  288:  { // lump all the cases using same types together in one cascade
+    #####:  289:    case YR_CONFIG_STACK_SIZE:
+        -:  290:    case YR_CONFIG_MAX_STRINGS_PER_RULE:
+        -:  291:    case YR_CONFIG_MAX_MATCH_DATA:
+    #####:  292:      *(uint32_t*) dest = yr_cfgs[name].ui32;
+    #####:  293:      break;
+        -:  294:
+    #####:  295:    default:
+    #####:  296:      return ERROR_INTERNAL_FATAL_ERROR;
+        -:  297:  }
+        -:  298:
+    #####:  299:  return ERROR_SUCCESS;
+        -:  300:}

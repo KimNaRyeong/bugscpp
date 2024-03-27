@@ -1,0 +1,1234 @@
+        -:    0:Source:compiler.c
+        -:    0:Graph:/home/workspace/libyara/compiler.gcno
+        -:    0:Data:/home/workspace/libyara/compiler.gcda
+        -:    0:Runs:7
+        -:    1:/*
+        -:    2:Copyright (c) 2013-2018. The YARA Authors. All Rights Reserved.
+        -:    3:
+        -:    4:Redistribution and use in source and binary forms, with or without modification,
+        -:    5:are permitted provided that the following conditions are met:
+        -:    6:
+        -:    7:1. Redistributions of source code must retain the above copyright notice, this
+        -:    8:list of conditions and the following disclaimer.
+        -:    9:
+        -:   10:2. Redistributions in binary form must reproduce the above copyright notice,
+        -:   11:this list of conditions and the following disclaimer in the documentation and/or
+        -:   12:other materials provided with the distribution.
+        -:   13:
+        -:   14:3. Neither the name of the copyright holder nor the names of its contributors
+        -:   15:may be used to endorse or promote products derived from this software without
+        -:   16:specific prior written permission.
+        -:   17:
+        -:   18:THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+        -:   19:ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+        -:   20:WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+        -:   21:DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+        -:   22:ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+        -:   23:(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+        -:   24:LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+        -:   25:ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        -:   26:(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+        -:   27:SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        -:   28:*/
+        -:   29:
+        -:   30:#include <assert.h>
+        -:   31:#include <fcntl.h>
+        -:   32:#include <stddef.h>
+        -:   33:#include <stdio.h>
+        -:   34:#include <string.h>
+        -:   35:#include <sys/stat.h>
+        -:   36:
+        -:   37:#ifdef _MSC_VER
+        -:   38:#include <io.h>
+        -:   39:#include <share.h>
+        -:   40:#else
+        -:   41:#include <unistd.h>
+        -:   42:#endif
+        -:   43:
+        -:   44:#include <yara/libyara.h>
+        -:   45:#include <yara/utils.h>
+        -:   46:#include <yara/compiler.h>
+        -:   47:#include <yara/exec.h>
+        -:   48:#include <yara/error.h>
+        -:   49:#include <yara/mem.h>
+        -:   50:#include <yara/object.h>
+        -:   51:#include <yara/lexer.h>
+        -:   52:#include <yara/strutils.h>
+        -:   53:
+        -:   54:
+    #####:   55:static void _yr_compiler_default_include_free(
+        -:   56:    const char* callback_result_ptr,
+        -:   57:    void* user_data)
+        -:   58:{
+    #####:   59:  if (callback_result_ptr != NULL)
+        -:   60:  {
+    #####:   61:    yr_free((void*)callback_result_ptr);
+        -:   62:  }
+    #####:   63:}
+        -:   64:
+        -:   65:
+    #####:   66:const char* _yr_compiler_default_include_callback(
+        -:   67:    const char* include_name,
+        -:   68:    const char* calling_rule_filename,
+        -:   69:    const char* calling_rule_namespace,
+        -:   70:    void* user_data)
+        -:   71:{
+        -:   72:  #ifndef _MSC_VER
+        -:   73:  struct stat stbuf;
+        -:   74:  #endif
+        -:   75:
+        -:   76:  char* file_buffer;
+        -:   77:
+        -:   78:  #ifdef _MSC_VER
+        -:   79:  long file_size;
+        -:   80:  #else
+        -:   81:  off_t file_size;
+        -:   82:  #endif
+        -:   83:
+    #####:   84:  int fd = -1;
+        -:   85:
+        -:   86:  #if defined(_MSC_VER)
+        -:   87:  _sopen_s(&fd, include_name, _O_RDONLY | _O_BINARY, _SH_DENYRW, _S_IREAD);
+        -:   88:  #elif defined(_WIN32) || defined(__CYGWIN__)
+        -:   89:  fd = open(include_name, O_RDONLY | O_BINARY);
+        -:   90:  #else
+    #####:   91:  fd = open(include_name, O_RDONLY);
+        -:   92:  #endif
+        -:   93:
+    #####:   94:  if (fd == -1)
+    #####:   95:    return NULL;
+        -:   96:
+        -:   97:  #ifdef _MSC_VER
+        -:   98:  file_size = _filelength(fd);
+        -:   99:  if (file_size == -1)
+        -:  100:  {
+        -:  101:    _close(fd);
+        -:  102:    return NULL;
+        -:  103:  }
+        -:  104:  #else
+    #####:  105:  if ((fstat(fd, &stbuf) != 0) || (!S_ISREG(stbuf.st_mode)))
+        -:  106:  {
+    #####:  107:    close(fd);
+    #####:  108:    return NULL;
+        -:  109:  }
+    #####:  110:  file_size = stbuf.st_size;
+        -:  111:  #endif
+        -:  112:
+    #####:  113:  file_buffer = (char*) yr_malloc((size_t) file_size + 1);
+        -:  114:
+    #####:  115:  if (file_buffer == NULL)
+        -:  116:  {
+        -:  117:    #ifdef _MSC_VER
+        -:  118:    _close(fd);
+        -:  119:    #else
+    #####:  120:    close(fd);
+        -:  121:    #endif
+        -:  122:
+    #####:  123:    return NULL;
+        -:  124:  }
+        -:  125:
+    #####:  126:  if (file_size != read(fd, file_buffer, (size_t) file_size))
+        -:  127:  {
+    #####:  128:    yr_free(file_buffer);
+        -:  129:
+        -:  130:    #ifdef _MSC_VER
+        -:  131:    _close(fd);
+        -:  132:    #else
+    #####:  133:    close(fd);
+        -:  134:    #endif
+        -:  135:
+    #####:  136:    return NULL;
+        -:  137:  }
+        -:  138:  else
+        -:  139:  {
+    #####:  140:    file_buffer[file_size] = '\0';
+        -:  141:  }
+        -:  142:
+        -:  143:  #ifdef _MSC_VER
+        -:  144:  _close(fd);
+        -:  145:  #else
+    #####:  146:  close(fd);
+        -:  147:  #endif
+        -:  148:
+    #####:  149:  return file_buffer;
+        -:  150:}
+        -:  151:
+        -:  152:
+      282:  153:YR_API int yr_compiler_create(
+        -:  154:    YR_COMPILER** compiler)
+        -:  155:{
+        -:  156:  int result;
+        -:  157:  YR_COMPILER* new_compiler;
+        -:  158:
+      282:  159:  new_compiler = (YR_COMPILER*) yr_calloc(1, sizeof(YR_COMPILER));
+        -:  160:
+      282:  161:  if (new_compiler == NULL)
+    #####:  162:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  163:
+      282:  164:  new_compiler->errors = 0;
+      282:  165:  new_compiler->callback = NULL;
+      282:  166:  new_compiler->include_callback = _yr_compiler_default_include_callback;
+      282:  167:  new_compiler->incl_clbk_user_data = NULL;
+      282:  168:  new_compiler->include_free = _yr_compiler_default_include_free;
+      282:  169:  new_compiler->re_ast_callback = NULL;
+      282:  170:  new_compiler->re_ast_clbk_user_data = NULL;
+      282:  171:  new_compiler->last_error = ERROR_SUCCESS;
+      282:  172:  new_compiler->last_error_line = 0;
+      282:  173:  new_compiler->current_line = 0;
+      282:  174:  new_compiler->file_name_stack_ptr = 0;
+      282:  175:  new_compiler->fixup_stack_head = NULL;
+      282:  176:  new_compiler->loop_depth = 0;
+      282:  177:  new_compiler->loop_for_of_mem_offset = -1;
+      282:  178:  new_compiler->compiled_rules_arena = NULL;
+      282:  179:  new_compiler->namespaces_count = 0;
+      282:  180:  new_compiler->current_rule = NULL;
+      282:  181:  new_compiler->atoms_config.get_atom_quality = yr_atoms_heuristic_quality;
+      282:  182:  new_compiler->atoms_config.quality_warning_threshold = \
+        -:  183:      YR_ATOM_QUALITY_WARNING_THRESHOLD;
+        -:  184:
+      282:  185:  result = yr_hash_table_create(10007, &new_compiler->rules_table);
+        -:  186:
+      282:  187:  if (result == ERROR_SUCCESS)
+      282:  188:    result = yr_hash_table_create(10007, &new_compiler->objects_table);
+        -:  189:
+      282:  190:  if (result == ERROR_SUCCESS)
+      282:  191:    result = yr_hash_table_create(101, &new_compiler->strings_table);
+        -:  192:
+      282:  193:  if (result == ERROR_SUCCESS)
+      282:  194:    result = yr_arena_create(
+        -:  195:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->sz_arena);
+        -:  196:
+      282:  197:  if (result == ERROR_SUCCESS)
+      282:  198:    result = yr_arena_create(
+        -:  199:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->rules_arena);
+        -:  200:
+      282:  201:  if (result == ERROR_SUCCESS)
+      282:  202:    result = yr_arena_create(
+        -:  203:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->strings_arena);
+        -:  204:
+      282:  205:  if (result == ERROR_SUCCESS)
+      282:  206:      result = yr_arena_create(
+        -:  207:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->code_arena);
+        -:  208:
+      282:  209:  if (result == ERROR_SUCCESS)
+      282:  210:    result = yr_arena_create(
+        -:  211:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->re_code_arena);
+        -:  212:
+      282:  213:  if (result == ERROR_SUCCESS)
+      282:  214:    result = yr_arena_create(
+        -:  215:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->externals_arena);
+        -:  216:
+      282:  217:  if (result == ERROR_SUCCESS)
+      282:  218:    result = yr_arena_create(
+        -:  219:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->namespaces_arena);
+        -:  220:
+      282:  221:  if (result == ERROR_SUCCESS)
+      282:  222:    result = yr_arena_create(
+        -:  223:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->metas_arena);
+        -:  224:
+      282:  225:  if (result == ERROR_SUCCESS)
+      282:  226:    result = yr_arena_create(
+        -:  227:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->automaton_arena);
+        -:  228:
+      282:  229:  if (result == ERROR_SUCCESS)
+      282:  230:    result = yr_arena_create(
+        -:  231:        65536, ARENA_FLAGS_RELOCATABLE, &new_compiler->matches_arena);
+        -:  232:
+      282:  233:  if (result == ERROR_SUCCESS)
+      282:  234:    result = yr_ac_automaton_create(&new_compiler->automaton);
+        -:  235:
+      282:  236:  if (result == ERROR_SUCCESS)
+        -:  237:  {
+      282:  238:    *compiler = new_compiler;
+        -:  239:  }
+        -:  240:  else  // if error, do cleanup
+        -:  241:  {
+    #####:  242:    yr_compiler_destroy(new_compiler);
+        -:  243:  }
+        -:  244:
+      282:  245:  return result;
+        -:  246:}
+        -:  247:
+        -:  248:
+      282:  249:YR_API void yr_compiler_destroy(
+        -:  250:    YR_COMPILER* compiler)
+        -:  251:{
+        -:  252:  YR_FIXUP* fixup;
+        -:  253:  int i;
+        -:  254:
+      282:  255:  yr_arena_destroy(compiler->compiled_rules_arena);
+      282:  256:  yr_arena_destroy(compiler->sz_arena);
+      282:  257:  yr_arena_destroy(compiler->rules_arena);
+      282:  258:  yr_arena_destroy(compiler->strings_arena);
+      282:  259:  yr_arena_destroy(compiler->code_arena);
+      282:  260:  yr_arena_destroy(compiler->re_code_arena);
+      282:  261:  yr_arena_destroy(compiler->externals_arena);
+      282:  262:  yr_arena_destroy(compiler->namespaces_arena);
+      282:  263:  yr_arena_destroy(compiler->metas_arena);
+      282:  264:  yr_arena_destroy(compiler->automaton_arena);
+      282:  265:  yr_arena_destroy(compiler->matches_arena);
+        -:  266:
+      282:  267:  yr_ac_automaton_destroy(compiler->automaton);
+        -:  268:
+      282:  269:  yr_hash_table_destroy(
+        -:  270:      compiler->rules_table,
+        -:  271:      NULL);
+        -:  272:
+      282:  273:  yr_hash_table_destroy(
+        -:  274:      compiler->strings_table,
+        -:  275:      NULL);
+        -:  276:
+      282:  277:  yr_hash_table_destroy(
+        -:  278:      compiler->objects_table,
+        -:  279:      (YR_HASH_TABLE_FREE_VALUE_FUNC) yr_object_destroy);
+        -:  280:
+      282:  281:  if (compiler->  atoms_config.free_quality_table)
+    #####:  282:    yr_free(compiler->atoms_config.quality_table);
+        -:  283:
+     282*:  284:  for (i = 0; i < compiler->file_name_stack_ptr; i++)
+    #####:  285:    yr_free(compiler->file_name_stack[i]);
+        -:  286:
+      282:  287:  fixup = compiler->fixup_stack_head;
+        -:  288:
+      298:  289:  while (fixup != NULL)
+        -:  290:  {
+       16:  291:    YR_FIXUP* next_fixup = fixup->next;
+       16:  292:    yr_free(fixup);
+       16:  293:    fixup = next_fixup;
+        -:  294:  }
+        -:  295:
+      282:  296:  yr_free(compiler);
+      282:  297:}
+        -:  298:
+        -:  299:
+      282:  300:YR_API void yr_compiler_set_callback(
+        -:  301:    YR_COMPILER* compiler,
+        -:  302:    YR_COMPILER_CALLBACK_FUNC callback,
+        -:  303:    void* user_data)
+        -:  304:{
+      282:  305:  compiler->callback = callback;
+      282:  306:  compiler->user_data = user_data;
+      282:  307:}
+        -:  308:
+        -:  309:
+    #####:  310:YR_API void yr_compiler_set_include_callback(
+        -:  311:    YR_COMPILER* compiler,
+        -:  312:    YR_COMPILER_INCLUDE_CALLBACK_FUNC include_callback,
+        -:  313:    YR_COMPILER_INCLUDE_FREE_FUNC include_free,
+        -:  314:    void* user_data)
+        -:  315:{
+    #####:  316:  compiler->include_callback = include_callback;
+    #####:  317:  compiler->include_free = include_free;
+    #####:  318:  compiler->incl_clbk_user_data = user_data;
+    #####:  319:}
+        -:  320:
+        -:  321:
+    #####:  322:YR_API void yr_compiler_set_re_ast_callback(
+        -:  323:    YR_COMPILER* compiler,
+        -:  324:    YR_COMPILER_RE_AST_CALLBACK_FUNC re_ast_callback,
+        -:  325:    void* user_data)
+        -:  326:{
+    #####:  327:  compiler->re_ast_callback = re_ast_callback;
+    #####:  328:  compiler->re_ast_clbk_user_data = user_data;
+    #####:  329:}
+        -:  330:
+        -:  331:
+        -:  332://
+        -:  333:// yr_compiler_set_atom_quality_table
+        -:  334://
+        -:  335:// This function allows to specify an atom quality table to be used by the
+        -:  336:// compiler for choosing the best atoms from regular expressions and strings.
+        -:  337:// When a quality table is set, the compiler uses yr_atoms_table_quality
+        -:  338:// instead of yr_atoms_heuristic_quality for computing atom quality. The table
+        -:  339:// has an arbitary number of entries, each composed of YR_MAX_ATOM_LENGTH + 1
+        -:  340:// bytes. The first YR_MAX_ATOM_LENGTH bytes from each entry are the atom's
+        -:  341:// ones, and the remaining byte is a value in the range 0-255 determining the
+        -:  342:// atom's quality. Entries must be lexicografically sorted by atom in ascending
+        -:  343:// order.
+        -:  344://
+        -:  345://  [ atom (YR_MAX_ATOM_LENGTH bytes) ] [ quality (1 byte) ]
+        -:  346://
+        -:  347://  [ 00 00 .. 00 00 ] [ 00 ]
+        -:  348://  [ 00 00 .. 00 01 ] [ 45 ]
+        -:  349://  [ 00 00 .. 00 02 ] [ 13 ]
+        -:  350://  ...
+        -:  351://  [ FF FF .. FF FF ] [ 03 ]
+        -:  352://
+        -:  353:// The "table" argument must point to a buffer containing the quality in
+        -:  354:// the format explained above, and "entries" must contain the number of entries
+        -:  355:// in the table. The table can not be freed while the compiler is in use, the
+        -:  356:// caller is responsible for freeing the table.
+        -:  357://
+        -:  358:// The "warning_threshold" argument must be a number between 0 and 255, if some
+        -:  359:// atom choosen for a string have a quality below the specified threshold a
+        -:  360:// warning like "<string> is slowing down scanning" is shown.
+        -:  361:
+    #####:  362:YR_API void yr_compiler_set_atom_quality_table(
+        -:  363:    YR_COMPILER* compiler,
+        -:  364:    const void* table,
+        -:  365:    int entries,
+        -:  366:    unsigned char warning_threshold)
+        -:  367:{
+    #####:  368:  compiler->atoms_config.free_quality_table = false;
+    #####:  369:  compiler->atoms_config.quality_warning_threshold = warning_threshold;
+    #####:  370:  compiler->atoms_config.get_atom_quality = yr_atoms_table_quality;
+    #####:  371:  compiler->atoms_config.quality_table_entries = entries;
+    #####:  372:  compiler->atoms_config.quality_table = \
+        -:  373:      (YR_ATOM_QUALITY_TABLE_ENTRY*) table;
+    #####:  374:}
+        -:  375:
+        -:  376://
+        -:  377:// yr_compiler_set_atom_quality_table
+        -:  378://
+        -:  379:// Load an atom quality table from a file. The file's content must have the
+        -:  380:// format explained in the decription for yr_compiler_set_atom_quality_table.
+        -:  381://
+        -:  382:
+    #####:  383:YR_API int yr_compiler_load_atom_quality_table(
+        -:  384:    YR_COMPILER* compiler,
+        -:  385:    const char* filename,
+        -:  386:    unsigned char warning_threshold)
+        -:  387:{
+        -:  388:  long file_size;
+        -:  389:  int entries;
+        -:  390:  void* table;
+        -:  391:
+    #####:  392:  FILE* fh = fopen(filename, "rb");
+        -:  393:
+    #####:  394:  if (fh == NULL)
+    #####:  395:    return ERROR_COULD_NOT_OPEN_FILE;
+        -:  396:
+    #####:  397:  fseek(fh, 0L, SEEK_END);
+    #####:  398:  file_size = ftell(fh);
+    #####:  399:  fseek(fh, 0L, SEEK_SET);
+        -:  400:
+    #####:  401:  table = yr_malloc(file_size);
+        -:  402:
+    #####:  403:  if (table == NULL)
+        -:  404:  {
+    #####:  405:    fclose(fh);
+    #####:  406:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  407:  }
+        -:  408:
+    #####:  409:  entries = (int) file_size / sizeof(YR_ATOM_QUALITY_TABLE_ENTRY);
+        -:  410:
+    #####:  411:  if (fread(table, sizeof(YR_ATOM_QUALITY_TABLE_ENTRY), entries, fh) != entries)
+        -:  412:  {
+    #####:  413:    fclose(fh);
+    #####:  414:    yr_free(table);
+    #####:  415:    return ERROR_COULD_NOT_READ_FILE;
+        -:  416:  }
+        -:  417:
+    #####:  418:  fclose(fh);
+        -:  419:
+    #####:  420:  yr_compiler_set_atom_quality_table(
+        -:  421:      compiler, table, entries, warning_threshold);
+        -:  422:
+    #####:  423:  compiler->atoms_config.free_quality_table = true;
+        -:  424:
+    #####:  425:  return ERROR_SUCCESS;
+        -:  426:}
+        -:  427:
+        -:  428:
+    #####:  429:int _yr_compiler_push_file_name(
+        -:  430:    YR_COMPILER* compiler,
+        -:  431:    const char* file_name)
+        -:  432:{
+        -:  433:  char* str;
+        -:  434:  int i;
+        -:  435:
+    #####:  436:  for (i = 0; i < compiler->file_name_stack_ptr; i++)
+        -:  437:  {
+    #####:  438:    if (strcmp(file_name, compiler->file_name_stack[i]) == 0)
+    #####:  439:      return ERROR_INCLUDES_CIRCULAR_REFERENCE;
+        -:  440:  }
+        -:  441:
+    #####:  442:  if (compiler->file_name_stack_ptr == YR_MAX_INCLUDE_DEPTH)
+    #####:  443:    return ERROR_INCLUDE_DEPTH_EXCEEDED;
+        -:  444:
+    #####:  445:  str = yr_strdup(file_name);
+        -:  446:
+    #####:  447:  if (str == NULL)
+    #####:  448:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  449:
+    #####:  450:  compiler->file_name_stack[compiler->file_name_stack_ptr] = str;
+    #####:  451:  compiler->file_name_stack_ptr++;
+        -:  452:
+    #####:  453:  return ERROR_SUCCESS;
+        -:  454:}
+        -:  455:
+        -:  456:
+    #####:  457:void _yr_compiler_pop_file_name(
+        -:  458:    YR_COMPILER* compiler)
+        -:  459:{
+    #####:  460:  if (compiler->file_name_stack_ptr > 0)
+        -:  461:  {
+    #####:  462:    compiler->file_name_stack_ptr--;
+    #####:  463:    yr_free(compiler->file_name_stack[compiler->file_name_stack_ptr]);
+    #####:  464:    compiler->file_name_stack[compiler->file_name_stack_ptr] = NULL;
+        -:  465:  }
+    #####:  466:}
+        -:  467:
+        -:  468:
+    #####:  469:YR_API char* yr_compiler_get_current_file_name(
+        -:  470:    YR_COMPILER* compiler)
+        -:  471:{
+    #####:  472:  if (compiler->file_name_stack_ptr > 0)
+        -:  473:  {
+    #####:  474:    return compiler->file_name_stack[compiler->file_name_stack_ptr - 1];
+        -:  475:  }
+        -:  476:  else
+        -:  477:  {
+    #####:  478:    return NULL;
+        -:  479:  }
+        -:  480:}
+        -:  481:
+        -:  482:
+      282:  483:static int _yr_compiler_set_namespace(
+        -:  484:    YR_COMPILER* compiler,
+        -:  485:    const char* namespace_)
+        -:  486:{
+        -:  487:  YR_NAMESPACE* ns;
+        -:  488:
+        -:  489:  char* ns_name;
+        -:  490:  int result;
+        -:  491:  int i;
+        -:  492:  bool found;
+        -:  493:
+      282:  494:  ns = (YR_NAMESPACE*) yr_arena_base_address(compiler->namespaces_arena);
+      282:  495:  found = false;
+        -:  496:
+     282*:  497:  for (i = 0; i < compiler->namespaces_count; i++)
+        -:  498:  {
+    #####:  499:    if (strcmp(ns->name, namespace_) == 0)
+        -:  500:    {
+    #####:  501:      found = true;
+    #####:  502:      break;
+        -:  503:    }
+        -:  504:
+    #####:  505:    ns = (YR_NAMESPACE*) yr_arena_next_address(
+        -:  506:        compiler->namespaces_arena,
+        -:  507:        ns,
+        -:  508:        sizeof(YR_NAMESPACE));
+        -:  509:  }
+        -:  510:
+      282:  511:  if (!found)
+        -:  512:  {
+      282:  513:    result = yr_arena_write_string(
+        -:  514:        compiler->sz_arena,
+        -:  515:        namespace_,
+        -:  516:        &ns_name);
+        -:  517:
+      282:  518:    if (result == ERROR_SUCCESS)
+      282:  519:      result = yr_arena_allocate_struct(
+        -:  520:          compiler->namespaces_arena,
+        -:  521:          sizeof(YR_NAMESPACE),
+        -:  522:          (void**) &ns,
+        -:  523:          offsetof(YR_NAMESPACE, name),
+        -:  524:          EOL);
+        -:  525:
+      282:  526:    if (result != ERROR_SUCCESS)
+    #####:  527:      return result;
+        -:  528:
+      282:  529:    ns->name = ns_name;
+        -:  530:
+     9306:  531:    for (i = 0; i < YR_MAX_THREADS; i++)
+     9024:  532:      ns->t_flags[i] = 0;
+        -:  533:
+      282:  534:    compiler->namespaces_count++;
+        -:  535:  }
+        -:  536:
+      282:  537:  compiler->current_namespace = ns;
+      282:  538:  return ERROR_SUCCESS;
+        -:  539:}
+        -:  540:
+        -:  541:
+    #####:  542:YR_API int yr_compiler_add_file(
+        -:  543:    YR_COMPILER* compiler,
+        -:  544:    FILE* rules_file,
+        -:  545:    const char* namespace_,
+        -:  546:    const char* file_name)
+        -:  547:{
+        -:  548:  int result;
+        -:  549:
+        -:  550:  // Don't allow yr_compiler_add_file() after
+        -:  551:  // yr_compiler_get_rules() has been called.
+        -:  552:
+    #####:  553:  assert(compiler->compiled_rules_arena == NULL);
+        -:  554:
+        -:  555:  // Don't allow calls to yr_compiler_add_file() if a previous call to
+        -:  556:  // yr_compiler_add_XXXX failed.
+        -:  557:
+    #####:  558:  assert(compiler->errors == 0);
+        -:  559:
+    #####:  560:  if (namespace_ != NULL)
+    #####:  561:    compiler->last_error = _yr_compiler_set_namespace(compiler, namespace_);
+        -:  562:  else
+    #####:  563:    compiler->last_error = _yr_compiler_set_namespace(compiler, "default");
+        -:  564:
+    #####:  565:  if (compiler->last_error == ERROR_SUCCESS && file_name != NULL)
+    #####:  566:    compiler->last_error = _yr_compiler_push_file_name(compiler, file_name);
+        -:  567:
+    #####:  568:  if (compiler->last_error != ERROR_SUCCESS)
+    #####:  569:    return ++compiler->errors;
+        -:  570:
+    #####:  571:  result = yr_lex_parse_rules_file(rules_file, compiler);
+        -:  572:
+    #####:  573:  if (file_name != NULL)
+    #####:  574:    _yr_compiler_pop_file_name(compiler);
+        -:  575:
+    #####:  576:  return result;
+        -:  577:}
+        -:  578:
+        -:  579:
+    #####:  580:YR_API int yr_compiler_add_fd(
+        -:  581:    YR_COMPILER* compiler,
+        -:  582:    YR_FILE_DESCRIPTOR rules_fd,
+        -:  583:    const char* namespace_,
+        -:  584:    const char* file_name)
+        -:  585:{
+        -:  586:  int result;
+        -:  587:
+        -:  588:  // Don't allow yr_compiler_add_fd() after
+        -:  589:  // yr_compiler_get_rules() has been called.
+        -:  590:
+    #####:  591:  assert(compiler->compiled_rules_arena == NULL);
+        -:  592:
+        -:  593:  // Don't allow calls to yr_compiler_add_fd() if a previous call to
+        -:  594:  // yr_compiler_add_XXXX failed.
+        -:  595:
+    #####:  596:  assert(compiler->errors == 0);
+        -:  597:
+    #####:  598:  if (namespace_ != NULL)
+    #####:  599:    compiler->last_error = _yr_compiler_set_namespace(compiler, namespace_);
+        -:  600:  else
+    #####:  601:    compiler->last_error = _yr_compiler_set_namespace(compiler, "default");
+        -:  602:
+    #####:  603:  if (compiler->last_error == ERROR_SUCCESS && file_name != NULL)
+    #####:  604:    compiler->last_error = _yr_compiler_push_file_name(compiler, file_name);
+        -:  605:
+    #####:  606:  if (compiler->last_error != ERROR_SUCCESS)
+    #####:  607:    return ++compiler->errors;
+        -:  608:
+    #####:  609:  result = yr_lex_parse_rules_fd(rules_fd, compiler);
+        -:  610:
+    #####:  611:  if (file_name != NULL)
+    #####:  612:    _yr_compiler_pop_file_name(compiler);
+        -:  613:
+    #####:  614:  return result;
+        -:  615:}
+        -:  616:
+        -:  617:
+      282:  618:YR_API int yr_compiler_add_string(
+        -:  619:    YR_COMPILER* compiler,
+        -:  620:    const char* rules_string,
+        -:  621:    const char* namespace_)
+        -:  622:{
+        -:  623:  // Don't allow calls to yr_compiler_add_string() after
+        -:  624:  // yr_compiler_get_rules() has been called.
+        -:  625:
+     282*:  626:  assert(compiler->compiled_rules_arena == NULL);
+        -:  627:
+        -:  628:  // Don't allow calls to yr_compiler_add_string() if a previous call to
+        -:  629:  // yr_compiler_add_XXXX failed.
+        -:  630:
+     282*:  631:  assert(compiler->errors == 0);
+        -:  632:
+      282:  633:  if (namespace_ != NULL)
+    #####:  634:    compiler->last_error = _yr_compiler_set_namespace(compiler, namespace_);
+        -:  635:  else
+      282:  636:    compiler->last_error = _yr_compiler_set_namespace(compiler, "default");
+        -:  637:
+      282:  638:  if (compiler->last_error != ERROR_SUCCESS)
+    #####:  639:    return ++compiler->errors;
+        -:  640:
+      282:  641:  return yr_lex_parse_rules_string(rules_string, compiler);
+        -:  642:}
+        -:  643:
+        -:  644:
+      266:  645:static int _yr_compiler_compile_rules(
+        -:  646:    YR_COMPILER* compiler)
+        -:  647:{
+      266:  648:  YARA_RULES_FILE_HEADER* rules_file_header = NULL;
+      266:  649:  YR_ARENA* arena = NULL;
+        -:  650:  YR_RULE null_rule;
+        -:  651:  YR_EXTERNAL_VARIABLE null_external;
+        -:  652:  YR_AC_TABLES tables;
+        -:  653:
+      266:  654:  uint8_t halt = OP_HALT;
+        -:  655:  int result;
+        -:  656:
+        -:  657:  // Write halt instruction at the end of code.
+      266:  658:  yr_arena_write_data(
+        -:  659:      compiler->code_arena,
+        -:  660:      &halt,
+        -:  661:      sizeof(uint8_t),
+        -:  662:      NULL);
+        -:  663:
+        -:  664:  // Write a null rule indicating the end.
+      266:  665:  memset(&null_rule, 0xFA, sizeof(YR_RULE));
+      266:  666:  null_rule.g_flags = RULE_GFLAGS_NULL;
+        -:  667:
+      266:  668:  yr_arena_write_data(
+        -:  669:      compiler->rules_arena,
+        -:  670:      &null_rule,
+        -:  671:      sizeof(YR_RULE),
+        -:  672:      NULL);
+        -:  673:
+        -:  674:  // Write a null external the end.
+      266:  675:  memset(&null_external, 0xFA, sizeof(YR_EXTERNAL_VARIABLE));
+      266:  676:  null_external.type = EXTERNAL_VARIABLE_TYPE_NULL;
+        -:  677:
+      266:  678:  yr_arena_write_data(
+        -:  679:      compiler->externals_arena,
+        -:  680:      &null_external,
+        -:  681:      sizeof(YR_EXTERNAL_VARIABLE),
+        -:  682:      NULL);
+        -:  683:
+        -:  684:  // Write Aho-Corasick automaton to arena.
+      266:  685:  result = yr_ac_compile(
+        -:  686:      compiler->automaton,
+        -:  687:      compiler->automaton_arena,
+        -:  688:      &tables);
+        -:  689:
+      266:  690:  if (result == ERROR_SUCCESS)
+      266:  691:    result = yr_arena_create(1024, ARENA_FLAGS_RELOCATABLE, &arena);
+        -:  692:
+      266:  693:  if (result == ERROR_SUCCESS)
+      266:  694:    result = yr_arena_allocate_struct(
+        -:  695:        arena,
+        -:  696:        sizeof(YARA_RULES_FILE_HEADER),
+        -:  697:        (void**) &rules_file_header,
+        -:  698:        offsetof(YARA_RULES_FILE_HEADER, rules_list_head),
+        -:  699:        offsetof(YARA_RULES_FILE_HEADER, externals_list_head),
+        -:  700:        offsetof(YARA_RULES_FILE_HEADER, code_start),
+        -:  701:        offsetof(YARA_RULES_FILE_HEADER, ac_match_table),
+        -:  702:        offsetof(YARA_RULES_FILE_HEADER, ac_transition_table),
+        -:  703:        EOL);
+        -:  704:
+      266:  705:  if (result == ERROR_SUCCESS)
+        -:  706:  {
+      266:  707:    rules_file_header->rules_list_head = (YR_RULE*) yr_arena_base_address(
+        -:  708:        compiler->rules_arena);
+        -:  709:
+      532:  710:    rules_file_header->externals_list_head = (YR_EXTERNAL_VARIABLE*)
+      266:  711:		yr_arena_base_address(compiler->externals_arena);
+        -:  712:
+      266:  713:    rules_file_header->code_start = (uint8_t*) yr_arena_base_address(
+        -:  714:        compiler->code_arena);
+        -:  715:
+      266:  716:    rules_file_header->ac_match_table = tables.matches;
+      266:  717:    rules_file_header->ac_transition_table = tables.transitions;
+      266:  718:    rules_file_header->ac_tables_size = compiler->automaton->tables_size;
+        -:  719:  }
+        -:  720:
+      266:  721:  if (result == ERROR_SUCCESS)
+        -:  722:  {
+      266:  723:    result = yr_arena_append(
+        -:  724:        arena,
+        -:  725:        compiler->code_arena);
+        -:  726:  }
+        -:  727:
+      266:  728:  if (result == ERROR_SUCCESS)
+        -:  729:  {
+      266:  730:    compiler->code_arena = NULL;
+      266:  731:    result = yr_arena_append(
+        -:  732:        arena,
+        -:  733:        compiler->re_code_arena);
+        -:  734:  }
+        -:  735:
+      266:  736:  if (result == ERROR_SUCCESS)
+        -:  737:  {
+      266:  738:    compiler->re_code_arena = NULL;
+      266:  739:    result = yr_arena_append(
+        -:  740:        arena,
+        -:  741:        compiler->rules_arena);
+        -:  742:  }
+        -:  743:
+      266:  744:  if (result == ERROR_SUCCESS)
+        -:  745:  {
+      266:  746:    compiler->rules_arena = NULL;
+      266:  747:    result = yr_arena_append(
+        -:  748:        arena,
+        -:  749:        compiler->strings_arena);
+        -:  750:  }
+        -:  751:
+      266:  752:  if (result == ERROR_SUCCESS)
+        -:  753:  {
+      266:  754:    compiler->strings_arena = NULL;
+      266:  755:    result = yr_arena_append(
+        -:  756:        arena,
+        -:  757:        compiler->externals_arena);
+        -:  758:  }
+        -:  759:
+      266:  760:  if (result == ERROR_SUCCESS)
+        -:  761:  {
+      266:  762:    compiler->externals_arena = NULL;
+      266:  763:    result = yr_arena_append(
+        -:  764:        arena,
+        -:  765:        compiler->namespaces_arena);
+        -:  766:  }
+        -:  767:
+      266:  768:  if (result == ERROR_SUCCESS)
+        -:  769:  {
+      266:  770:    compiler->namespaces_arena = NULL;
+      266:  771:    result = yr_arena_append(
+        -:  772:        arena,
+        -:  773:        compiler->metas_arena);
+        -:  774:  }
+        -:  775:
+      266:  776:  if (result == ERROR_SUCCESS)
+        -:  777:  {
+      266:  778:    compiler->metas_arena = NULL;
+      266:  779:    result = yr_arena_append(
+        -:  780:        arena,
+        -:  781:        compiler->sz_arena);
+        -:  782:  }
+        -:  783:
+      266:  784:  if (result == ERROR_SUCCESS)
+        -:  785:  {
+      266:  786:    compiler->sz_arena = NULL;
+      266:  787:    result = yr_arena_append(
+        -:  788:        arena,
+        -:  789:        compiler->automaton_arena);
+        -:  790:  }
+        -:  791:
+      266:  792:  if (result == ERROR_SUCCESS)
+        -:  793:  {
+      266:  794:    compiler->automaton_arena = NULL;
+      266:  795:    result = yr_arena_append(
+        -:  796:        arena,
+        -:  797:        compiler->matches_arena);
+        -:  798:  }
+        -:  799:
+      266:  800:  if (result == ERROR_SUCCESS)
+        -:  801:  {
+      266:  802:    compiler->matches_arena = NULL;
+      266:  803:    compiler->compiled_rules_arena = arena;
+      266:  804:    result = yr_arena_coalesce(arena);
+        -:  805:  }
+        -:  806:  else
+        -:  807:  {
+    #####:  808:    yr_arena_destroy(arena);
+        -:  809:  }
+        -:  810:
+      266:  811:  return result;
+        -:  812:}
+        -:  813:
+        -:  814:
+      266:  815:YR_API int yr_compiler_get_rules(
+        -:  816:    YR_COMPILER* compiler,
+        -:  817:    YR_RULES** rules)
+        -:  818:{
+        -:  819:  YR_RULES* yara_rules;
+        -:  820:  YARA_RULES_FILE_HEADER* rules_file_header;
+        -:  821:
+        -:  822:  // Don't allow calls to yr_compiler_get_rules() if a previous call to
+        -:  823:  // yr_compiler_add_XXXX failed.
+        -:  824:
+     266*:  825:  assert(compiler->errors == 0);
+        -:  826:
+      266:  827:  *rules = NULL;
+        -:  828:
+      266:  829:  if (compiler->compiled_rules_arena == NULL)
+     266*:  830:     FAIL_ON_ERROR(_yr_compiler_compile_rules(compiler));
+        -:  831:
+      266:  832:  yara_rules = (YR_RULES*) yr_malloc(sizeof(YR_RULES));
+        -:  833:
+      266:  834:  if (yara_rules == NULL)
+    #####:  835:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  836:
+     266*:  837:  FAIL_ON_ERROR_WITH_CLEANUP(
+        -:  838:      yr_arena_duplicate(compiler->compiled_rules_arena, &yara_rules->arena),
+        -:  839:      yr_free(yara_rules));
+        -:  840:
+      266:  841:  rules_file_header = (YARA_RULES_FILE_HEADER*) yr_arena_base_address(
+        -:  842:      yara_rules->arena);
+        -:  843:
+      266:  844:  yara_rules->externals_list_head = rules_file_header->externals_list_head;
+      266:  845:  yara_rules->rules_list_head = rules_file_header->rules_list_head;
+      266:  846:  yara_rules->ac_match_table = rules_file_header->ac_match_table;
+      266:  847:  yara_rules->ac_transition_table = rules_file_header->ac_transition_table;
+      266:  848:  yara_rules->ac_tables_size = rules_file_header->ac_tables_size;
+      266:  849:  yara_rules->code_start = rules_file_header->code_start;
+      266:  850:  yara_rules->time_cost = 0;
+        -:  851:
+      266:  852:  memset(yara_rules->tidx_mask, 0, sizeof(yara_rules->tidx_mask));
+        -:  853:
+     266*:  854:  FAIL_ON_ERROR_WITH_CLEANUP(
+        -:  855:      yr_mutex_create(&yara_rules->mutex),
+        -:  856:      // cleanup
+        -:  857:      yr_arena_destroy(yara_rules->arena);
+        -:  858:      yr_free(yara_rules));
+        -:  859:
+      266:  860:  *rules = yara_rules;
+        -:  861:
+      266:  862:  return ERROR_SUCCESS;
+        -:  863:}
+        -:  864:
+    #####:  865:int _yr_compiler_define_variable(
+        -:  866:    YR_COMPILER* compiler,
+        -:  867:    YR_EXTERNAL_VARIABLE* external)
+        -:  868:{
+        -:  869:  YR_EXTERNAL_VARIABLE* ext;
+        -:  870:  YR_OBJECT* object;
+        -:  871:
+        -:  872:  char* id;
+        -:  873:
+    #####:  874:  if (external->identifier == NULL)
+    #####:  875:    return ERROR_INVALID_ARGUMENT;
+        -:  876:
+    #####:  877:  object = (YR_OBJECT*) yr_hash_table_lookup(
+        -:  878:      compiler->objects_table,
+        -:  879:      external->identifier,
+        -:  880:      NULL);
+        -:  881:
+    #####:  882:  if (object != NULL)
+    #####:  883:    return ERROR_DUPLICATED_EXTERNAL_VARIABLE;
+        -:  884:
+    #####:  885:  FAIL_ON_ERROR(yr_arena_write_string(
+        -:  886:      compiler->sz_arena,
+        -:  887:      external->identifier,
+        -:  888:      &id));
+        -:  889:
+    #####:  890:  FAIL_ON_ERROR(yr_arena_allocate_struct(
+        -:  891:      compiler->externals_arena,
+        -:  892:      sizeof(YR_EXTERNAL_VARIABLE),
+        -:  893:      (void**) &ext,
+        -:  894:      offsetof(YR_EXTERNAL_VARIABLE, identifier),
+        -:  895:      EOL));
+        -:  896:
+    #####:  897:  ext->identifier = id;
+    #####:  898:  ext->type = external->type;
+    #####:  899:  ext->value = external->value;
+        -:  900:
+    #####:  901:  if (external->type == EXTERNAL_VARIABLE_TYPE_STRING)
+        -:  902:  {
+        -:  903:    char* val;
+        -:  904:
+    #####:  905:    if (external->value.s == NULL)
+    #####:  906:      return ERROR_INVALID_ARGUMENT;
+        -:  907:
+    #####:  908:    FAIL_ON_ERROR(yr_arena_write_string(
+        -:  909:        compiler->sz_arena,
+        -:  910:        external->value.s,
+        -:  911:        &val));
+        -:  912:
+    #####:  913:    ext->value.s = val;
+        -:  914:
+    #####:  915:    FAIL_ON_ERROR(yr_arena_make_ptr_relocatable(
+        -:  916:        compiler->externals_arena,
+        -:  917:        ext,
+        -:  918:        offsetof(YR_EXTERNAL_VARIABLE, value.s),
+        -:  919:        EOL));
+        -:  920:  }
+        -:  921:
+    #####:  922:  FAIL_ON_ERROR(yr_object_from_external_variable(
+        -:  923:      external,
+        -:  924:      &object));
+        -:  925:
+    #####:  926:  FAIL_ON_ERROR(yr_hash_table_add(
+        -:  927:      compiler->objects_table,
+        -:  928:      external->identifier,
+        -:  929:      NULL,
+        -:  930:      (void*) object));
+        -:  931:
+    #####:  932:  return ERROR_SUCCESS;
+        -:  933:}
+        -:  934:
+        -:  935:
+    #####:  936:YR_API int yr_compiler_define_integer_variable(
+        -:  937:    YR_COMPILER* compiler,
+        -:  938:    const char* identifier,
+        -:  939:    int64_t value)
+        -:  940:{
+        -:  941:  YR_EXTERNAL_VARIABLE external;
+        -:  942:
+    #####:  943:  external.type = EXTERNAL_VARIABLE_TYPE_INTEGER;
+    #####:  944:  external.identifier = identifier;
+    #####:  945:  external.value.i = value;
+        -:  946:
+    #####:  947:  FAIL_ON_ERROR(_yr_compiler_define_variable(
+        -:  948:      compiler, &external));
+        -:  949:
+    #####:  950:  return ERROR_SUCCESS;
+        -:  951:}
+        -:  952:
+        -:  953:
+    #####:  954:YR_API int yr_compiler_define_boolean_variable(
+        -:  955:    YR_COMPILER* compiler,
+        -:  956:    const char* identifier,
+        -:  957:    int value)
+        -:  958:{
+        -:  959:  YR_EXTERNAL_VARIABLE external;
+        -:  960:
+    #####:  961:  external.type = EXTERNAL_VARIABLE_TYPE_BOOLEAN;
+    #####:  962:  external.identifier = identifier;
+    #####:  963:  external.value.i = value;
+        -:  964:
+    #####:  965:  FAIL_ON_ERROR(_yr_compiler_define_variable(
+        -:  966:      compiler, &external));
+        -:  967:
+    #####:  968:  return ERROR_SUCCESS;
+        -:  969:}
+        -:  970:
+        -:  971:
+    #####:  972:YR_API int yr_compiler_define_float_variable(
+        -:  973:    YR_COMPILER* compiler,
+        -:  974:    const char* identifier,
+        -:  975:    double value)
+        -:  976:{
+        -:  977:  YR_EXTERNAL_VARIABLE external;
+        -:  978:
+    #####:  979:  external.type = EXTERNAL_VARIABLE_TYPE_FLOAT;
+    #####:  980:  external.identifier = identifier;
+    #####:  981:  external.value.f = value;
+        -:  982:
+    #####:  983:  FAIL_ON_ERROR(_yr_compiler_define_variable(
+        -:  984:      compiler, &external));
+        -:  985:
+    #####:  986:  return ERROR_SUCCESS;
+        -:  987:}
+        -:  988:
+        -:  989:
+    #####:  990:YR_API int yr_compiler_define_string_variable(
+        -:  991:    YR_COMPILER* compiler,
+        -:  992:    const char* identifier,
+        -:  993:    const char* value)
+        -:  994:{
+        -:  995:  YR_EXTERNAL_VARIABLE external;
+        -:  996:
+    #####:  997:  external.type = EXTERNAL_VARIABLE_TYPE_STRING;
+    #####:  998:  external.identifier = identifier;
+    #####:  999:  external.value.s = (char*) value;
+        -: 1000:
+    #####: 1001:  FAIL_ON_ERROR(_yr_compiler_define_variable(
+        -: 1002:      compiler, &external));
+        -: 1003:
+    #####: 1004:  return ERROR_SUCCESS;
+        -: 1005:}
+        -: 1006:
+        -: 1007:
+       13: 1008:YR_API char* yr_compiler_get_error_message(
+        -: 1009:    YR_COMPILER* compiler,
+        -: 1010:    char* buffer,
+        -: 1011:    int buffer_size)
+        -: 1012:{
+        -: 1013:  uint32_t max_strings_per_rule;
+        -: 1014:
+       13: 1015:  switch(compiler->last_error)
+        -: 1016:  {
+    #####: 1017:    case ERROR_INSUFFICIENT_MEMORY:
+    #####: 1018:      snprintf(buffer, buffer_size, "not enough memory");
+    #####: 1019:      break;
+    #####: 1020:    case ERROR_DUPLICATED_IDENTIFIER:
+    #####: 1021:      snprintf(
+        -: 1022:          buffer,
+        -: 1023:          buffer_size,
+        -: 1024:          "duplicated identifier \"%s\"",
+    #####: 1025:          compiler->last_error_extra_info);
+    #####: 1026:      break;
+    #####: 1027:    case ERROR_DUPLICATED_STRING_IDENTIFIER:
+    #####: 1028:      snprintf(
+        -: 1029:          buffer,
+        -: 1030:          buffer_size,
+        -: 1031:          "duplicated string identifier \"%s\"",
+    #####: 1032:          compiler->last_error_extra_info);
+    #####: 1033:      break;
+    #####: 1034:    case ERROR_DUPLICATED_TAG_IDENTIFIER:
+    #####: 1035:      snprintf(
+        -: 1036:          buffer,
+        -: 1037:          buffer_size,
+        -: 1038:          "duplicated tag identifier \"%s\"",
+    #####: 1039:          compiler->last_error_extra_info);
+    #####: 1040:      break;
+    #####: 1041:    case ERROR_DUPLICATED_META_IDENTIFIER:
+    #####: 1042:      snprintf(
+        -: 1043:          buffer,
+        -: 1044:          buffer_size,
+        -: 1045:          "duplicated metadata identifier \"%s\"",
+    #####: 1046:          compiler->last_error_extra_info);
+    #####: 1047:      break;
+    #####: 1048:    case ERROR_DUPLICATED_LOOP_IDENTIFIER:
+    #####: 1049:      snprintf(
+        -: 1050:          buffer,
+        -: 1051:          buffer_size,
+        -: 1052:          "duplicated loop identifier \"%s\"",
+    #####: 1053:          compiler->last_error_extra_info);
+    #####: 1054:      break;
+    #####: 1055:    case ERROR_UNDEFINED_STRING:
+    #####: 1056:      snprintf(
+        -: 1057:          buffer,
+        -: 1058:          buffer_size,
+        -: 1059:          "undefined string \"%s\"",
+    #####: 1060:          compiler->last_error_extra_info);
+    #####: 1061:      break;
+    #####: 1062:    case ERROR_UNDEFINED_IDENTIFIER:
+    #####: 1063:      snprintf(
+        -: 1064:          buffer,
+        -: 1065:          buffer_size,
+        -: 1066:          "undefined identifier \"%s\"",
+    #####: 1067:          compiler->last_error_extra_info);
+    #####: 1068:      break;
+    #####: 1069:    case ERROR_UNREFERENCED_STRING:
+    #####: 1070:      snprintf(
+        -: 1071:          buffer,
+        -: 1072:          buffer_size,
+        -: 1073:          "unreferenced string \"%s\"",
+    #####: 1074:          compiler->last_error_extra_info);
+    #####: 1075:      break;
+    #####: 1076:    case ERROR_EMPTY_STRING:
+    #####: 1077:      snprintf(
+        -: 1078:          buffer,
+        -: 1079:          buffer_size,
+        -: 1080:          "empty string \"%s\"",
+    #####: 1081:          compiler->last_error_extra_info);
+    #####: 1082:      break;
+    #####: 1083:    case ERROR_NOT_A_STRUCTURE:
+    #####: 1084:      snprintf(
+        -: 1085:          buffer,
+        -: 1086:          buffer_size,
+        -: 1087:          "\"%s\" is not a structure",
+    #####: 1088:          compiler->last_error_extra_info);
+    #####: 1089:      break;
+    #####: 1090:    case ERROR_NOT_INDEXABLE:
+    #####: 1091:      snprintf(
+        -: 1092:          buffer,
+        -: 1093:          buffer_size,
+        -: 1094:          "\"%s\" is not an array or dictionary",
+    #####: 1095:          compiler->last_error_extra_info);
+    #####: 1096:      break;
+    #####: 1097:    case ERROR_NOT_A_FUNCTION:
+    #####: 1098:      snprintf(
+        -: 1099:          buffer,
+        -: 1100:          buffer_size,
+        -: 1101:          "\"%s\" is not a function",
+    #####: 1102:          compiler->last_error_extra_info);
+    #####: 1103:      break;
+    #####: 1104:    case ERROR_INVALID_FIELD_NAME:
+    #####: 1105:      snprintf(
+        -: 1106:          buffer,
+        -: 1107:          buffer_size,
+        -: 1108:          "invalid field name \"%s\"",
+    #####: 1109:          compiler->last_error_extra_info);
+    #####: 1110:      break;
+    #####: 1111:    case ERROR_MISPLACED_ANONYMOUS_STRING:
+    #####: 1112:      snprintf(
+        -: 1113:          buffer,
+        -: 1114:          buffer_size,
+        -: 1115:          "wrong use of anonymous string");
+    #####: 1116:      break;
+    #####: 1117:    case ERROR_INCLUDES_CIRCULAR_REFERENCE:
+    #####: 1118:      snprintf(
+        -: 1119:          buffer,
+        -: 1120:          buffer_size,
+        -: 1121:          "include circular reference");
+    #####: 1122:      break;
+    #####: 1123:    case ERROR_INCLUDE_DEPTH_EXCEEDED:
+    #####: 1124:      snprintf(buffer,
+        -: 1125:          buffer_size,
+        -: 1126:          "too many levels of included rules");
+    #####: 1127:      break;
+    #####: 1128:    case ERROR_LOOP_NESTING_LIMIT_EXCEEDED:
+    #####: 1129:      snprintf(buffer,
+        -: 1130:          buffer_size,
+        -: 1131:          "loop nesting limit exceeded");
+    #####: 1132:      break;
+    #####: 1133:    case ERROR_NESTED_FOR_OF_LOOP:
+    #####: 1134:      snprintf(buffer,
+        -: 1135:          buffer_size,
+        -: 1136:          "'for <quantifier> of <string set>' loops can't be nested");
+    #####: 1137:      break;
+    #####: 1138:    case ERROR_UNKNOWN_MODULE:
+    #####: 1139:      snprintf(
+        -: 1140:          buffer,
+        -: 1141:          buffer_size,
+        -: 1142:          "unknown module \"%s\"",
+    #####: 1143:          compiler->last_error_extra_info);
+    #####: 1144:      break;
+    #####: 1145:    case ERROR_INVALID_MODULE_NAME:
+    #####: 1146:      snprintf(
+        -: 1147:          buffer,
+        -: 1148:          buffer_size,
+        -: 1149:          "invalid module name \"%s\"",
+    #####: 1150:          compiler->last_error_extra_info);
+    #####: 1151:      break;
+    #####: 1152:    case ERROR_DUPLICATED_STRUCTURE_MEMBER:
+    #####: 1153:      snprintf(buffer,
+        -: 1154:          buffer_size,
+        -: 1155:          "duplicated structure member");
+    #####: 1156:      break;
+    #####: 1157:    case ERROR_WRONG_ARGUMENTS:
+    #####: 1158:      snprintf(
+        -: 1159:          buffer,
+        -: 1160:          buffer_size,
+        -: 1161:          "wrong arguments for function \"%s\"",
+    #####: 1162:          compiler->last_error_extra_info);
+    #####: 1163:      break;
+    #####: 1164:    case ERROR_WRONG_RETURN_TYPE:
+    #####: 1165:      snprintf(buffer,
+        -: 1166:          buffer_size,
+        -: 1167:          "wrong return type for overloaded function");
+    #####: 1168:      break;
+       13: 1169:    case ERROR_INVALID_HEX_STRING:
+        -: 1170:    case ERROR_INVALID_REGULAR_EXPRESSION:
+        -: 1171:    case ERROR_SYNTAX_ERROR:
+        -: 1172:    case ERROR_WRONG_TYPE:
+       13: 1173:      snprintf(
+        -: 1174:          buffer,
+        -: 1175:          buffer_size,
+        -: 1176:          "%s",
+       13: 1177:          compiler->last_error_extra_info);
+       13: 1178:      break;
+    #####: 1179:    case ERROR_INTERNAL_FATAL_ERROR:
+    #####: 1180:      snprintf(
+        -: 1181:          buffer,
+        -: 1182:          buffer_size,
+        -: 1183:          "internal fatal error");
+    #####: 1184:      break;
+    #####: 1185:    case ERROR_DIVISION_BY_ZERO:
+    #####: 1186:      snprintf(
+        -: 1187:          buffer,
+        -: 1188:          buffer_size,
+        -: 1189:          "division by zero");
+    #####: 1190:      break;
+    #####: 1191:    case ERROR_REGULAR_EXPRESSION_TOO_LARGE:
+    #####: 1192:      snprintf(
+        -: 1193:          buffer,
+        -: 1194:          buffer_size,
+        -: 1195:          "regular expression is too large");
+    #####: 1196:      break;
+    #####: 1197:    case ERROR_REGULAR_EXPRESSION_TOO_COMPLEX:
+    #####: 1198:      snprintf(
+        -: 1199:          buffer,
+        -: 1200:          buffer_size,
+        -: 1201:          "regular expression is too complex");
+    #####: 1202:      break;
+    #####: 1203:    case ERROR_TOO_MANY_STRINGS:
+    #####: 1204:       yr_get_configuration(
+        -: 1205:          YR_CONFIG_MAX_STRINGS_PER_RULE,
+        -: 1206:          &max_strings_per_rule);
+    #####: 1207:       snprintf(
+        -: 1208:          buffer,
+        -: 1209:          buffer_size,
+        -: 1210:          "too many strings in rule \"%s\" (limit: %d)",
+    #####: 1211:          compiler->last_error_extra_info,
+        -: 1212:          max_strings_per_rule);
+    #####: 1213:      break;
+    #####: 1214:    case ERROR_INTEGER_OVERFLOW:
+    #####: 1215:      snprintf(
+        -: 1216:          buffer,
+        -: 1217:          buffer_size,
+        -: 1218:          "integer overflow in \"%s\"",
+    #####: 1219:          compiler->last_error_extra_info);
+    #####: 1220:      break;
+    #####: 1221:    case ERROR_COULD_NOT_READ_FILE:
+    #####: 1222:      snprintf(
+        -: 1223:          buffer,
+        -: 1224:          buffer_size,
+        -: 1225:          "could not read file");
+    #####: 1226:      break;
+        -: 1227:  }
+        -: 1228:
+       13: 1229:  return buffer;
+        -: 1230:}

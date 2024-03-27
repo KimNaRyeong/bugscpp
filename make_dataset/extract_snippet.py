@@ -36,7 +36,7 @@ class BugscppInterface():
         self._commands['checkout'](checkout_args)
 
     def build(self):
-        build_args = [self._path_to_repo, '--coverage']
+        build_args = [self._path_to_repo, '--coverage', '--verbose']
         self._commands['build'](build_args)
 
     def test(self):
@@ -126,8 +126,10 @@ def parse_gcov_file(path):
 
     return execution_count
 
-def get_coverage_file(coverage_dir, src_file):
+def get_coverage_file(coverage_dir, src_file, root_dir):
     gcov_postfix = f'{src_file.replace("/", "#")}.gcov'
+    if gcov_postfix.startswith(root_dir):
+        gcov_postfix = gcov_postfix[len(root_dir) + 1:]
     for file in os.listdir(coverage_dir):
         if file.endswith(gcov_postfix):
             return os.path.join(coverage_dir, file)
@@ -140,7 +142,7 @@ def collect_snippet(target_bugs):
         translation_unit = index.parse(src_path, args=[f'-std={standard}'])
 
         relative_path = src_path[len(repo_path) + 1:]
-        gcov_path = get_coverage_file(coverage_path, relative_path)
+        gcov_path = get_coverage_file(coverage_path, relative_path, src_dir)
         if consider_coverage and not gcov_path:
             return
         execution_count = parse_gcov_file(gcov_path)
@@ -155,7 +157,6 @@ def collect_snippet(target_bugs):
                 
                 function_snippet = get_corresponding_code(node)
                 signature = get_signature(function_snippet, node.spelling)
-                
                 is_buggy = False
                 if relative_path in patch_info:
                     for line in patch_info[relative_path]:
@@ -194,8 +195,8 @@ def collect_snippet(target_bugs):
         coverage_path = bugscpp.get_path_to_coverages()
         patch_info = bugscpp.extract_patch_info()
 
-        src_dir = 'src' # for libchewing, libyara for yara
-        test_dir = 'test' # for libchewing, tests for yara
+        src_dir = 'libyara' # for libchewing, libyara for yara
+        test_dir = 'tests' # for libchewing, tests for yara
         
         data = list()
         iterate_over_directory(os.path.join(repo_path, src_dir))        
@@ -260,5 +261,5 @@ def collect_token_statistics(target_bugs):
             json.dump(sorted(data, key=lambda info: info['name']), f, indent=4)
  
 if __name__ == "__main__":
-    collect_snippet([('libchewing', '8')])
+    collect_snippet([('yara', '1'), ('yara', '2'), ('yara', '3'), ('yara', '4'), ('yara', '5')])
     # collect_token_statistics([('zsh', '1', 'Src', True), ('libchewing', '1', 'src', True), ('berry', '1', 'src', True), ('yara', '1', 'libyara', True)])
