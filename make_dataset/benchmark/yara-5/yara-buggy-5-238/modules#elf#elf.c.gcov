@@ -1,0 +1,796 @@
+        -:    0:Source:modules/elf/elf.c
+        -:    0:Graph:/home/workspace/libyara/modules/elf/elf.gcno
+        -:    0:Data:/home/workspace/libyara/modules/elf/elf.gcda
+        -:    0:Runs:10
+        -:    1:/*
+        -:    2:Copyright (c) 2014. The YARA Authors. All Rights Reserved.
+        -:    3:
+        -:    4:Redistribution and use in source and binary forms, with or without modification,
+        -:    5:are permitted provided that the following conditions are met:
+        -:    6:
+        -:    7:1. Redistributions of source code must retain the above copyright notice, this
+        -:    8:list of conditions and the following disclaimer.
+        -:    9:
+        -:   10:2. Redistributions in binary form must reproduce the above copyright notice,
+        -:   11:this list of conditions and the following disclaimer in the documentation and/or
+        -:   12:other materials provided with the distribution.
+        -:   13:
+        -:   14:3. Neither the name of the copyright holder nor the names of its contributors
+        -:   15:may be used to endorse or promote products derived from this software without
+        -:   16:specific prior written permission.
+        -:   17:
+        -:   18:THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+        -:   19:ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+        -:   20:WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+        -:   21:DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+        -:   22:ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+        -:   23:(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+        -:   24:LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+        -:   25:ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        -:   26:(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+        -:   27:SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        -:   28:*/
+        -:   29:
+        -:   30:#include <limits.h>
+        -:   31:#include <string.h>
+        -:   32:
+        -:   33:#include <yara/elf.h>
+        -:   34:#include <yara/endian.h>
+        -:   35:#include <yara/modules.h>
+        -:   36:#include <yara/mem.h>
+        -:   37:#include <yara/utils.h>
+        -:   38:
+        -:   39:
+        -:   40:#define MODULE_NAME elf
+        -:   41:
+        -:   42:#define CLASS_DATA(c,d) ((c << 8) | d)
+        -:   43:
+    #####:   44:int get_elf_class_data(
+        -:   45:    const uint8_t* buffer,
+        -:   46:    size_t buffer_length)
+        -:   47:{
+        -:   48:  elf_ident_t* elf_ident;
+        -:   49:
+    #####:   50:  if (buffer_length < sizeof(elf_ident_t))
+    #####:   51:    return 0;
+        -:   52:
+    #####:   53:  elf_ident = (elf_ident_t*) buffer;
+        -:   54:
+    #####:   55:  if (yr_le32toh(elf_ident->magic) == ELF_MAGIC)
+        -:   56:  {
+    #####:   57:    return CLASS_DATA(elf_ident->_class, elf_ident->data);
+        -:   58:  }
+        -:   59:  else
+        -:   60:  {
+    #####:   61:    return 0;
+        -:   62:  }
+        -:   63:}
+        -:   64:
+    #####:   65:static bool is_valid_ptr(
+        -:   66:    const void* base,
+        -:   67:    size_t size,
+        -:   68:    const void* ptr,
+        -:   69:    uint64_t ptr_size)  // ptr_size can be 64bit even in 32bit systems.
+        -:   70:{
+    #####:   71:  return ptr >= base && ptr_size <= size &&
+    #####:   72:      ((char*) ptr) + ptr_size <= ((char*) base) + size;
+        -:   73:}
+        -:   74:
+        -:   75:#define IS_VALID_PTR(base, size, ptr) \
+        -:   76:    is_valid_ptr(base, size, ptr, sizeof(*ptr))
+        -:   77:
+        -:   78://
+        -:   79:// Returns a string table entry for the index or NULL if the entry is out
+        -:   80:// of bounds. A non-null return value will be a null-terminated C string.
+        -:   81://
+    #####:   82:static const char* str_table_entry(
+        -:   83:    const char* str_table_base,
+        -:   84:    const char* str_table_limit,
+        -:   85:    int index)
+        -:   86:{
+        -:   87:  size_t len;
+        -:   88:  const char* str_entry;
+        -:   89:
+    #####:   90:  if (str_table_base >= str_table_limit)
+    #####:   91:    return NULL;
+        -:   92:
+        -:   93:  // The first entry in the string table must be a null character, if not the
+        -:   94:  // string table is probably corrupted.
+    #####:   95:  if (*str_table_base != '\0')
+    #####:   96:    return NULL;
+        -:   97:
+    #####:   98:  if (index < 0)
+    #####:   99:    return NULL;
+        -:  100:
+    #####:  101:  str_entry = str_table_base + index;
+        -:  102:
+    #####:  103:  if (str_entry >= str_table_limit)
+    #####:  104:    return NULL;
+        -:  105:
+    #####:  106:  len = strnlen(str_entry, str_table_limit - str_entry);
+        -:  107:
+        -:  108:  // Entry is clamped by extent of string table, not null-terminated.
+    #####:  109:  if (str_entry + len == str_table_limit)
+    #####:  110:    return NULL;
+        -:  111:
+    #####:  112:  return str_entry;
+        -:  113:}
+        -:  114:
+        -:  115:#define ELF_SIZE_OF_SECTION_TABLE(bits,bo,h)       \
+        -:  116:  (sizeof(elf##bits##_section_header_t) * yr_##bo##16toh(h->sh_entry_count))
+        -:  117:
+        -:  118:#define ELF_SIZE_OF_PROGRAM_TABLE(bits,bo,h)       \
+        -:  119:  (sizeof(elf##bits##_program_header_t) * yr_##bo##16toh(h->ph_entry_count))
+        -:  120:
+        -:  121:#define ELF_RVA_TO_OFFSET(bits,bo)                                             \
+        -:  122:uint64_t elf_rva_to_offset_##bits##_##bo(                                      \
+        -:  123:    elf##bits##_header_t* elf_header,                                          \
+        -:  124:    uint64_t rva,                                                              \
+        -:  125:    size_t elf_size)                                                           \
+        -:  126:{                                                                              \
+        -:  127:  if (yr_##bo##16toh(elf_header->type) == ELF_ET_EXEC)                         \
+        -:  128:  {                                                                            \
+        -:  129:    int i;                                                                     \
+        -:  130:                                                                               \
+        -:  131:    elf##bits##_program_header_t* program;                                     \
+        -:  132:                                                                               \
+        -:  133:    /* check that ph_offset doesn't wrap when added to SIZE_OF_PROGRAM_TABLE */\
+        -:  134:                                                                               \
+        -:  135:    if(ULONG_MAX - yr_##bo##bits##toh(elf_header->ph_offset) <                 \
+        -:  136:       ELF_SIZE_OF_PROGRAM_TABLE(bits,bo,elf_header))                          \
+        -:  137:    {                                                                          \
+        -:  138:      return YR_UNDEFINED;                                                        \
+        -:  139:    }                                                                          \
+        -:  140:                                                                               \
+        -:  141:    if (yr_##bo##bits##toh(elf_header->ph_offset) == 0 ||                      \
+        -:  142:        yr_##bo##bits##toh(elf_header->ph_offset) > elf_size ||                \
+        -:  143:        yr_##bo##bits##toh(elf_header->ph_offset) +                            \
+        -:  144:         ELF_SIZE_OF_PROGRAM_TABLE(bits,bo,elf_header) > elf_size ||           \
+        -:  145:        yr_##bo##16toh(elf_header->ph_entry_count) == 0)                       \
+        -:  146:    {                                                                          \
+        -:  147:      return YR_UNDEFINED;                                                        \
+        -:  148:    }                                                                          \
+        -:  149:                                                                               \
+        -:  150:    program = (elf##bits##_program_header_t*)                                  \
+        -:  151:        ((uint8_t*) elf_header + yr_##bo##bits##toh(elf_header->ph_offset));   \
+        -:  152:                                                                               \
+        -:  153:    for (i = 0; i < yr_##bo##16toh(elf_header->ph_entry_count); i++)           \
+        -:  154:    {                                                                          \
+        -:  155:      if (rva >= yr_##bo##bits##toh(program->virt_addr) &&                     \
+        -:  156:          rva < yr_##bo##bits##toh(program->virt_addr) +                       \
+        -:  157:          yr_##bo##bits##toh(program->mem_size))                               \
+        -:  158:      {                                                                        \
+        -:  159:        return yr_##bo##bits##toh(program->offset) +                           \
+        -:  160:          (rva - yr_##bo##bits##toh(program->virt_addr));                      \
+        -:  161:      }                                                                        \
+        -:  162:                                                                               \
+        -:  163:      program++;                                                               \
+        -:  164:    }                                                                          \
+        -:  165:  }                                                                            \
+        -:  166:  else                                                                         \
+        -:  167:  {                                                                            \
+        -:  168:    int i;                                                                     \
+        -:  169:                                                                               \
+        -:  170:    elf##bits##_section_header_t* section;                                     \
+        -:  171:                                                                               \
+        -:  172:    /* check that sh_offset doesn't wrap when added to SIZE_OF_SECTION_TABLE */\
+        -:  173:                                                                               \
+        -:  174:    if(ULONG_MAX - yr_##bo##bits##toh(elf_header->sh_offset) <                 \
+        -:  175:       ELF_SIZE_OF_SECTION_TABLE(bits,bo,elf_header))                          \
+        -:  176:    {                                                                          \
+        -:  177:      return YR_UNDEFINED;                                                        \
+        -:  178:    }                                                                          \
+        -:  179:                                                                               \
+        -:  180:    if (yr_##bo##bits##toh(elf_header->sh_offset) == 0 ||                      \
+        -:  181:        yr_##bo##bits##toh(elf_header->sh_offset) > elf_size ||                \
+        -:  182:        yr_##bo##bits##toh(elf_header->sh_offset) +                            \
+        -:  183:         ELF_SIZE_OF_SECTION_TABLE(bits,bo,elf_header) > elf_size ||           \
+        -:  184:        yr_##bo##16toh(elf_header->sh_entry_count) == 0)                       \
+        -:  185:    {                                                                          \
+        -:  186:      return YR_UNDEFINED;                                                        \
+        -:  187:    }                                                                          \
+        -:  188:                                                                               \
+        -:  189:    section = (elf##bits##_section_header_t*)                                  \
+        -:  190:        ((uint8_t*) elf_header + yr_##bo##bits##toh(elf_header->sh_offset));   \
+        -:  191:                                                                               \
+        -:  192:    for (i = 0; i < yr_##bo##16toh(elf_header->sh_entry_count); i++)           \
+        -:  193:    {                                                                          \
+        -:  194:      if (yr_##bo##32toh(section->type) != ELF_SHT_NULL &&                     \
+        -:  195:          yr_##bo##32toh(section->type) != ELF_SHT_NOBITS &&                   \
+        -:  196:          rva >= yr_##bo##bits##toh(section->addr) &&                          \
+        -:  197:          rva < yr_##bo##bits##toh(section->addr) +                            \
+        -:  198:          yr_##bo##bits##toh(section->size))                                   \
+        -:  199:      {                                                                        \
+        -:  200:        return yr_##bo##bits##toh(section->offset) +                           \
+        -:  201:          (rva - yr_##bo##bits##toh(section->addr));                           \
+        -:  202:      }                                                                        \
+        -:  203:                                                                               \
+        -:  204:      section++;                                                               \
+        -:  205:    }                                                                          \
+        -:  206:  }                                                                            \
+        -:  207:  return YR_UNDEFINED;                                                            \
+        -:  208:}
+        -:  209:
+        -:  210:#define PARSE_ELF_HEADER(bits,bo)                                              \
+        -:  211:void parse_elf_header_##bits##_##bo(                                           \
+        -:  212:  elf##bits##_header_t* elf,                                                   \
+        -:  213:  uint64_t base_address,                                                       \
+        -:  214:  size_t elf_size,                                                             \
+        -:  215:  int flags,                                                                   \
+        -:  216:  YR_OBJECT* elf_obj)                                                          \
+        -:  217:{                                                                              \
+        -:  218:  unsigned int i, j;                                                           \
+        -:  219:  const char* elf_raw = (const char*) elf;                                     \
+        -:  220:  uint16_t str_table_index = yr_##bo##16toh(elf->sh_str_table_index);          \
+        -:  221:                                                                               \
+        -:  222:  const char* sym_table = NULL;                                                \
+        -:  223:  const char* sym_str_table = NULL;                                            \
+        -:  224:                                                                               \
+        -:  225:  uint##bits##_t sym_table_size = 0;                                           \
+        -:  226:  uint##bits##_t sym_str_table_size = 0;                                       \
+        -:  227:                                                                               \
+        -:  228:  elf##bits##_section_header_t* section_table;                                 \
+        -:  229:  elf##bits##_section_header_t* section;                                       \
+        -:  230:  elf##bits##_program_header_t* segment;                                       \
+        -:  231:                                                                               \
+        -:  232:  set_integer(yr_##bo##16toh(elf->type), elf_obj, "type");                     \
+        -:  233:  set_integer(yr_##bo##16toh(elf->machine), elf_obj, "machine");               \
+        -:  234:  set_integer(yr_##bo##bits##toh(elf->sh_offset), elf_obj,                     \
+        -:  235:              "sh_offset");                                                    \
+        -:  236:  set_integer(yr_##bo##16toh(elf->sh_entry_size), elf_obj,                     \
+        -:  237:              "sh_entry_size");                                                \
+        -:  238:  set_integer(yr_##bo##16toh(elf->sh_entry_count), elf_obj,                    \
+        -:  239:              "number_of_sections");                                           \
+        -:  240:  set_integer(yr_##bo##bits##toh(elf->ph_offset), elf_obj,                     \
+        -:  241:              "ph_offset");                                                    \
+        -:  242:  set_integer(yr_##bo##16toh(elf->ph_entry_size), elf_obj,                     \
+        -:  243:              "ph_entry_size");                                                \
+        -:  244:  set_integer(yr_##bo##16toh(elf->ph_entry_count), elf_obj,                    \
+        -:  245:              "number_of_segments");                                           \
+        -:  246:                                                                               \
+        -:  247:  if (yr_##bo##bits##toh(elf->entry) != 0)                                     \
+        -:  248:  {                                                                            \
+        -:  249:    set_integer(                                                               \
+        -:  250:        flags & SCAN_FLAGS_PROCESS_MEMORY ?                                    \
+        -:  251:        base_address + yr_##bo##bits##toh(elf->entry) :                        \
+        -:  252:        elf_rva_to_offset_##bits##_##bo(                                       \
+        -:  253:            elf, yr_##bo##bits##toh(elf->entry), elf_size),                    \
+        -:  254:        elf_obj, "entry_point");                                               \
+        -:  255:  }                                                                            \
+        -:  256:                                                                               \
+        -:  257:  if (yr_##bo##16toh(elf->sh_entry_count) < ELF_SHN_LORESERVE &&               \
+        -:  258:      str_table_index < yr_##bo##16toh(elf->sh_entry_count) &&                 \
+        -:  259:      yr_##bo##bits##toh(elf->sh_offset) < elf_size &&                         \
+        -:  260:      yr_##bo##bits##toh(elf->sh_offset) +                                     \
+        -:  261:        yr_##bo##16toh(elf->sh_entry_count) *                                  \
+        -:  262:        sizeof(elf##bits##_section_header_t) <= elf_size)                      \
+        -:  263:  {                                                                            \
+        -:  264:    const char* str_table = NULL;                                              \
+        -:  265:                                                                               \
+        -:  266:    section_table = (elf##bits##_section_header_t*)                            \
+        -:  267:        (elf_raw + yr_##bo##bits##toh(elf->sh_offset));                        \
+        -:  268:                                                                               \
+        -:  269:    if (yr_##bo##bits##toh(section_table[str_table_index].offset) < elf_size)  \
+        -:  270:    {                                                                          \
+        -:  271:      str_table = elf_raw + yr_##bo##bits##toh(                                \
+        -:  272:          section_table[str_table_index].offset);                              \
+        -:  273:    }                                                                          \
+        -:  274:                                                                               \
+        -:  275:    section = section_table;                                                   \
+        -:  276:                                                                               \
+        -:  277:    for (i = 0; i < yr_##bo##16toh(elf->sh_entry_count); i++, section++)       \
+        -:  278:    {                                                                          \
+        -:  279:      set_integer(yr_##bo##32toh(section->type), elf_obj,                      \
+        -:  280:                  "sections[%i].type", i);                                     \
+        -:  281:      set_integer(yr_##bo##bits##toh(section->flags), elf_obj,                 \
+        -:  282:                  "sections[%i].flags", i);                                    \
+        -:  283:      set_integer(yr_##bo##bits##toh(section->addr), elf_obj,                  \
+        -:  284:                  "sections[%i].address", i);                                  \
+        -:  285:      set_integer(yr_##bo##bits##toh(section->size), elf_obj,                  \
+        -:  286:                  "sections[%i].size", i);                                     \
+        -:  287:      set_integer(yr_##bo##bits##toh(section->offset), elf_obj,                \
+        -:  288:                  "sections[%i].offset", i);                                   \
+        -:  289:                                                                               \
+        -:  290:      if (yr_##bo##32toh(section->name) < elf_size && str_table > elf_raw)     \
+        -:  291:      {                                                                        \
+        -:  292:        const char* section_name = str_table_entry(                            \
+        -:  293:            str_table,                                                         \
+        -:  294:            elf_raw + elf_size,                                                \
+        -:  295:            yr_##bo##32toh(section->name));                                    \
+        -:  296:                                                                               \
+        -:  297:        if (section_name)                                                      \
+        -:  298:          set_string(section_name, elf_obj, "sections[%i].name", i);           \
+        -:  299:      }                                                                        \
+        -:  300:                                                                               \
+        -:  301:      if (yr_##bo##32toh(section->type) == ELF_SHT_SYMTAB &&                   \
+        -:  302:          yr_##bo##32toh(section->link) < elf->sh_entry_count)                 \
+        -:  303:      {                                                                        \
+        -:  304:        elf##bits##_section_header_t* string_section =                         \
+        -:  305:            section_table + yr_##bo##32toh(section->link);                     \
+        -:  306:                                                                               \
+        -:  307:        if (IS_VALID_PTR(elf, elf_size, string_section) &&                     \
+        -:  308:            yr_##bo##32toh(string_section->type) == ELF_SHT_STRTAB)            \
+        -:  309:        {                                                                      \
+        -:  310:          sym_table = elf_raw + yr_##bo##bits##toh(section->offset);           \
+        -:  311:          sym_str_table = elf_raw + yr_##bo##bits##toh(string_section->offset);\
+        -:  312:          sym_table_size = yr_##bo##bits##toh(section->size);                  \
+        -:  313:          sym_str_table_size = yr_##bo##bits##toh(string_section->size);       \
+        -:  314:        }                                                                      \
+        -:  315:      }                                                                        \
+        -:  316:    }                                                                          \
+        -:  317:                                                                               \
+        -:  318:    if (is_valid_ptr(elf, elf_size, sym_str_table, sym_str_table_size) &&      \
+        -:  319:        is_valid_ptr(elf, elf_size, sym_table, sym_table_size))                \
+        -:  320:    {                                                                          \
+        -:  321:      elf##bits##_sym_t* sym = (elf##bits##_sym_t*) sym_table;                 \
+        -:  322:                                                                               \
+        -:  323:      for (j = 0; j < sym_table_size / sizeof(elf##bits##_sym_t); j++, sym++)  \
+        -:  324:      {                                                                        \
+        -:  325:        const char* sym_name = str_table_entry(                                \
+        -:  326:            sym_str_table,                                                     \
+        -:  327:            sym_str_table + sym_str_table_size,                                \
+        -:  328:            yr_##bo##32toh(sym->name));                                        \
+        -:  329:                                                                               \
+        -:  330:        if (sym_name)                                                          \
+        -:  331:          set_string(sym_name, elf_obj, "symtab[%i].name", j);                 \
+        -:  332:                                                                               \
+        -:  333:        set_integer(sym->info >> 4, elf_obj,                                   \
+        -:  334:            "symtab[%i].bind", j);                                             \
+        -:  335:        set_integer(sym->info & 0xf, elf_obj,                                  \
+        -:  336:            "symtab[%i].type", j);                                             \
+        -:  337:        set_integer(yr_##bo##16toh(sym->shndx), elf_obj,                       \
+        -:  338:           "symtab[%i].shndx", j);                                             \
+        -:  339:        set_integer(yr_##bo##bits##toh(sym->value), elf_obj,                   \
+        -:  340:           "symtab[%i].value", j);                                             \
+        -:  341:        set_integer(yr_##bo##bits##toh(sym->size), elf_obj,                    \
+        -:  342:           "symtab[%i].size", j);                                              \
+        -:  343:      }                                                                        \
+        -:  344:                                                                               \
+        -:  345:      set_integer(j, elf_obj, "symtab_entries");                               \
+        -:  346:    }                                                                          \
+        -:  347:  }                                                                            \
+        -:  348:                                                                               \
+        -:  349:  if (yr_##bo##16toh(elf->ph_entry_count) > 0 &&                               \
+        -:  350:      yr_##bo##16toh(elf->ph_entry_count) < ELF_PN_XNUM &&                     \
+        -:  351:      yr_##bo##bits##toh(elf->ph_offset) < elf_size &&                         \
+        -:  352:      yr_##bo##bits##toh(elf->ph_offset) +                                     \
+        -:  353:        yr_##bo##16toh(elf->ph_entry_count) *                                  \
+        -:  354:        sizeof(elf##bits##_program_header_t) <= elf_size)                      \
+        -:  355:  {                                                                            \
+        -:  356:    segment = (elf##bits##_program_header_t*)                                  \
+        -:  357:        (elf_raw + yr_##bo##bits##toh(elf->ph_offset));                        \
+        -:  358:                                                                               \
+        -:  359:    for (i = 0; i < yr_##bo##16toh(elf->ph_entry_count); i++, segment++)       \
+        -:  360:    {                                                                          \
+        -:  361:      set_integer(                                                             \
+        -:  362:          yr_##bo##32toh(segment->type), elf_obj, "segments[%i].type", i);     \
+        -:  363:      set_integer(                                                             \
+        -:  364:          yr_##bo##32toh(segment->flags), elf_obj, "segments[%i].flags", i);   \
+        -:  365:      set_integer(                                                             \
+        -:  366:          yr_##bo##bits##toh(segment->offset), elf_obj,                        \
+        -:  367:          "segments[%i].offset", i);                                           \
+        -:  368:      set_integer(                                                             \
+        -:  369:          yr_##bo##bits##toh(segment->virt_addr), elf_obj,                     \
+        -:  370:          "segments[%i].virtual_address", i);                                  \
+        -:  371:      set_integer(                                                             \
+        -:  372:          yr_##bo##bits##toh(segment->phys_addr), elf_obj,                     \
+        -:  373:          "segments[%i].physical_address", i);                                 \
+        -:  374:      set_integer(                                                             \
+        -:  375:          yr_##bo##bits##toh(segment->file_size), elf_obj,                     \
+        -:  376:          "segments[%i].file_size", i);                                        \
+        -:  377:      set_integer(                                                             \
+        -:  378:          yr_##bo##bits##toh(segment->mem_size), elf_obj,                      \
+        -:  379:          "segments[%i].memory_size", i);                                      \
+        -:  380:      set_integer(                                                             \
+        -:  381:          yr_##bo##bits##toh(segment->alignment), elf_obj,                     \
+        -:  382:          "segments[%i].alignment", i);                                        \
+        -:  383:                                                                               \
+        -:  384:      if (yr_##bo##32toh(segment->type) == ELF_PT_DYNAMIC)                     \
+        -:  385:      {                                                                        \
+        -:  386:        elf##bits##_dyn_t* dyn = (elf##bits##_dyn_t*)                          \
+        -:  387:            (elf_raw + yr_##bo##bits##toh(segment->offset));                   \
+        -:  388:                                                                               \
+        -:  389:        for (j = 0; IS_VALID_PTR(elf, elf_size, dyn); dyn++, j++)              \
+        -:  390:        {                                                                      \
+        -:  391:          set_integer(                                                         \
+        -:  392:              yr_##bo##bits##toh(dyn->tag), elf_obj, "dynamic[%i].type", j);   \
+        -:  393:          set_integer(                                                         \
+        -:  394:              yr_##bo##bits##toh(dyn->val), elf_obj, "dynamic[%i].val", j);    \
+        -:  395:                                                                               \
+        -:  396:          if (dyn->tag == ELF_DT_NULL)                                         \
+        -:  397:          {                                                                    \
+        -:  398:            j++;                                                               \
+        -:  399:            break;                                                             \
+        -:  400:          }                                                                    \
+        -:  401:        }                                                                      \
+        -:  402:        set_integer(j, elf_obj, "dynamic_section_entries");                    \
+        -:  403:      }                                                                        \
+        -:  404:    }                                                                          \
+        -:  405:  }                                                                            \
+        -:  406:}
+        -:  407:
+    #####:  408:ELF_RVA_TO_OFFSET(32,le);
+    #####:  409:ELF_RVA_TO_OFFSET(64,le);
+    #####:  410:ELF_RVA_TO_OFFSET(32,be);
+    #####:  411:ELF_RVA_TO_OFFSET(64,be);
+        -:  412:
+    #####:  413:PARSE_ELF_HEADER(32,le);
+    #####:  414:PARSE_ELF_HEADER(64,le);
+    #####:  415:PARSE_ELF_HEADER(32,be);
+    #####:  416:PARSE_ELF_HEADER(64,be);
+        -:  417:
+        -:  418:
+    #####:  419:begin_declarations;
+        -:  420:
+    #####:  421:  declare_integer("ET_NONE");
+    #####:  422:  declare_integer("ET_REL");
+    #####:  423:  declare_integer("ET_EXEC");
+    #####:  424:  declare_integer("ET_DYN");
+    #####:  425:  declare_integer("ET_CORE");
+        -:  426:
+    #####:  427:  declare_integer("EM_NONE");
+    #####:  428:  declare_integer("EM_M32");
+    #####:  429:  declare_integer("EM_SPARC");
+    #####:  430:  declare_integer("EM_386");
+    #####:  431:  declare_integer("EM_68K");
+    #####:  432:  declare_integer("EM_88K");
+    #####:  433:  declare_integer("EM_860");
+    #####:  434:  declare_integer("EM_MIPS");
+    #####:  435:  declare_integer("EM_MIPS_RS3_LE");
+    #####:  436:  declare_integer("EM_PPC");
+    #####:  437:  declare_integer("EM_PPC64");
+    #####:  438:  declare_integer("EM_ARM");
+    #####:  439:  declare_integer("EM_X86_64");
+    #####:  440:  declare_integer("EM_AARCH64");
+        -:  441:
+    #####:  442:  declare_integer("SHT_NULL");
+    #####:  443:  declare_integer("SHT_PROGBITS");
+    #####:  444:  declare_integer("SHT_SYMTAB");
+    #####:  445:  declare_integer("SHT_STRTAB");
+    #####:  446:  declare_integer("SHT_RELA");
+    #####:  447:  declare_integer("SHT_HASH");
+    #####:  448:  declare_integer("SHT_DYNAMIC");
+    #####:  449:  declare_integer("SHT_NOTE");
+    #####:  450:  declare_integer("SHT_NOBITS");
+    #####:  451:  declare_integer("SHT_REL");
+    #####:  452:  declare_integer("SHT_SHLIB");
+    #####:  453:  declare_integer("SHT_DYNSYM");
+        -:  454:
+    #####:  455:  declare_integer("SHF_WRITE");
+    #####:  456:  declare_integer("SHF_ALLOC");
+    #####:  457:  declare_integer("SHF_EXECINSTR");
+        -:  458:
+    #####:  459:  declare_integer("type");
+    #####:  460:  declare_integer("machine");
+    #####:  461:  declare_integer("entry_point");
+        -:  462:
+    #####:  463:  declare_integer("number_of_sections");
+    #####:  464:  declare_integer("sh_offset");
+    #####:  465:  declare_integer("sh_entry_size");
+        -:  466:
+    #####:  467:  declare_integer("number_of_segments");
+    #####:  468:  declare_integer("ph_offset");
+    #####:  469:  declare_integer("ph_entry_size");
+        -:  470:
+    #####:  471:  begin_struct_array("sections");
+    #####:  472:    declare_integer("type");
+    #####:  473:    declare_integer("flags");
+    #####:  474:    declare_integer("address");
+    #####:  475:    declare_string("name");
+    #####:  476:    declare_integer("size");
+    #####:  477:    declare_integer("offset");
+    #####:  478:  end_struct_array("sections");
+        -:  479:
+    #####:  480:  declare_integer("PT_NULL");
+    #####:  481:  declare_integer("PT_LOAD");
+    #####:  482:  declare_integer("PT_DYNAMIC");
+    #####:  483:  declare_integer("PT_INTERP");
+    #####:  484:  declare_integer("PT_NOTE");
+    #####:  485:  declare_integer("PT_SHLIB");
+    #####:  486:  declare_integer("PT_PHDR");
+    #####:  487:  declare_integer("PT_TLS");
+    #####:  488:  declare_integer("PT_GNU_EH_FRAME");
+    #####:  489:  declare_integer("PT_GNU_STACK");
+        -:  490:
+    #####:  491:  declare_integer("DT_NULL");
+    #####:  492:  declare_integer("DT_NEEDED");
+    #####:  493:  declare_integer("DT_PLTRELSZ");
+    #####:  494:  declare_integer("DT_PLTGOT");
+    #####:  495:  declare_integer("DT_HASH");
+    #####:  496:  declare_integer("DT_STRTAB");
+    #####:  497:  declare_integer("DT_SYMTAB");
+    #####:  498:  declare_integer("DT_RELA");
+    #####:  499:  declare_integer("DT_RELASZ");
+    #####:  500:  declare_integer("DT_RELAENT");
+    #####:  501:  declare_integer("DT_STRSZ");
+    #####:  502:  declare_integer("DT_SYMENT");
+    #####:  503:  declare_integer("DT_INIT");
+    #####:  504:  declare_integer("DT_FINI");
+    #####:  505:  declare_integer("DT_SONAME");
+    #####:  506:  declare_integer("DT_RPATH");
+    #####:  507:  declare_integer("DT_SYMBOLIC");
+    #####:  508:  declare_integer("DT_REL");
+    #####:  509:  declare_integer("DT_RELSZ");
+    #####:  510:  declare_integer("DT_RELENT");
+    #####:  511:  declare_integer("DT_PLTREL");
+    #####:  512:  declare_integer("DT_DEBUG");
+    #####:  513:  declare_integer("DT_TEXTREL");
+    #####:  514:  declare_integer("DT_JMPREL");
+    #####:  515:  declare_integer("DT_BIND_NOW");
+    #####:  516:  declare_integer("DT_INIT_ARRAY");
+    #####:  517:  declare_integer("DT_FINI_ARRAY");
+    #####:  518:  declare_integer("DT_INIT_ARRAYSZ");
+    #####:  519:  declare_integer("DT_FINI_ARRAYSZ");
+    #####:  520:  declare_integer("DT_RUNPATH");
+    #####:  521:  declare_integer("DT_FLAGS");
+    #####:  522:  declare_integer("DT_ENCODING");
+        -:  523:
+    #####:  524:  declare_integer("STT_NOTYPE");
+    #####:  525:  declare_integer("STT_OBJECT");
+    #####:  526:  declare_integer("STT_FUNC");
+    #####:  527:  declare_integer("STT_SECTION");
+    #####:  528:  declare_integer("STT_FILE");
+    #####:  529:  declare_integer("STT_COMMON");
+    #####:  530:  declare_integer("STT_TLS");
+        -:  531:
+    #####:  532:  declare_integer("STB_LOCAL");
+    #####:  533:  declare_integer("STB_GLOBAL");
+    #####:  534:  declare_integer("STB_WEAK");
+        -:  535:
+    #####:  536:  declare_integer("PF_X");
+    #####:  537:  declare_integer("PF_W");
+    #####:  538:  declare_integer("PF_R");
+        -:  539:
+    #####:  540:  begin_struct_array("segments");
+    #####:  541:    declare_integer("type");
+    #####:  542:    declare_integer("flags");
+    #####:  543:    declare_integer("offset");
+    #####:  544:    declare_integer("virtual_address");
+    #####:  545:    declare_integer("physical_address");
+    #####:  546:    declare_integer("file_size");
+    #####:  547:    declare_integer("memory_size");
+    #####:  548:    declare_integer("alignment");
+    #####:  549:  end_struct_array("segments");
+        -:  550:
+    #####:  551:  declare_integer("dynamic_section_entries");
+    #####:  552:  begin_struct_array("dynamic");
+    #####:  553:    declare_integer("type");
+    #####:  554:    declare_integer("val");
+    #####:  555:  end_struct_array("dynamic");
+        -:  556:
+    #####:  557:  declare_integer("symtab_entries");
+    #####:  558:  begin_struct_array("symtab");
+    #####:  559:    declare_string("name");
+    #####:  560:    declare_integer("value");
+    #####:  561:    declare_integer("size");
+    #####:  562:    declare_integer("type");
+    #####:  563:    declare_integer("bind");
+    #####:  564:    declare_integer("shndx");
+    #####:  565:  end_struct_array("symtab");
+        -:  566:
+    #####:  567:end_declarations;
+        -:  568:
+        -:  569:
+        6:  570:int module_initialize(
+        -:  571:    YR_MODULE* module)
+        -:  572:{
+        6:  573:  return ERROR_SUCCESS;
+        -:  574:}
+        -:  575:
+        -:  576:
+        5:  577:int module_finalize(
+        -:  578:    YR_MODULE* module)
+        -:  579:{
+        5:  580:  return ERROR_SUCCESS;
+        -:  581:}
+        -:  582:
+        -:  583:
+    #####:  584:int module_load(
+        -:  585:    YR_SCAN_CONTEXT* context,
+        -:  586:    YR_OBJECT* module_object,
+        -:  587:    void* module_data,
+        -:  588:    size_t module_data_size)
+        -:  589:{
+        -:  590:  YR_MEMORY_BLOCK* block;
+    #####:  591:  YR_MEMORY_BLOCK_ITERATOR* iterator = context->iterator;
+        -:  592:
+        -:  593:  elf32_header_t* elf_header32;
+        -:  594:  elf64_header_t* elf_header64;
+        -:  595:
+    #####:  596:  set_integer(ELF_ET_NONE, module_object, "ET_NONE");
+    #####:  597:  set_integer(ELF_ET_REL, module_object, "ET_REL");
+    #####:  598:  set_integer(ELF_ET_EXEC, module_object, "ET_EXEC");
+    #####:  599:  set_integer(ELF_ET_DYN, module_object, "ET_DYN");
+    #####:  600:  set_integer(ELF_ET_CORE, module_object, "ET_CORE");
+        -:  601:
+    #####:  602:  set_integer(ELF_EM_NONE, module_object, "EM_NONE");
+    #####:  603:  set_integer(ELF_EM_M32, module_object, "EM_M32");
+    #####:  604:  set_integer(ELF_EM_SPARC, module_object, "EM_SPARC");
+    #####:  605:  set_integer(ELF_EM_386, module_object, "EM_386");
+    #####:  606:  set_integer(ELF_EM_68K, module_object, "EM_68K");
+    #####:  607:  set_integer(ELF_EM_88K, module_object, "EM_88K");
+    #####:  608:  set_integer(ELF_EM_860, module_object, "EM_860");
+    #####:  609:  set_integer(ELF_EM_MIPS, module_object, "EM_MIPS");
+    #####:  610:  set_integer(ELF_EM_MIPS_RS3_LE, module_object, "EM_MIPS_RS3_LE");
+    #####:  611:  set_integer(ELF_EM_PPC, module_object, "EM_PPC");
+    #####:  612:  set_integer(ELF_EM_PPC64, module_object, "EM_PPC64");
+    #####:  613:  set_integer(ELF_EM_ARM, module_object, "EM_ARM");
+    #####:  614:  set_integer(ELF_EM_X86_64, module_object, "EM_X86_64");
+    #####:  615:  set_integer(ELF_EM_AARCH64, module_object, "EM_AARCH64");
+        -:  616:
+    #####:  617:  set_integer(ELF_SHT_NULL, module_object, "SHT_NULL");
+    #####:  618:  set_integer(ELF_SHT_PROGBITS, module_object, "SHT_PROGBITS");
+    #####:  619:  set_integer(ELF_SHT_SYMTAB, module_object, "SHT_SYMTAB");
+    #####:  620:  set_integer(ELF_SHT_STRTAB, module_object, "SHT_STRTAB");
+    #####:  621:  set_integer(ELF_SHT_RELA, module_object, "SHT_RELA");
+    #####:  622:  set_integer(ELF_SHT_HASH, module_object, "SHT_HASH");
+    #####:  623:  set_integer(ELF_SHT_DYNAMIC, module_object, "SHT_DYNAMIC");
+    #####:  624:  set_integer(ELF_SHT_NOTE, module_object, "SHT_NOTE");
+    #####:  625:  set_integer(ELF_SHT_NOBITS, module_object, "SHT_NOBITS");
+    #####:  626:  set_integer(ELF_SHT_REL, module_object, "SHT_REL");
+    #####:  627:  set_integer(ELF_SHT_SHLIB, module_object, "SHT_SHLIB");
+    #####:  628:  set_integer(ELF_SHT_DYNSYM, module_object, "SHT_DYNSYM");
+        -:  629:
+    #####:  630:  set_integer(ELF_SHF_WRITE, module_object, "SHF_WRITE");
+    #####:  631:  set_integer(ELF_SHF_ALLOC, module_object, "SHF_ALLOC");
+    #####:  632:  set_integer(ELF_SHF_EXECINSTR, module_object, "SHF_EXECINSTR");
+        -:  633:
+    #####:  634:  set_integer(ELF_PT_NULL, module_object, "PT_NULL");
+    #####:  635:  set_integer(ELF_PT_LOAD, module_object, "PT_LOAD");
+    #####:  636:  set_integer(ELF_PT_DYNAMIC, module_object, "PT_DYNAMIC");
+    #####:  637:  set_integer(ELF_PT_INTERP, module_object, "PT_INTERP");
+    #####:  638:  set_integer(ELF_PT_NOTE, module_object, "PT_NOTE");
+    #####:  639:  set_integer(ELF_PT_SHLIB, module_object, "PT_SHLIB");
+    #####:  640:  set_integer(ELF_PT_PHDR, module_object, "PT_PHDR");
+    #####:  641:  set_integer(ELF_PT_TLS, module_object, "PT_TLS");
+    #####:  642:  set_integer(ELF_PT_GNU_EH_FRAME, module_object, "PT_GNU_EH_FRAME");
+    #####:  643:  set_integer(ELF_PT_GNU_STACK, module_object, "PT_GNU_STACK");
+        -:  644:
+    #####:  645:  set_integer(ELF_DT_NULL, module_object, "DT_NULL");
+    #####:  646:  set_integer(ELF_DT_NEEDED, module_object, "DT_NEEDED");
+    #####:  647:  set_integer(ELF_DT_PLTRELSZ, module_object, "DT_PLTRELSZ");
+    #####:  648:  set_integer(ELF_DT_PLTGOT, module_object, "DT_PLTGOT");
+    #####:  649:  set_integer(ELF_DT_HASH, module_object, "DT_HASH");
+    #####:  650:  set_integer(ELF_DT_STRTAB, module_object, "DT_STRTAB");
+    #####:  651:  set_integer(ELF_DT_SYMTAB, module_object, "DT_SYMTAB");
+    #####:  652:  set_integer(ELF_DT_RELA, module_object, "DT_RELA");
+    #####:  653:  set_integer(ELF_DT_RELASZ, module_object, "DT_RELASZ");
+    #####:  654:  set_integer(ELF_DT_RELAENT, module_object, "DT_RELAENT");
+    #####:  655:  set_integer(ELF_DT_STRSZ, module_object, "DT_STRSZ");
+    #####:  656:  set_integer(ELF_DT_SYMENT, module_object, "DT_SYMENT");
+    #####:  657:  set_integer(ELF_DT_INIT, module_object, "DT_INIT");
+    #####:  658:  set_integer(ELF_DT_FINI, module_object, "DT_FINI");
+    #####:  659:  set_integer(ELF_DT_SONAME, module_object, "DT_SONAME");
+    #####:  660:  set_integer(ELF_DT_RPATH, module_object, "DT_RPATH");
+    #####:  661:  set_integer(ELF_DT_SYMBOLIC, module_object, "DT_SYMBOLIC");
+    #####:  662:  set_integer(ELF_DT_REL, module_object, "DT_REL");
+    #####:  663:  set_integer(ELF_DT_RELSZ, module_object, "DT_RELSZ");
+    #####:  664:  set_integer(ELF_DT_RELENT, module_object, "DT_RELENT");
+    #####:  665:  set_integer(ELF_DT_PLTREL, module_object, "DT_PLTREL");
+    #####:  666:  set_integer(ELF_DT_DEBUG, module_object, "DT_DEBUG");
+    #####:  667:  set_integer(ELF_DT_TEXTREL, module_object, "DT_TEXTREL");
+    #####:  668:  set_integer(ELF_DT_JMPREL, module_object, "DT_JMPREL");
+    #####:  669:  set_integer(ELF_DT_BIND_NOW, module_object, "DT_BIND_NOW");
+    #####:  670:  set_integer(ELF_DT_INIT_ARRAY, module_object, "DT_INIT_ARRAY");
+    #####:  671:  set_integer(ELF_DT_FINI_ARRAY, module_object, "DT_FINI_ARRAY");
+    #####:  672:  set_integer(ELF_DT_INIT_ARRAYSZ, module_object, "DT_INIT_ARRAYSZ");
+    #####:  673:  set_integer(ELF_DT_FINI_ARRAYSZ, module_object, "DT_FINI_ARRAYSZ");
+    #####:  674:  set_integer(ELF_DT_RUNPATH, module_object, "DT_RUNPATH");
+    #####:  675:  set_integer(ELF_DT_FLAGS, module_object, "DT_FLAGS");
+    #####:  676:  set_integer(ELF_DT_ENCODING, module_object, "DT_ENCODING");
+        -:  677:
+    #####:  678:  set_integer(ELF_STT_NOTYPE, module_object, "STT_NOTYPE");
+    #####:  679:  set_integer(ELF_STT_OBJECT, module_object, "STT_OBJECT");
+    #####:  680:  set_integer(ELF_STT_FUNC, module_object, "STT_FUNC");
+    #####:  681:  set_integer(ELF_STT_SECTION, module_object, "STT_SECTION");
+    #####:  682:  set_integer(ELF_STT_FILE, module_object, "STT_FILE");
+    #####:  683:  set_integer(ELF_STT_COMMON, module_object, "STT_COMMON");
+    #####:  684:  set_integer(ELF_STT_TLS, module_object, "STT_TLS");
+        -:  685:
+    #####:  686:  set_integer(ELF_STB_LOCAL, module_object, "STB_LOCAL");
+    #####:  687:  set_integer(ELF_STB_GLOBAL, module_object, "STB_GLOBAL");
+    #####:  688:  set_integer(ELF_STB_WEAK, module_object, "STB_WEAK");
+        -:  689:
+    #####:  690:  set_integer(ELF_PF_X, module_object, "PF_X");
+    #####:  691:  set_integer(ELF_PF_W, module_object, "PF_W");
+    #####:  692:  set_integer(ELF_PF_R, module_object, "PF_R");
+        -:  693:
+    #####:  694:  foreach_memory_block(iterator, block)
+        -:  695:  {
+    #####:  696:    const uint8_t* block_data = block->fetch_data(block);
+        -:  697:
+    #####:  698:    if (block_data == NULL)
+    #####:  699:      continue;
+        -:  700:
+    #####:  701:    switch(get_elf_class_data(block_data, block->size))
+        -:  702:    {
+    #####:  703:      case CLASS_DATA(ELF_CLASS_32, ELF_DATA_2LSB):
+        -:  704:
+    #####:  705:        if (block->size > sizeof(elf32_header_t))
+        -:  706:        {
+    #####:  707:          elf_header32 = (elf32_header_t*) block_data;
+        -:  708:
+    #####:  709:          if (!(context->flags & SCAN_FLAGS_PROCESS_MEMORY) ||
+    #####:  710:              yr_le16toh(elf_header32->type) == ELF_ET_EXEC)
+        -:  711:          {
+    #####:  712:            parse_elf_header_32_le(
+        -:  713:                elf_header32,
+        -:  714:                block->base,
+        -:  715:                block->size,
+        -:  716:                context->flags,
+        -:  717:                module_object);
+        -:  718:          }
+        -:  719:        }
+        -:  720:
+    #####:  721:        break;
+        -:  722:
+    #####:  723:      case CLASS_DATA(ELF_CLASS_32, ELF_DATA_2MSB):
+        -:  724:
+    #####:  725:        if (block->size > sizeof(elf32_header_t))
+        -:  726:        {
+    #####:  727:          elf_header32 = (elf32_header_t*) block_data;
+        -:  728:
+    #####:  729:          if (!(context->flags & SCAN_FLAGS_PROCESS_MEMORY) ||
+    #####:  730:              yr_be16toh(elf_header32->type) == ELF_ET_EXEC)
+        -:  731:          {
+    #####:  732:            parse_elf_header_32_be(
+        -:  733:                elf_header32,
+        -:  734:                block->base,
+        -:  735:                block->size,
+        -:  736:                context->flags,
+        -:  737:                module_object);
+        -:  738:          }
+        -:  739:        }
+        -:  740:
+    #####:  741:        break;
+        -:  742:
+    #####:  743:      case CLASS_DATA(ELF_CLASS_64,ELF_DATA_2LSB):
+        -:  744:
+    #####:  745:        if (block->size > sizeof(elf64_header_t))
+        -:  746:        {
+    #####:  747:          elf_header64 = (elf64_header_t*) block_data;
+        -:  748:
+    #####:  749:          if (!(context->flags & SCAN_FLAGS_PROCESS_MEMORY) ||
+    #####:  750:              yr_le16toh(elf_header64->type) == ELF_ET_EXEC)
+        -:  751:          {
+    #####:  752:            parse_elf_header_64_le(
+        -:  753:                elf_header64,
+        -:  754:                block->base,
+        -:  755:                block->size,
+        -:  756:                context->flags,
+        -:  757:                module_object);
+        -:  758:          }
+        -:  759:        }
+        -:  760:
+    #####:  761:        break;
+        -:  762:
+    #####:  763:      case CLASS_DATA(ELF_CLASS_64,ELF_DATA_2MSB):
+        -:  764:
+    #####:  765:        if (block->size > sizeof(elf64_header_t))
+        -:  766:        {
+    #####:  767:          elf_header64 = (elf64_header_t*) block_data;
+        -:  768:
+    #####:  769:          if (!(context->flags & SCAN_FLAGS_PROCESS_MEMORY) ||
+    #####:  770:              yr_be16toh(elf_header64->type) == ELF_ET_EXEC)
+        -:  771:          {
+    #####:  772:            parse_elf_header_64_be(
+        -:  773:                elf_header64,
+        -:  774:                block->base,
+        -:  775:                block->size,
+        -:  776:                context->flags,
+        -:  777:                module_object);
+        -:  778:          }
+        -:  779:        }
+        -:  780:
+    #####:  781:        break;
+        -:  782:    }
+    #####:  783:  }
+        -:  784:
+    #####:  785:  return ERROR_SUCCESS;
+        -:  786:}
+        -:  787:
+        -:  788:
+    #####:  789:int module_unload(YR_OBJECT* module_object)
+        -:  790:{
+    #####:  791:  return ERROR_SUCCESS;
+        -:  792:}

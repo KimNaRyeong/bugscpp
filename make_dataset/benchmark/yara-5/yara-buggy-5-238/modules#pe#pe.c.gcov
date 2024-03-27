@@ -1,0 +1,3437 @@
+        -:    0:Source:modules/pe/pe.c
+        -:    0:Graph:/home/workspace/libyara/modules/pe/pe.gcno
+        -:    0:Data:/home/workspace/libyara/modules/pe/pe.gcda
+        -:    0:Runs:10
+        -:    1:/*
+        -:    2:Copyright (c) 2014. The YARA Authors. All Rights Reserved.
+        -:    3:
+        -:    4:Redistribution and use in source and binary forms, with or without modification,
+        -:    5:are permitted provided that the following conditions are met:
+        -:    6:
+        -:    7:1. Redistributions of source code must retain the above copyright notice, this
+        -:    8:list of conditions and the following disclaimer.
+        -:    9:
+        -:   10:2. Redistributions in binary form must reproduce the above copyright notice,
+        -:   11:this list of conditions and the following disclaimer in the documentation and/or
+        -:   12:other materials provided with the distribution.
+        -:   13:
+        -:   14:3. Neither the name of the copyright holder nor the names of its contributors
+        -:   15:may be used to endorse or promote products derived from this software without
+        -:   16:specific prior written permission.
+        -:   17:
+        -:   18:THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+        -:   19:ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+        -:   20:WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+        -:   21:DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+        -:   22:ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+        -:   23:(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+        -:   24:LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+        -:   25:ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        -:   26:(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+        -:   27:SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        -:   28:*/
+        -:   29:
+        -:   30:#include <stdio.h>
+        -:   31:#include <ctype.h>
+        -:   32:#include <time.h>
+        -:   33:
+        -:   34:#include "../crypto.h"
+        -:   35:#if defined(HAVE_LIBCRYPTO)
+        -:   36:#include <openssl/safestack.h>
+        -:   37:#include <openssl/asn1.h>
+        -:   38:#include <openssl/bio.h>
+        -:   39:#include <openssl/pkcs7.h>
+        -:   40:#include <openssl/x509.h>
+        -:   41:
+        -:   42:#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+        -:   43:#define X509_get_signature_nid(o) OBJ_obj2nid((o)->sig_alg->algorithm)
+        -:   44:#endif
+        -:   45:
+        -:   46:#if OPENSSL_VERSION_NUMBER < 0x10100000L
+        -:   47:#define X509_getm_notBefore X509_get_notBefore
+        -:   48:#define X509_getm_notAfter X509_get_notAfter
+        -:   49:#endif
+        -:   50:#endif
+        -:   51:
+        -:   52:#include <yara/endian.h>
+        -:   53:#include <yara/pe.h>
+        -:   54:#include <yara/modules.h>
+        -:   55:#include <yara/mem.h>
+        -:   56:#include <yara/strutils.h>
+        -:   57:#include <yara/utils.h>
+        -:   58:
+        -:   59:
+        -:   60:#include <yara/pe_utils.h>
+        -:   61:
+        -:   62:#define MODULE_NAME pe
+        -:   63:
+        -:   64:// http://msdn.microsoft.com/en-us/library/ms648009(v=vs.85).aspx
+        -:   65:#define RESOURCE_TYPE_CURSOR       1
+        -:   66:#define RESOURCE_TYPE_BITMAP       2
+        -:   67:#define RESOURCE_TYPE_ICON         3
+        -:   68:#define RESOURCE_TYPE_MENU         4
+        -:   69:#define RESOURCE_TYPE_DIALOG       5
+        -:   70:#define RESOURCE_TYPE_STRING       6
+        -:   71:#define RESOURCE_TYPE_FONTDIR      7
+        -:   72:#define RESOURCE_TYPE_FONT         8
+        -:   73:#define RESOURCE_TYPE_ACCELERATOR  9
+        -:   74:#define RESOURCE_TYPE_RCDATA       10
+        -:   75:#define RESOURCE_TYPE_MESSAGETABLE 11
+        -:   76:#define RESOURCE_TYPE_GROUP_CURSOR 12 // MAKEINTRESOURCE((ULONG_PTR)(RT_CURSOR) + 11)
+        -:   77:#define RESOURCE_TYPE_GROUP_ICON   14 // MAKEINTRESOURCE((ULONG_PTR)(RT_ICON) + 11)
+        -:   78:#define RESOURCE_TYPE_VERSION      16
+        -:   79:#define RESOURCE_TYPE_DLGINCLUDE   17
+        -:   80:#define RESOURCE_TYPE_PLUGPLAY     19
+        -:   81:#define RESOURCE_TYPE_VXD          20
+        -:   82:#define RESOURCE_TYPE_ANICURSOR    21
+        -:   83:#define RESOURCE_TYPE_ANIICON      22
+        -:   84:#define RESOURCE_TYPE_HTML         23
+        -:   85:#define RESOURCE_TYPE_MANIFEST     24
+        -:   86:
+        -:   87:
+        -:   88:#define RESOURCE_CALLBACK_CONTINUE   0
+        -:   89:#define RESOURCE_CALLBACK_ABORT      1
+        -:   90:
+        -:   91:
+        -:   92:#define RESOURCE_ITERATOR_FINISHED   0
+        -:   93:#define RESOURCE_ITERATOR_ABORTED    1
+        -:   94:
+        -:   95:
+        -:   96:#define MAX_PE_IMPORTS               16384
+        -:   97:#define MAX_PE_EXPORTS               8192
+        -:   98:#define MAX_EXPORT_NAME_LENGTH       512
+        -:   99:
+        -:  100:
+        -:  101:#define IS_RESOURCE_SUBDIRECTORY(entry) \
+        -:  102:    (yr_le32toh((entry)->OffsetToData) & 0x80000000)
+        -:  103:
+        -:  104:
+        -:  105:#define RESOURCE_OFFSET(entry) \
+        -:  106:    (yr_le32toh((entry)->OffsetToData) & 0x7FFFFFFF)
+        -:  107:
+        -:  108:
+        -:  109:typedef int (*RESOURCE_CALLBACK_FUNC) ( \
+        -:  110:     PIMAGE_RESOURCE_DATA_ENTRY rsrc_data, \
+        -:  111:     int rsrc_type, \
+        -:  112:     int rsrc_id, \
+        -:  113:     int rsrc_language, \
+        -:  114:     const uint8_t* type_string, \
+        -:  115:     const uint8_t* name_string, \
+        -:  116:     const uint8_t* lang_string, \
+        -:  117:     void* cb_data);
+        -:  118:
+        -:  119:
+    #####:  120:static size_t available_space(
+        -:  121:    PE* pe,
+        -:  122:    void* pointer)
+        -:  123:{
+    #####:  124:  if ((uint8_t*) pointer < pe->data)
+    #####:  125:    return 0;
+        -:  126:
+    #####:  127:  if ((uint8_t*) pointer >= pe->data + pe->data_size)
+    #####:  128:    return 0;
+        -:  129:
+    #####:  130:  return pe->data + pe->data_size - (uint8_t*) pointer;
+        -:  131:}
+        -:  132:
+        -:  133:
+    #####:  134:static int wide_string_fits_in_pe(
+        -:  135:    PE* pe,
+        -:  136:    char* data)
+        -:  137:{
+    #####:  138:  size_t i = 0;
+    #####:  139:  size_t space_left = available_space(pe, data);
+        -:  140:
+    #####:  141:  while (space_left >= 2)
+        -:  142:  {
+    #####:  143:    if (data[i] == 0 && data[i + 1] == 0)
+    #####:  144:      return 1;
+    #####:  145:    space_left -= 2;
+    #####:  146:    i += 2;
+        -:  147:  }
+        -:  148:
+    #####:  149:  return 0;
+        -:  150:}
+        -:  151:
+        -:  152:
+        -:  153:// Parse the rich signature.
+        -:  154:// http://www.ntcore.com/files/richsign.htm
+        -:  155:
+    #####:  156:static void pe_parse_rich_signature(
+        -:  157:    PE* pe,
+        -:  158:    uint64_t base_address)
+        -:  159:{
+        -:  160:  PIMAGE_DOS_HEADER mz_header;
+    #####:  161:  PRICH_SIGNATURE rich_signature = NULL;
+        -:  162:
+    #####:  163:  DWORD* rich_ptr = NULL;
+    #####:  164:  BYTE* raw_data = NULL;
+    #####:  165:  BYTE* clear_data = NULL;
+    #####:  166:  DWORD* p = NULL;
+    #####:  167:  uint32_t nthdr_offset = 0;
+    #####:  168:  uint32_t key = 0;
+    #####:  169:  size_t rich_len = 0;
+        -:  170:
+    #####:  171:  if (pe->data_size < sizeof(IMAGE_DOS_HEADER))
+    #####:  172:    return;
+        -:  173:
+    #####:  174:  mz_header = (PIMAGE_DOS_HEADER) pe->data;
+        -:  175:
+    #####:  176:  if (yr_le16toh(mz_header->e_magic) != IMAGE_DOS_SIGNATURE)
+    #####:  177:    return;
+        -:  178:
+        -:  179:  // To find the Rich marker we start at the NT header and work backwards, so
+        -:  180:  // make sure we have at least enough data to get to the NT header.
+    #####:  181:  nthdr_offset = yr_le32toh(mz_header->e_lfanew);
+    #####:  182:  if (nthdr_offset > pe->data_size + sizeof(uint32_t) || nthdr_offset < 4)
+    #####:  183:    return;
+        -:  184:
+        -:  185:  // Most files have the Rich header at offset 0x80, but that is not always
+        -:  186:  // true. 582ce3eea9c97d5e89f7d83953a6d518b16770e635a19a456c0225449c6967a4 is
+        -:  187:  // one sample which has a Rich header starting at offset 0x200. To properly
+        -:  188:  // find the Rich header we need to start at the NT header and work backwards.
+    #####:  189:  p = (DWORD*)(pe->data + nthdr_offset - 4);
+    #####:  190:  while (p > (DWORD*)(pe->data + sizeof(IMAGE_DOS_HEADER)))
+        -:  191:  {
+    #####:  192:    if (yr_le32toh(*p) == RICH_RICH)
+        -:  193:    {
+        -:  194:      // The XOR key is the dword following the Rich value. We  use this to find
+        -:  195:      // DanS header only.
+    #####:  196:      key = *(p + 1);
+    #####:  197:      rich_ptr = p;
+    #####:  198:      --p;
+    #####:  199:      break;
+        -:  200:    }
+        -:  201:
+        -:  202:    // The NT header is 8 byte aligned so we can move back in 4 byte increments.
+    #####:  203:    --p;
+        -:  204:  }
+        -:  205:
+        -:  206:  // If we haven't found a key we can skip processing the rest.
+    #####:  207:  if (key == 0)
+    #####:  208:    return;
+        -:  209:
+        -:  210:  // If we have found the key we need to now find the start (DanS).
+    #####:  211:  while (p > (DWORD*)(pe->data + sizeof(IMAGE_DOS_HEADER)))
+        -:  212:  {
+    #####:  213:    if (yr_le32toh((*(p) ^ key)) == RICH_DANS)
+        -:  214:    {
+    #####:  215:      rich_signature = (PRICH_SIGNATURE) p;
+    #####:  216:      break;
+        -:  217:    }
+        -:  218:
+    #####:  219:    --p;
+        -:  220:  }
+        -:  221:
+    #####:  222:  if (rich_signature == NULL)
+    #####:  223:    return;
+        -:  224:
+        -:  225:  // The three key values must all be equal and the first dword
+        -:  226:  // XORs to "DanS". Then walk the buffer looking for "Rich" which marks the
+        -:  227:  // end. Technically the XOR key should be right after "Rich" but it's not
+        -:  228:  // important.
+        -:  229:
+    #####:  230:  if (yr_le32toh(rich_signature->key1) != yr_le32toh(rich_signature->key2) ||
+    #####:  231:      yr_le32toh(rich_signature->key2) != yr_le32toh(rich_signature->key3) ||
+    #####:  232:      (yr_le32toh(rich_signature->dans) ^ yr_le32toh(rich_signature->key1)) != RICH_DANS)
+        -:  233:  {
+    #####:  234:    return;
+        -:  235:  }
+        -:  236:
+        -:  237:  // Multiple by 4 because we are counting in DWORDs.
+    #####:  238:  rich_len = (rich_ptr - (DWORD*) rich_signature) * 4;
+    #####:  239:  raw_data = (BYTE*) yr_malloc(rich_len);
+        -:  240:
+    #####:  241:  if (!raw_data)
+    #####:  242:    return;
+        -:  243:
+    #####:  244:  memcpy(raw_data, rich_signature, rich_len);
+        -:  245:
+    #####:  246:  set_integer(
+        -:  247:      base_address + ((uint8_t*) rich_signature - pe->data),
+        -:  248:      pe->object, "rich_signature.offset");
+        -:  249:
+    #####:  250:  set_integer(rich_len, pe->object, "rich_signature.length");
+        -:  251:
+    #####:  252:  set_integer(yr_le32toh(rich_signature->key1), pe->object, "rich_signature.key");
+        -:  253:
+    #####:  254:  clear_data = (BYTE*) yr_malloc(rich_len);
+        -:  255:
+    #####:  256:  if (!clear_data)
+        -:  257:  {
+    #####:  258:    yr_free(raw_data);
+    #####:  259:    return;
+        -:  260:  }
+        -:  261:
+        -:  262:  // Copy the entire block here to be XORed.
+    #####:  263:  memcpy(clear_data, raw_data, rich_len);
+        -:  264:
+    #####:  265:  for (rich_ptr = (DWORD*) clear_data;
+    #####:  266:       rich_ptr < (DWORD*) (clear_data + rich_len);
+    #####:  267:       rich_ptr++)
+        -:  268:  {
+    #####:  269:    *rich_ptr ^= rich_signature->key1;
+        -:  270:  }
+        -:  271:
+    #####:  272:  set_sized_string(
+        -:  273:      (char*) raw_data, rich_len, pe->object, "rich_signature.raw_data");
+        -:  274:
+    #####:  275:  set_sized_string(
+        -:  276:      (char*) clear_data, rich_len, pe->object, "rich_signature.clear_data");
+        -:  277:
+    #####:  278:  yr_free(raw_data);
+    #####:  279:  yr_free(clear_data);
+    #####:  280:  return;
+        -:  281:}
+        -:  282:
+        -:  283:
+    #####:  284:static void pe_parse_debug_directory(
+        -:  285:    PE* pe)
+        -:  286:{
+        -:  287:  PIMAGE_DATA_DIRECTORY data_dir;
+        -:  288:  PIMAGE_DEBUG_DIRECTORY debug_dir;
+        -:  289:  int64_t debug_dir_offset;
+        -:  290:  int64_t pcv_hdr_offset;
+        -:  291:  int i, dcount;
+        -:  292:  size_t pdb_path_len;
+    #####:  293:  char* pdb_path = NULL;
+        -:  294:  
+    #####:  295:  data_dir = pe_get_directory_entry(
+        -:  296:      pe, IMAGE_DIRECTORY_ENTRY_DEBUG);
+        -:  297:
+    #####:  298:  if (data_dir == NULL)
+    #####:  299:    return;
+        -:  300:
+    #####:  301:  if (yr_le32toh(data_dir->Size) == 0)
+    #####:  302:    return;
+        -:  303:
+    #####:  304:  if (yr_le32toh(data_dir->Size) % sizeof(IMAGE_DEBUG_DIRECTORY) != 0)
+    #####:  305:    return;
+        -:  306:
+    #####:  307:  if (yr_le32toh(data_dir->VirtualAddress) == 0)
+    #####:  308:    return;
+        -:  309:
+    #####:  310:  debug_dir_offset = pe_rva_to_offset(
+    #####:  311:      pe, yr_le32toh(data_dir->VirtualAddress));
+        -:  312:
+    #####:  313:  if (debug_dir_offset < 0)
+    #####:  314:    return;
+        -:  315:
+    #####:  316:  dcount = yr_le32toh(data_dir->Size) / sizeof(IMAGE_DEBUG_DIRECTORY);
+        -:  317:
+    #####:  318:  for (i = 0; i < dcount; i++)
+        -:  319:  {
+    #####:  320:    debug_dir = (PIMAGE_DEBUG_DIRECTORY) \
+    #####:  321:        (pe->data + debug_dir_offset + i * sizeof(IMAGE_DEBUG_DIRECTORY));
+        -:  322:    
+    #####:  323:    if (!struct_fits_in_pe(pe, debug_dir, IMAGE_DEBUG_DIRECTORY))
+        -:  324:      break;
+        -:  325:  
+    #####:  326:    if (yr_le32toh(debug_dir->Type) != IMAGE_DEBUG_TYPE_CODEVIEW)
+    #####:  327:      continue;
+        -:  328:    
+    #####:  329:    if (yr_le32toh(debug_dir->AddressOfRawData) == 0)
+    #####:  330:      continue;
+        -:  331:    
+    #####:  332:    pcv_hdr_offset = pe_rva_to_offset(
+    #####:  333:        pe, yr_le32toh(debug_dir->AddressOfRawData));
+        -:  334:
+    #####:  335:    if (pcv_hdr_offset < 0)
+    #####:  336:      continue;
+        -:  337:
+    #####:  338:    PCV_HEADER cv_hdr = (PCV_HEADER) (pe->data + pcv_hdr_offset);
+        -:  339:
+    #####:  340:    if (!struct_fits_in_pe(pe, cv_hdr, CV_HEADER))
+    #####:  341:      continue;
+        -:  342:
+    #####:  343:    if (yr_le32toh(cv_hdr->dwSignature) == CVINFO_PDB20_CVSIGNATURE)
+        -:  344:    {
+    #####:  345:      PCV_INFO_PDB20 pdb20 = (PCV_INFO_PDB20) cv_hdr;
+        -:  346:      
+    #####:  347:      if (struct_fits_in_pe(pe, pdb20, CV_INFO_PDB20))
+    #####:  348:        pdb_path = (char*) (pdb20->PdbFileName);
+        -:  349:    }
+    #####:  350:    else if (yr_le32toh(cv_hdr->dwSignature) == CVINFO_PDB70_CVSIGNATURE)
+        -:  351:    {
+    #####:  352:      PCV_INFO_PDB70 pdb70 = (PCV_INFO_PDB70) cv_hdr;
+        -:  353:      
+    #####:  354:      if (struct_fits_in_pe(pe, pdb70, CV_INFO_PDB70))
+    #####:  355:        pdb_path = (char*) (pdb70->PdbFileName);
+        -:  356:    }
+        -:  357:
+    #####:  358:    if (pdb_path != NULL)
+        -:  359:    {
+    #####:  360:      pdb_path_len = strnlen(
+    #####:  361:          pdb_path, yr_min(available_space(pe, pdb_path), MAX_PATH));
+        -:  362:
+    #####:  363:      if (pdb_path_len > 0 && pdb_path_len < MAX_PATH)
+        -:  364:      {
+    #####:  365:        set_sized_string(pdb_path, pdb_path_len, pe->object, "pdb_path");
+    #####:  366:        break;
+        -:  367:      }
+        -:  368:    }
+        -:  369:  }
+        -:  370:  
+    #####:  371:  return;
+        -:  372:}
+        -:  373:
+        -:  374:// Return a pointer to the resource directory string or NULL.
+        -:  375:// The callback function will parse this and call set_sized_string().
+        -:  376:// The pointer is guaranteed to have enough space to contain the entire string.
+        -:  377:
+    #####:  378:static const uint8_t* parse_resource_name(
+        -:  379:    PE* pe,
+        -:  380:    const uint8_t* rsrc_data,
+        -:  381:    PIMAGE_RESOURCE_DIRECTORY_ENTRY entry)
+        -:  382:{
+        -:  383:
+        -:  384:  // If high bit is set it is an offset relative to rsrc_data, which contains
+        -:  385:  // a resource directory string.
+        -:  386:
+    #####:  387:  if (yr_le32toh(entry->Name) & 0x80000000)
+        -:  388:  {
+        -:  389:    DWORD length;
+        -:  390:
+    #####:  391:    const uint8_t* rsrc_str_ptr = rsrc_data + \
+    #####:  392:        (yr_le32toh(entry->Name) & 0x7FFFFFFF);
+        -:  393:
+        -:  394:    // A resource directory string is 2 bytes for the length and then a variable
+        -:  395:    // length Unicode string. Make sure we have at least 2 bytes.
+        -:  396:
+    #####:  397:    if (!fits_in_pe(pe, rsrc_str_ptr, 2))
+    #####:  398:      return NULL;
+        -:  399:
+    #####:  400:    length = *rsrc_str_ptr;
+        -:  401:
+        -:  402:    // Move past the length and make sure we have enough bytes for the string.
+    #####:  403:    if (!fits_in_pe(pe, rsrc_str_ptr + 2, length * 2))
+    #####:  404:      return NULL;
+        -:  405:
+    #####:  406:    return rsrc_str_ptr;
+        -:  407:  }
+        -:  408:
+    #####:  409:  return NULL;
+        -:  410:}
+        -:  411:
+        -:  412:
+    #####:  413:static int _pe_iterate_resources(
+        -:  414:    PE* pe,
+        -:  415:    PIMAGE_RESOURCE_DIRECTORY resource_dir,
+        -:  416:    const uint8_t* rsrc_data,
+        -:  417:    int rsrc_tree_level,
+        -:  418:    int* type,
+        -:  419:    int* id,
+        -:  420:    int* language,
+        -:  421:    const uint8_t* type_string,
+        -:  422:    const uint8_t* name_string,
+        -:  423:    const uint8_t* lang_string,
+        -:  424:    RESOURCE_CALLBACK_FUNC callback,
+        -:  425:    void* callback_data)
+        -:  426:{
+    #####:  427:  int i, result = RESOURCE_ITERATOR_FINISHED;
+        -:  428:  int total_entries;
+        -:  429:
+        -:  430:  PIMAGE_RESOURCE_DIRECTORY_ENTRY entry;
+        -:  431:
+        -:  432:  // A few sanity checks to avoid corrupt files
+        -:  433:
+    #####:  434:  if (yr_le32toh(resource_dir->Characteristics) != 0 ||
+    #####:  435:      yr_le16toh(resource_dir->NumberOfNamedEntries) > 32768 ||
+    #####:  436:      yr_le16toh(resource_dir->NumberOfIdEntries) > 32768)
+        -:  437:  {
+    #####:  438:    return result;
+        -:  439:  }
+        -:  440:
+    #####:  441:  total_entries = yr_le16toh(resource_dir->NumberOfNamedEntries) +
+    #####:  442:                  yr_le16toh(resource_dir->NumberOfIdEntries);
+        -:  443:
+        -:  444:  // The first directory entry is just after the resource directory,
+        -:  445:  // by incrementing resource_dir we skip sizeof(resource_dir) bytes
+        -:  446:  // and get a pointer to the end of the resource directory.
+        -:  447:
+    #####:  448:  entry = (PIMAGE_RESOURCE_DIRECTORY_ENTRY) (resource_dir + 1);
+        -:  449:
+    #####:  450:  for (i = 0; i < total_entries; i++)
+        -:  451:  {
+    #####:  452:    if (!struct_fits_in_pe(pe, entry, IMAGE_RESOURCE_DIRECTORY_ENTRY))
+        -:  453:    {
+    #####:  454:      result = RESOURCE_ITERATOR_ABORTED;
+    #####:  455:      break;
+        -:  456:    }
+        -:  457:
+    #####:  458:    switch(rsrc_tree_level)
+        -:  459:    {
+    #####:  460:      case 0:
+    #####:  461:        *type = yr_le32toh(entry->Name);
+    #####:  462:        type_string = parse_resource_name(pe, rsrc_data, entry);
+    #####:  463:        break;
+    #####:  464:      case 1:
+    #####:  465:        *id = yr_le32toh(entry->Name);
+    #####:  466:        name_string = parse_resource_name(pe, rsrc_data, entry);
+    #####:  467:        break;
+    #####:  468:      case 2:
+    #####:  469:        *language = yr_le32toh(entry->Name);
+    #####:  470:        lang_string = parse_resource_name(pe, rsrc_data, entry);
+    #####:  471:        break;
+        -:  472:    }
+        -:  473:
+    #####:  474:    if (IS_RESOURCE_SUBDIRECTORY(entry) && rsrc_tree_level < 2)
+    #####:  475:    {
+    #####:  476:      PIMAGE_RESOURCE_DIRECTORY directory = (PIMAGE_RESOURCE_DIRECTORY) \
+    #####:  477:          (rsrc_data + RESOURCE_OFFSET(entry));
+        -:  478:
+    #####:  479:      if (struct_fits_in_pe(pe, directory, IMAGE_RESOURCE_DIRECTORY))
+        -:  480:      {
+    #####:  481:        result = _pe_iterate_resources(
+        -:  482:            pe,
+        -:  483:            directory,
+        -:  484:            rsrc_data,
+        -:  485:            rsrc_tree_level + 1,
+        -:  486:            type,
+        -:  487:            id,
+        -:  488:            language,
+        -:  489:            type_string,
+        -:  490:            name_string,
+        -:  491:            lang_string,
+        -:  492:            callback,
+        -:  493:            callback_data);
+        -:  494:      }
+        -:  495:      else
+        -:  496:      {
+    #####:  497:        result = RESOURCE_ITERATOR_ABORTED;
+        -:  498:      }
+        -:  499:    }
+        -:  500:    else
+        -:  501:    {
+    #####:  502:      PIMAGE_RESOURCE_DATA_ENTRY data_entry = (PIMAGE_RESOURCE_DATA_ENTRY) \
+    #####:  503:          (rsrc_data + RESOURCE_OFFSET(entry));
+        -:  504:
+    #####:  505:      if (struct_fits_in_pe(pe, data_entry, IMAGE_RESOURCE_DATA_ENTRY))
+        -:  506:      {
+    #####:  507:        if (callback(
+        -:  508:            data_entry,
+        -:  509:            *type,
+        -:  510:            *id,
+        -:  511:            *language,
+        -:  512:            type_string,
+        -:  513:            name_string,
+        -:  514:            lang_string,
+        -:  515:            callback_data) == RESOURCE_CALLBACK_ABORT)
+        -:  516:        {
+    #####:  517:          result = RESOURCE_ITERATOR_ABORTED;
+        -:  518:        }
+        -:  519:      }
+        -:  520:      else
+        -:  521:      {
+    #####:  522:        result = RESOURCE_ITERATOR_ABORTED;
+        -:  523:      }
+        -:  524:    }
+        -:  525:
+    #####:  526:    if (result == RESOURCE_ITERATOR_ABORTED)
+    #####:  527:      break;
+        -:  528:
+    #####:  529:    entry++;
+        -:  530:  }
+        -:  531:
+    #####:  532:  return result;
+        -:  533:}
+        -:  534:
+        -:  535:
+    #####:  536:static int pe_iterate_resources(
+        -:  537:    PE* pe,
+        -:  538:    RESOURCE_CALLBACK_FUNC callback,
+        -:  539:    void* callback_data)
+        -:  540:{
+        -:  541:  int64_t offset;
+        -:  542:
+    #####:  543:  int type = -1;
+    #####:  544:  int id = -1;
+    #####:  545:  int language = -1;
+        -:  546:
+    #####:  547:  uint8_t* type_string = NULL;
+    #####:  548:  uint8_t* name_string = NULL;
+    #####:  549:  uint8_t* lang_string = NULL;
+        -:  550:
+    #####:  551:  PIMAGE_DATA_DIRECTORY directory = pe_get_directory_entry(
+        -:  552:      pe, IMAGE_DIRECTORY_ENTRY_RESOURCE);
+        -:  553:
+    #####:  554:  if (directory == NULL)
+    #####:  555:     return 0;
+        -:  556:
+    #####:  557:  if (yr_le32toh(directory->VirtualAddress) != 0)
+        -:  558:  {
+        -:  559:    PIMAGE_RESOURCE_DIRECTORY rsrc_dir;
+        -:  560:
+    #####:  561:    offset = pe_rva_to_offset(pe, yr_le32toh(directory->VirtualAddress));
+        -:  562:
+    #####:  563:    if (offset < 0)
+    #####:  564:      return 0;
+        -:  565:
+    #####:  566:    rsrc_dir = (PIMAGE_RESOURCE_DIRECTORY) (pe->data + offset);
+        -:  567:
+    #####:  568:    if (struct_fits_in_pe(pe, rsrc_dir, IMAGE_RESOURCE_DIRECTORY))
+        -:  569:    {
+    #####:  570:      set_integer(yr_le32toh(rsrc_dir->TimeDateStamp),
+        -:  571:          pe->object,
+        -:  572:          "resource_timestamp");
+        -:  573:
+    #####:  574:      set_integer(yr_le16toh(rsrc_dir->MajorVersion),
+        -:  575:                  pe->object,
+        -:  576:                  "resource_version.major");
+    #####:  577:      set_integer(yr_le16toh(rsrc_dir->MinorVersion),
+        -:  578:                  pe->object,
+        -:  579:                  "resource_version.minor");
+        -:  580:
+    #####:  581:      _pe_iterate_resources(
+        -:  582:          pe,
+        -:  583:          rsrc_dir,
+    #####:  584:          pe->data + offset,
+        -:  585:          0,
+        -:  586:          &type,
+        -:  587:          &id,
+        -:  588:          &language,
+        -:  589:          type_string,
+        -:  590:          name_string,
+        -:  591:          lang_string,
+        -:  592:          callback,
+        -:  593:          callback_data);
+        -:  594:
+    #####:  595:      return 1;
+        -:  596:    }
+        -:  597:  }
+        -:  598:
+    #####:  599:  return 0;
+        -:  600:}
+        -:  601:
+        -:  602:
+        -:  603:// Align offset to a 32-bit boundary and add it to a pointer
+        -:  604:
+        -:  605:#define ADD_OFFSET(ptr, offset) \
+        -:  606:    (PVERSION_INFO) ((uint8_t*) (ptr) + ((offset + 3) & ~3))
+        -:  607:
+        -:  608:
+    #####:  609:static void pe_parse_version_info(
+        -:  610:    PIMAGE_RESOURCE_DATA_ENTRY rsrc_data,
+        -:  611:    PE* pe)
+        -:  612:{
+        -:  613:  PVERSION_INFO version_info;
+        -:  614:
+    #####:  615:  int64_t version_info_offset = pe_rva_to_offset(
+    #####:  616:      pe, yr_le32toh(rsrc_data->OffsetToData));
+        -:  617:
+    #####:  618:  if (version_info_offset < 0)
+    #####:  619:    return;
+        -:  620:
+    #####:  621:  version_info = (PVERSION_INFO) (pe->data + version_info_offset);
+        -:  622:
+    #####:  623:  if (!struct_fits_in_pe(pe, version_info, VERSION_INFO))
+    #####:  624:    return;
+        -:  625:
+    #####:  626:  if (!fits_in_pe(pe, version_info->Key, sizeof("VS_VERSION_INFO") * 2))
+    #####:  627:    return;
+        -:  628:
+    #####:  629:  if (strcmp_w(version_info->Key, "VS_VERSION_INFO") != 0)
+    #####:  630:    return;
+        -:  631:
+    #####:  632:  version_info = ADD_OFFSET(
+        -:  633:      version_info, sizeof(VERSION_INFO) + 86);
+        -:  634:
+    #####:  635:  while(fits_in_pe(pe, version_info->Key, sizeof("VarFileInfo") * 2) &&
+    #####:  636:        strcmp_w(version_info->Key, "VarFileInfo") == 0 &&
+    #####:  637:        yr_le16toh(version_info->Length) != 0)
+        -:  638:  {
+    #####:  639:    version_info = ADD_OFFSET(
+        -:  640:        version_info,
+        -:  641:        yr_le16toh(version_info->Length));
+        -:  642:  }
+        -:  643:
+    #####:  644:  while(fits_in_pe(pe, version_info->Key, sizeof("StringFileInfo") * 2) &&
+    #####:  645:        strcmp_w(version_info->Key, "StringFileInfo") == 0 &&
+    #####:  646:        yr_le16toh(version_info->Length) != 0)
+        -:  647:  {
+    #####:  648:    PVERSION_INFO string_table = ADD_OFFSET(
+        -:  649:        version_info,
+        -:  650:        sizeof(VERSION_INFO) + 30);
+        -:  651:
+    #####:  652:    version_info = ADD_OFFSET(
+        -:  653:        version_info,
+        -:  654:        yr_le16toh(version_info->Length));
+        -:  655:
+    #####:  656:    while (struct_fits_in_pe(pe, string_table, VERSION_INFO) &&
+    #####:  657:           wide_string_fits_in_pe(pe, string_table->Key) &&
+    #####:  658:           yr_le16toh(string_table->Length) != 0 &&
+        -:  659:           string_table < version_info)
+        -:  660:    {
+    #####:  661:      PVERSION_INFO string = ADD_OFFSET(
+        -:  662:          string_table,
+        -:  663:          sizeof(VERSION_INFO) + 2 * (strnlen_w(string_table->Key) + 1));
+        -:  664:
+    #####:  665:      string_table = ADD_OFFSET(
+        -:  666:          string_table,
+        -:  667:          yr_le16toh(string_table->Length));
+        -:  668:
+    #####:  669:      while (struct_fits_in_pe(pe, string, VERSION_INFO) &&
+    #####:  670:             wide_string_fits_in_pe(pe, string->Key) &&
+    #####:  671:             yr_le16toh(string->Length) != 0 &&
+        -:  672:             string < string_table)
+        -:  673:      {
+    #####:  674:        if (yr_le16toh(string->ValueLength) > 0)
+        -:  675:        {
+    #####:  676:          char* string_value = (char*) ADD_OFFSET(string,
+        -:  677:              sizeof(VERSION_INFO) + 2 * (strnlen_w(string->Key) + 1));
+        -:  678:
+    #####:  679:          if (wide_string_fits_in_pe(pe, string_value))
+        -:  680:          {
+        -:  681:            char key[64];
+        -:  682:            char value[256];
+        -:  683:
+    #####:  684:            strlcpy_w(key, string->Key, sizeof(key));
+    #####:  685:            strlcpy_w(value, string_value, sizeof(value));
+        -:  686:
+    #####:  687:            set_string(value, pe->object, "version_info[%s]", key);
+        -:  688:          }
+        -:  689:        }
+        -:  690:
+    #####:  691:        string = ADD_OFFSET(string, yr_le16toh(string->Length));
+        -:  692:      }
+        -:  693:    }
+        -:  694:  }
+        -:  695:}
+        -:  696:
+        -:  697:
+    #####:  698:static int pe_collect_resources(
+        -:  699:    PIMAGE_RESOURCE_DATA_ENTRY rsrc_data,
+        -:  700:    int rsrc_type,
+        -:  701:    int rsrc_id,
+        -:  702:    int rsrc_language,
+        -:  703:    uint8_t* type_string,
+        -:  704:    uint8_t* name_string,
+        -:  705:    uint8_t* lang_string,
+        -:  706:    PE* pe)
+        -:  707:{
+        -:  708:  DWORD length;
+        -:  709:
+    #####:  710:  int64_t offset = pe_rva_to_offset(pe, yr_le32toh(rsrc_data->OffsetToData));
+        -:  711:
+    #####:  712:  if (offset < 0)
+    #####:  713:    return RESOURCE_CALLBACK_CONTINUE;
+        -:  714:
+    #####:  715:  if (!fits_in_pe(pe, pe->data + offset, yr_le32toh(rsrc_data->Size)))
+    #####:  716:    return RESOURCE_CALLBACK_CONTINUE;
+        -:  717:
+    #####:  718:  set_integer(
+        -:  719:        offset,
+        -:  720:        pe->object,
+        -:  721:        "resources[%i].offset",
+        -:  722:        pe->resources);
+        -:  723:
+    #####:  724:  set_integer(
+        -:  725:        yr_le32toh(rsrc_data->Size),
+        -:  726:        pe->object,
+        -:  727:        "resources[%i].length",
+        -:  728:        pe->resources);
+        -:  729:
+    #####:  730:  if (type_string)
+        -:  731:  {
+        -:  732:    // Multiply by 2 because it is a Unicode string.
+    #####:  733:    length = ((DWORD) *type_string) * 2;
+    #####:  734:    type_string += 2;
+        -:  735:
+    #####:  736:    set_sized_string(
+        -:  737:        (char*) type_string, length, pe->object,
+        -:  738:        "resources[%i].type_string", pe->resources);
+        -:  739:  }
+        -:  740:  else
+        -:  741:  {
+    #####:  742:    set_integer(
+        -:  743:          rsrc_type,
+        -:  744:          pe->object,
+        -:  745:          "resources[%i].type",
+        -:  746:          pe->resources);
+        -:  747:  }
+        -:  748:
+    #####:  749:  if (name_string)
+        -:  750:  {
+        -:  751:    // Multiply by 2 because it is a Unicode string.
+    #####:  752:    length = ((DWORD) *name_string) * 2;
+    #####:  753:    name_string += 2;
+    #####:  754:    set_sized_string(
+        -:  755:        (char*) name_string, length, pe->object,
+        -:  756:        "resources[%i].name_string", pe->resources);
+        -:  757:  }
+        -:  758:  else
+        -:  759:  {
+    #####:  760:    set_integer(
+        -:  761:        rsrc_id,
+        -:  762:        pe->object,
+        -:  763:        "resources[%i].id",
+        -:  764:        pe->resources);
+        -:  765:  }
+        -:  766:
+    #####:  767:  if (lang_string)
+        -:  768:  {
+        -:  769:    // Multiply by 2 because it is a Unicode string.
+    #####:  770:    length = ((DWORD) *lang_string) * 2;
+    #####:  771:    lang_string += 2;
+    #####:  772:    set_sized_string(
+        -:  773:        (char*) lang_string, length, pe->object,
+        -:  774:        "resources[%i].language_string", pe->resources);
+        -:  775:  }
+        -:  776:  else
+        -:  777:  {
+    #####:  778:    set_integer(
+        -:  779:        rsrc_language,
+        -:  780:        pe->object,
+        -:  781:        "resources[%i].language",
+        -:  782:        pe->resources);
+        -:  783:  }
+        -:  784:
+        -:  785:  // Resources we do extra parsing on
+    #####:  786:  if (rsrc_type == RESOURCE_TYPE_VERSION)
+    #####:  787:    pe_parse_version_info(rsrc_data, pe);
+        -:  788:
+    #####:  789:  pe->resources += 1;
+    #####:  790:  return RESOURCE_CALLBACK_CONTINUE;
+        -:  791:}
+        -:  792:
+        -:  793:
+    #####:  794:static IMPORT_FUNCTION* pe_parse_import_descriptor(
+        -:  795:    PE* pe,
+        -:  796:    PIMAGE_IMPORT_DESCRIPTOR import_descriptor,
+        -:  797:    char* dll_name,
+        -:  798:    int* num_function_imports)
+        -:  799:{
+    #####:  800:  IMPORT_FUNCTION* head = NULL;
+    #####:  801:  IMPORT_FUNCTION* tail = NULL;
+        -:  802:
+    #####:  803:  int64_t offset = pe_rva_to_offset(
+    #####:  804:      pe, yr_le32toh(import_descriptor->OriginalFirstThunk));
+        -:  805:
+        -:  806:  // I've seen binaries where OriginalFirstThunk is zero. In this case
+        -:  807:  // use FirstThunk.
+        -:  808:
+    #####:  809:  if (offset <= 0)
+    #####:  810:    offset = pe_rva_to_offset(pe, yr_le32toh(import_descriptor->FirstThunk));
+        -:  811:
+    #####:  812:  if (offset < 0)
+    #####:  813:    return NULL;
+        -:  814:
+    #####:  815:  if (IS_64BITS_PE(pe))
+        -:  816:  {
+    #####:  817:    PIMAGE_THUNK_DATA64 thunks64 = (PIMAGE_THUNK_DATA64)(pe->data + offset);
+        -:  818:
+    #####:  819:    while (struct_fits_in_pe(pe, thunks64, IMAGE_THUNK_DATA64) &&
+    #####:  820:           yr_le64toh(thunks64->u1.Ordinal) != 0 &&
+    #####:  821:           *num_function_imports < MAX_PE_IMPORTS)
+        -:  822:    {
+    #####:  823:      char* name = NULL;
+    #####:  824:      uint16_t ordinal = 0;
+    #####:  825:      uint8_t has_ordinal = 0;
+        -:  826:
+    #####:  827:      if (!(yr_le64toh(thunks64->u1.Ordinal) & IMAGE_ORDINAL_FLAG64))
+        -:  828:      {
+        -:  829:        // If imported by name
+    #####:  830:        offset = pe_rva_to_offset(pe, yr_le64toh(thunks64->u1.Function));
+        -:  831:
+    #####:  832:        if (offset >= 0)
+        -:  833:        {
+    #####:  834:          PIMAGE_IMPORT_BY_NAME import = (PIMAGE_IMPORT_BY_NAME) \
+    #####:  835:              (pe->data + offset);
+        -:  836:
+    #####:  837:          if (struct_fits_in_pe(pe, import, IMAGE_IMPORT_BY_NAME))
+        -:  838:          {
+    #####:  839:            name = (char *) yr_strndup(
+    #####:  840:                (char*) import->Name,
+    #####:  841:                yr_min(available_space(pe, import->Name), 512));
+        -:  842:          }
+        -:  843:        }
+        -:  844:      }
+        -:  845:      else
+        -:  846:      {
+        -:  847:        // If imported by ordinal. Lookup the ordinal.
+    #####:  848:        name = ord_lookup(dll_name, yr_le64toh(thunks64->u1.Ordinal) & 0xFFFF);
+        -:  849:        // Also store the ordinal.
+    #####:  850:        ordinal = yr_le64toh(thunks64->u1.Ordinal) & 0xFFFF;
+    #####:  851:        has_ordinal = 1;
+        -:  852:      }
+        -:  853:
+    #####:  854:      if (name != NULL || has_ordinal == 1)
+        -:  855:      {
+        -:  856:        IMPORT_FUNCTION* imported_func = (IMPORT_FUNCTION*)
+    #####:  857:            yr_calloc(1, sizeof(IMPORT_FUNCTION));
+        -:  858:
+    #####:  859:        if (imported_func == NULL)
+        -:  860:        {
+    #####:  861:          yr_free(name);
+    #####:  862:          continue;
+        -:  863:        }
+        -:  864:
+    #####:  865:        imported_func->name = name;
+    #####:  866:        imported_func->ordinal = ordinal;
+    #####:  867:        imported_func->has_ordinal = has_ordinal;
+    #####:  868:        imported_func->next = NULL;
+        -:  869:
+    #####:  870:        if (head == NULL)
+    #####:  871:          head = imported_func;
+        -:  872:
+    #####:  873:        if (tail != NULL)
+    #####:  874:          tail->next = imported_func;
+        -:  875:
+    #####:  876:        tail = imported_func;
+        -:  877:      }
+        -:  878:
+    #####:  879:      (*num_function_imports)++;
+    #####:  880:      thunks64++;
+        -:  881:    }
+        -:  882:  }
+        -:  883:  else
+        -:  884:  {
+    #####:  885:    PIMAGE_THUNK_DATA32 thunks32 = (PIMAGE_THUNK_DATA32)(pe->data + offset);
+        -:  886:
+    #####:  887:    while (struct_fits_in_pe(pe, thunks32, IMAGE_THUNK_DATA32) &&
+    #####:  888:           yr_le32toh(thunks32->u1.Ordinal) != 0 && *num_function_imports < MAX_PE_IMPORTS)
+        -:  889:    {
+    #####:  890:      char* name = NULL;
+    #####:  891:      uint16_t ordinal = 0;
+    #####:  892:      uint8_t has_ordinal = 0;
+        -:  893:
+    #####:  894:      if (!(yr_le32toh(thunks32->u1.Ordinal) & IMAGE_ORDINAL_FLAG32))
+        -:  895:      {
+        -:  896:        // If imported by name
+    #####:  897:        offset = pe_rva_to_offset(pe, yr_le32toh(thunks32->u1.Function));
+        -:  898:
+    #####:  899:        if (offset >= 0)
+        -:  900:        {
+    #####:  901:          PIMAGE_IMPORT_BY_NAME import = (PIMAGE_IMPORT_BY_NAME) \
+    #####:  902:              (pe->data + offset);
+        -:  903:
+    #####:  904:          if (struct_fits_in_pe(pe, import, IMAGE_IMPORT_BY_NAME))
+        -:  905:          {
+    #####:  906:            name = (char *) yr_strndup(
+    #####:  907:                (char*) import->Name,
+    #####:  908:                yr_min(available_space(pe, import->Name), 512));
+        -:  909:          }
+        -:  910:        }
+        -:  911:      }
+        -:  912:      else
+        -:  913:      {
+        -:  914:        // If imported by ordinal. Lookup the ordinal.
+    #####:  915:        name = ord_lookup(dll_name, yr_le32toh(thunks32->u1.Ordinal) & 0xFFFF);
+        -:  916:        // Also store the ordinal.
+    #####:  917:        ordinal = yr_le32toh(thunks32->u1.Ordinal) & 0xFFFF;
+    #####:  918:        has_ordinal = 1;
+        -:  919:      }
+        -:  920:
+    #####:  921:      if (name != NULL || has_ordinal == 1)
+        -:  922:      {
+        -:  923:        IMPORT_FUNCTION* imported_func = (IMPORT_FUNCTION*)
+    #####:  924:            yr_calloc(1, sizeof(IMPORT_FUNCTION));
+        -:  925:
+    #####:  926:        if (imported_func == NULL)
+        -:  927:        {
+    #####:  928:          yr_free(name);
+    #####:  929:          continue;
+        -:  930:        }
+        -:  931:
+    #####:  932:        imported_func->name = name;
+    #####:  933:        imported_func->ordinal = ordinal;
+    #####:  934:        imported_func->has_ordinal = has_ordinal;
+    #####:  935:        imported_func->next = NULL;
+        -:  936:
+    #####:  937:        if (head == NULL)
+    #####:  938:          head = imported_func;
+        -:  939:
+    #####:  940:        if (tail != NULL)
+    #####:  941:          tail->next = imported_func;
+        -:  942:
+    #####:  943:        tail = imported_func;
+        -:  944:      }
+        -:  945:
+    #####:  946:      (*num_function_imports)++;
+    #####:  947:      thunks32++;
+        -:  948:    }
+        -:  949:  }
+        -:  950:
+    #####:  951:  return head;
+        -:  952:}
+        -:  953:
+        -:  954:
+    #####:  955:static int pe_valid_dll_name(
+        -:  956:    const char* dll_name,
+        -:  957:    size_t n)
+        -:  958:{
+    #####:  959:  const char* c = dll_name;
+    #####:  960:  size_t l = 0;
+        -:  961:
+    #####:  962:  while (l < n && *c != '\0')
+        -:  963:  {
+    #####:  964:    if ((*c >= 'a' && *c <= 'z') ||
+    #####:  965:        (*c >= 'A' && *c <= 'Z') ||
+    #####:  966:        (*c >= '0' && *c <= '9') ||
+    #####:  967:        (*c == '_' || *c == '.' || *c == '-'))
+        -:  968:    {
+    #####:  969:      c++;
+    #####:  970:      l++;
+        -:  971:    }
+        -:  972:    else
+        -:  973:    {
+    #####:  974:      return false;
+        -:  975:    }
+        -:  976:  }
+        -:  977:
+    #####:  978:  return (l > 0 && l < n);
+        -:  979:}
+        -:  980:
+        -:  981:
+        -:  982://
+        -:  983:// Walk the imports and collect relevant information. It is used in the
+        -:  984:// "imports" function for comparison and in the "imphash" function for
+        -:  985:// calculation.
+        -:  986://
+        -:  987:
+    #####:  988:static IMPORTED_DLL* pe_parse_imports(
+        -:  989:    PE* pe)
+        -:  990:{
+        -:  991:  int64_t offset;
+    #####:  992:  int num_imports = 0;           // Number of imported DLLs
+    #####:  993:  int num_function_imports = 0;  // Total number of functions imported
+        -:  994:
+    #####:  995:  IMPORTED_DLL* head = NULL;
+    #####:  996:  IMPORTED_DLL* tail = NULL;
+        -:  997:
+        -:  998:  PIMAGE_IMPORT_DESCRIPTOR imports;
+        -:  999:  PIMAGE_DATA_DIRECTORY directory;
+        -: 1000:
+        -: 1001:  // Default to 0 imports until we know there are any
+    #####: 1002:  set_integer(0, pe->object, "number_of_imports");
+        -: 1003:
+    #####: 1004:  directory = pe_get_directory_entry(
+        -: 1005:      pe, IMAGE_DIRECTORY_ENTRY_IMPORT);
+        -: 1006:
+    #####: 1007:  if (directory == NULL)
+    #####: 1008:    return NULL;
+        -: 1009:
+    #####: 1010:  if (yr_le32toh(directory->VirtualAddress) == 0)
+    #####: 1011:    return NULL;
+        -: 1012:
+    #####: 1013:  offset = pe_rva_to_offset(pe, yr_le32toh(directory->VirtualAddress));
+        -: 1014:
+    #####: 1015:  if (offset < 0)
+    #####: 1016:    return NULL;
+        -: 1017:
+    #####: 1018:  imports = (PIMAGE_IMPORT_DESCRIPTOR) \
+    #####: 1019:      (pe->data + offset);
+        -: 1020:
+    #####: 1021:  while (struct_fits_in_pe(pe, imports, IMAGE_IMPORT_DESCRIPTOR) &&
+    #####: 1022:         yr_le32toh(imports->Name) != 0 && num_imports < MAX_PE_IMPORTS)
+        -: 1023:  {
+    #####: 1024:    int64_t offset = pe_rva_to_offset(pe, yr_le32toh(imports->Name));
+        -: 1025:
+    #####: 1026:    if (offset >= 0)
+        -: 1027:    {
+        -: 1028:      IMPORTED_DLL* imported_dll;
+        -: 1029:
+    #####: 1030:      char* dll_name = (char *) (pe->data + offset);
+        -: 1031:
+    #####: 1032:      if (!pe_valid_dll_name(dll_name, pe->data_size - (size_t) offset))
+        -: 1033:      {
+    #####: 1034:          imports++;
+    #####: 1035:          continue;
+        -: 1036:      }
+        -: 1037:
+    #####: 1038:      imported_dll = (IMPORTED_DLL*) yr_calloc(1, sizeof(IMPORTED_DLL));
+        -: 1039:
+    #####: 1040:      if (imported_dll != NULL)
+        -: 1041:      {
+    #####: 1042:        IMPORT_FUNCTION* functions = pe_parse_import_descriptor(
+        -: 1043:            pe, imports, dll_name, &num_function_imports);
+        -: 1044:
+    #####: 1045:        if (functions != NULL)
+        -: 1046:        {
+    #####: 1047:          imported_dll->name = yr_strdup(dll_name);;
+    #####: 1048:          imported_dll->functions = functions;
+    #####: 1049:          imported_dll->next = NULL;
+        -: 1050:
+    #####: 1051:          if (head == NULL)
+    #####: 1052:            head = imported_dll;
+        -: 1053:
+    #####: 1054:          if (tail != NULL)
+    #####: 1055:            tail->next = imported_dll;
+        -: 1056:
+    #####: 1057:          tail = imported_dll;
+        -: 1058:        }
+        -: 1059:        else
+        -: 1060:        {
+    #####: 1061:          yr_free(imported_dll);
+        -: 1062:        }
+        -: 1063:      }
+        -: 1064:    }
+        -: 1065:
+    #####: 1066:    num_imports++;
+    #####: 1067:    imports++;
+        -: 1068:  }
+        -: 1069:
+    #####: 1070:  set_integer(num_imports, pe->object, "number_of_imports");
+    #####: 1071:  return head;
+        -: 1072:}
+        -: 1073:
+        -: 1074://
+        -: 1075:// Walk the exports and collect relevant information. It is used in the
+        -: 1076:// "exports" function for comparison.
+        -: 1077://
+        -: 1078:
+    #####: 1079:static void pe_parse_exports(
+        -: 1080:    PE* pe)
+        -: 1081:{
+        -: 1082:  PIMAGE_DATA_DIRECTORY directory;
+        -: 1083:  PIMAGE_EXPORT_DIRECTORY exports;
+        -: 1084:
+        -: 1085:  uint32_t i, j;
+        -: 1086:  uint32_t number_of_exports;
+        -: 1087:  uint32_t number_of_names;
+        -: 1088:  uint32_t ordinal_base;
+        -: 1089:  uint32_t export_start;
+        -: 1090:  uint32_t export_size;
+        -: 1091:  int64_t offset;
+        -: 1092:  size_t remaining;
+        -: 1093:  size_t name_len;
+        -: 1094:
+    #####: 1095:  uint32_t exp_sz = 0;
+    #####: 1096:  DWORD* names = NULL;
+    #####: 1097:  WORD* ordinals = NULL;
+    #####: 1098:  DWORD* function_addrs = NULL;
+        -: 1099:
+        -: 1100:  // If not a PE file, return YR_UNDEFINED
+        -: 1101:
+    #####: 1102:  if (pe == NULL)
+    #####: 1103:    return;
+        -: 1104:
+        -: 1105:  // Default to 0 exports until we know there are any
+    #####: 1106:  set_integer(0, pe->object, "number_of_exports");
+        -: 1107:
+    #####: 1108:  directory = pe_get_directory_entry(
+        -: 1109:      pe, IMAGE_DIRECTORY_ENTRY_EXPORT);
+        -: 1110:
+    #####: 1111:  if (directory == NULL)
+    #####: 1112:    return;
+        -: 1113:
+    #####: 1114:  if (yr_le32toh(directory->VirtualAddress) == 0)
+    #####: 1115:    return;
+        -: 1116:
+    #####: 1117:  offset = pe_rva_to_offset(pe, yr_le32toh(directory->VirtualAddress));
+        -: 1118:
+    #####: 1119:  if (offset < 0)
+    #####: 1120:    return;
+        -: 1121:
+    #####: 1122:  export_start = offset;
+    #####: 1123:  export_size = yr_le32toh(directory->Size);
+        -: 1124:
+    #####: 1125:  exports = (PIMAGE_EXPORT_DIRECTORY) (pe->data + offset);
+        -: 1126:
+    #####: 1127:  if (!struct_fits_in_pe(pe, exports, IMAGE_EXPORT_DIRECTORY))
+    #####: 1128:    return;
+        -: 1129:
+    #####: 1130:  number_of_exports = yr_min(
+        -: 1131:      yr_le32toh(exports->NumberOfFunctions),
+        -: 1132:      MAX_PE_EXPORTS);
+        -: 1133:
+    #####: 1134:  ordinal_base = yr_le32toh(exports->Base);
+        -: 1135:
+    #####: 1136:  set_integer(yr_le32toh(exports->TimeDateStamp), pe->object, "export_timestamp");
+        -: 1137:
+    #####: 1138:  offset = pe_rva_to_offset(pe, yr_le32toh(exports->Name));
+        -: 1139:
+    #####: 1140:  if (offset > 0)
+        -: 1141:  {
+    #####: 1142:    remaining = pe->data_size - (size_t) offset;
+    #####: 1143:    name_len = strnlen((char*) (pe->data + offset), remaining);
+    #####: 1144:    set_sized_string(
+        -: 1145:        (char*) (pe->data + offset), name_len, pe->object, "dll_name");
+        -: 1146:  }
+        -: 1147:
+    #####: 1148:  if (number_of_exports * sizeof(DWORD) > pe->data_size - offset)
+    #####: 1149:    return;
+        -: 1150:
+    #####: 1151:  if (yr_le32toh(exports->NumberOfNames) > 0)
+        -: 1152:  {
+    #####: 1153:    offset = pe_rva_to_offset(pe, yr_le32toh(exports->AddressOfNames));
+        -: 1154:
+    #####: 1155:    if (offset < 0)
+    #####: 1156:      return;
+        -: 1157:
+    #####: 1158:    if (yr_le32toh(exports->NumberOfNames) * sizeof(DWORD) > pe->data_size - offset)
+    #####: 1159:      return;
+        -: 1160:
+    #####: 1161:    names = (DWORD*)(pe->data + offset);
+        -: 1162:  }
+        -: 1163:
+    #####: 1164:  offset = pe_rva_to_offset(pe, yr_le32toh(exports->AddressOfNameOrdinals));
+        -: 1165:
+    #####: 1166:  if (offset < 0)
+    #####: 1167:    return;
+        -: 1168:
+    #####: 1169:  ordinals = (WORD*)(pe->data + offset);
+        -: 1170:
+    #####: 1171:  if (available_space(pe, ordinals) < sizeof(WORD) * number_of_exports)
+    #####: 1172:    return;
+        -: 1173:
+    #####: 1174:  offset = pe_rva_to_offset(pe, yr_le32toh(exports->AddressOfFunctions));
+        -: 1175:
+    #####: 1176:  if (offset < 0)
+    #####: 1177:    return;
+        -: 1178:
+    #####: 1179:  function_addrs = (DWORD*)(pe->data + offset);
+        -: 1180:
+    #####: 1181:  if (available_space(pe, function_addrs) < sizeof(DWORD) * number_of_exports)
+    #####: 1182:    return;
+        -: 1183:
+    #####: 1184:  number_of_names = yr_min(
+        -: 1185:      yr_le32toh(yr_le32toh(exports->NumberOfNames)), number_of_exports);
+        -: 1186:
+        -: 1187:  // Mapping out the exports is a bit janky. We start with the export address
+        -: 1188:  // array. The index from that array plus the ordinal base is the ordinal for
+        -: 1189:  // that export. To find the name we walk the ordinal array looking for a value
+        -: 1190:  // that matches our index. If one exists we look up the corresponding RVA from
+        -: 1191:  // the names array and follow it to get the name. If one does not exist then
+        -: 1192:  // the export has no name.
+        -: 1193:  //
+        -: 1194:  // Ordinal base: 5
+        -: 1195:  //                       0            1            2
+        -: 1196:  // Address array: [ 0x00000011 | 0x00000022 | 0x00000033 ]
+        -: 1197:  //                     0        1        2
+        -: 1198:  // Ordinal array: [ 0x0000 | 0x0002 | 0x0001 ]
+        -: 1199:  //                       0            1
+        -: 1200:  // Names array:   [ 0x00000044 | 0x00000055 ]
+        -: 1201:  //
+        -: 1202:  // The function at RVA 0x00000011 (index 0) has ordinal 5 (base + index). The
+        -: 1203:  // index can be found in position 0 in the ordinal array. Using 0 to index
+        -: 1204:  // into the name array gives us an RVA (0x00000044) which we can follow to get
+        -: 1205:  // the name.
+        -: 1206:  //
+        -: 1207:  // The function at RVA 0x00000022 (index 1) has ordinal 6 (base + index). The
+        -: 1208:  // index can be found in position 2 in the ordinal array. 2 is out of bounds
+        -: 1209:  // for the names array so this function is exported without a name.
+        -: 1210:  //
+        -: 1211:  // The function at RVA 0x00000033 (index 2) has ordinal 7 (base + index). The
+        -: 1212:  // index can be found in position 1 in the ordinal array. Using 1 to index
+        -: 1213:  // into the name array gives us an RVA (0x00000055) which we can follow to get
+        -: 1214:  // the name.
+        -: 1215:  //
+        -: 1216:  // If the RVA from the address array is within the export directory it is a
+        -: 1217:  // forwarder RVA and points to a NULL terminated ASCII string.
+        -: 1218:
+    #####: 1219:  for (i = 0; i < number_of_exports; i++)
+        -: 1220:  {
+    #####: 1221:    set_integer(
+        -: 1222:        ordinal_base + i, pe->object, "export_details[%i].ordinal", exp_sz);
+        -: 1223:
+        -: 1224:    // Don't check for a failure here since some packers make this an invalid
+        -: 1225:    // value.
+    #####: 1226:    offset = pe_rva_to_offset(pe, yr_le32toh(function_addrs[i]));
+        -: 1227:
+    #####: 1228:    if (offset > export_start && offset < export_start + export_size)
+        -: 1229:    {
+    #####: 1230:      remaining = pe->data_size - (size_t) offset;
+    #####: 1231:      name_len = strnlen((char*) (pe->data + offset), remaining);
+        -: 1232:
+    #####: 1233:      set_sized_string(
+        -: 1234:          (char*) (pe->data + offset),
+        -: 1235:          yr_min(name_len, MAX_EXPORT_NAME_LENGTH),
+        -: 1236:          pe->object,
+        -: 1237:          "export_details[%i].forward_name", exp_sz);
+        -: 1238:    }
+        -: 1239:    else
+        -: 1240:    {
+    #####: 1241:      set_integer(offset, pe->object, "export_details[%i].offset", exp_sz);
+        -: 1242:    }
+        -: 1243:
+    #####: 1244:    if (names != NULL)
+        -: 1245:    {
+    #####: 1246:      for (j = 0; j < number_of_exports; j++)
+        -: 1247:      {
+    #####: 1248:        if (yr_le16toh(ordinals[j]) == i && j < number_of_names)
+        -: 1249:        {
+    #####: 1250:          offset = pe_rva_to_offset(pe, yr_le32toh(names[j]));
+    #####: 1251:          if (offset > 0)
+        -: 1252:          {
+    #####: 1253:            remaining = pe->data_size - (size_t) offset;
+    #####: 1254:            name_len = strnlen((char*) (pe->data + offset), remaining);
+        -: 1255:
+    #####: 1256:            set_sized_string(
+        -: 1257:                (char*) (pe->data + offset),
+        -: 1258:                yr_min(name_len, MAX_EXPORT_NAME_LENGTH),
+        -: 1259:                pe->object,
+        -: 1260:                "export_details[%i].name", exp_sz);
+        -: 1261:          }
+    #####: 1262:          break;
+        -: 1263:        }
+        -: 1264:      }
+        -: 1265:    }
+    #####: 1266:    exp_sz++;
+        -: 1267:  }
+        -: 1268:
+    #####: 1269:  set_integer(exp_sz, pe->object, "number_of_exports");
+    #####: 1270:  return;
+        -: 1271:}
+        -: 1272:
+        -: 1273:// BoringSSL (https://boringssl.googlesource.com/boringssl/) doesn't support
+        -: 1274:// some features used in pe_parse_certificates, if you are using BoringSSL
+        -: 1275:// instead of OpenSSL you should define BORINGSSL for YARA to compile properly,
+        -: 1276:// but you won't have signature-related features in the PE module.
+        -: 1277:#if defined(HAVE_LIBCRYPTO) && !defined(BORINGSSL)
+        -: 1278:
+        -: 1279://
+        -: 1280:// Parse a PKCS7 blob, looking for certs and nested PKCS7 blobs.
+        -: 1281://
+        -: 1282:
+    #####: 1283:void _parse_pkcs7(
+        -: 1284:    PE* pe,
+        -: 1285:    PKCS7* pkcs7,
+        -: 1286:    int* counter)
+        -: 1287:{
+        -: 1288:  int i, j;
+        -: 1289:  time_t date_time;
+        -: 1290:  const char* sig_alg;
+        -: 1291:  char buffer[256];
+        -: 1292:  int bytes;
+        -: 1293:  int idx;
+    #####: 1294:  const EVP_MD* sha1_digest = EVP_sha1();
+        -: 1295:  const unsigned char* p;
+        -: 1296:  unsigned char thumbprint[YR_SHA1_LEN];
+        -: 1297:  char thumbprint_ascii[YR_SHA1_LEN * 2 + 1];
+        -: 1298:
+    #####: 1299:  PKCS7_SIGNER_INFO* signer_info = NULL;
+    #####: 1300:  PKCS7* nested_pkcs7 = NULL;
+    #####: 1301:  ASN1_INTEGER* serial = NULL;
+    #####: 1302:  ASN1_TYPE* nested = NULL;
+    #####: 1303:  ASN1_STRING* value = NULL;
+    #####: 1304:  X509* cert = NULL;
+    #####: 1305:  STACK_OF(X509)* certs = NULL;
+    #####: 1306:  X509_ATTRIBUTE *xa = NULL;
+    #####: 1307:  STACK_OF(X509_ATTRIBUTE)* attrs = NULL;
+        -: 1308:
+    #####: 1309:  if (*counter >= MAX_PE_CERTS)
+    #####: 1310:    return;
+        -: 1311:
+    #####: 1312:  certs = PKCS7_get0_signers(pkcs7, NULL, 0);
+        -: 1313:
+    #####: 1314:  if (!certs)
+    #####: 1315:    return;
+        -: 1316:
+    #####: 1317:  for (i = 0; i < sk_X509_num(certs) && *counter < MAX_PE_CERTS; i++)
+        -: 1318:  {
+    #####: 1319:    cert = sk_X509_value(certs, i);
+        -: 1320:
+    #####: 1321:    X509_digest(cert, sha1_digest, thumbprint, NULL);
+        -: 1322:
+    #####: 1323:    for (j = 0; j < YR_SHA1_LEN; j++)
+    #####: 1324:      sprintf(thumbprint_ascii + (j * 2), "%02x", thumbprint[j]);
+        -: 1325:
+    #####: 1326:    set_string(
+        -: 1327:        (char*) thumbprint_ascii,
+        -: 1328:        pe->object,
+        -: 1329:        "signatures[%i].thumbprint",
+        -: 1330:        *counter);
+        -: 1331:
+    #####: 1332:    X509_NAME_oneline(
+    #####: 1333:        X509_get_issuer_name(cert), buffer, sizeof(buffer));
+        -: 1334:
+    #####: 1335:    set_string(buffer, pe->object, "signatures[%i].issuer", *counter);
+        -: 1336:
+    #####: 1337:    X509_NAME_oneline(
+    #####: 1338:        X509_get_subject_name(cert), buffer, sizeof(buffer));
+        -: 1339:
+    #####: 1340:    set_string(buffer, pe->object, "signatures[%i].subject", *counter);
+        -: 1341:
+    #####: 1342:    set_integer(
+        -: 1343:        X509_get_version(cert) + 1, // Versions are zero based, so add one.
+        -: 1344:        pe->object,
+        -: 1345:        "signatures[%i].version", *counter);
+        -: 1346:
+    #####: 1347:    sig_alg = OBJ_nid2ln(X509_get_signature_nid(cert));
+        -: 1348:
+    #####: 1349:    set_string(sig_alg, pe->object, "signatures[%i].algorithm", *counter);
+        -: 1350:
+    #####: 1351:    serial = X509_get_serialNumber(cert);
+        -: 1352:
+    #####: 1353:    if (serial)
+        -: 1354:    {
+        -: 1355:      // ASN1_INTEGER can be negative (serial->type & V_ASN1_NEG_INTEGER),
+        -: 1356:      // in which case the serial number will be stored in 2's complement.
+        -: 1357:      //
+        -: 1358:      // Handle negative serial numbers, which are technically not allowed
+        -: 1359:      // by RFC5280, but do exist. An example binary which has a negative
+        -: 1360:      // serial number is: 4bfe05f182aa273e113db6ed7dae4bb8.
+        -: 1361:      //
+        -: 1362:      // Negative serial numbers are handled by calling i2d_ASN1_INTEGER()
+        -: 1363:      // with a NULL second parameter. This will return the size of the
+        -: 1364:      // buffer necessary to store the proper serial number.
+        -: 1365:      //
+        -: 1366:      // Do this even for positive serial numbers because it makes the code
+        -: 1367:      // cleaner and easier to read.
+        -: 1368:
+    #####: 1369:      bytes = i2d_ASN1_INTEGER(serial, NULL);
+        -: 1370:
+        -: 1371:      // According to X.509 specification the maximum length for the
+        -: 1372:      // serial number is 20 octets. Add two bytes to account for
+        -: 1373:      // DER type and length information.
+        -: 1374:
+    #####: 1375:      if (bytes > 2 && bytes <= 22)
+        -: 1376:      {
+        -: 1377:        // Now that we know the size of the serial number allocate enough
+        -: 1378:        // space to hold it, and use i2d_ASN1_INTEGER() one last time to
+        -: 1379:        // hold it in the allocated buffer.
+        -: 1380:
+    #####: 1381:        unsigned char* serial_der = (unsigned char*) yr_malloc(bytes);
+        -: 1382:
+    #####: 1383:        if (serial_der != NULL)
+        -: 1384:        {
+        -: 1385:          unsigned char* serial_bytes;
+        -: 1386:          char *serial_ascii;
+        -: 1387:
+    #####: 1388:          bytes = i2d_ASN1_INTEGER(serial, &serial_der);
+        -: 1389:
+        -: 1390:          // i2d_ASN1_INTEGER() moves the pointer as it writes into
+        -: 1391:          // serial_bytes. Move it back.
+        -: 1392:
+    #####: 1393:          serial_der -= bytes;
+        -: 1394:
+        -: 1395:          // Skip over DER type, length information
+    #####: 1396:          serial_bytes = serial_der + 2;
+    #####: 1397:          bytes -= 2;
+        -: 1398:
+        -: 1399:          // Also allocate space to hold the "common" string format:
+        -: 1400:          // 00:01:02:03:04...
+        -: 1401:          //
+        -: 1402:          // For each byte in the serial to convert to hexlified format we
+        -: 1403:          // need three bytes, two for the byte itself and one for colon.
+        -: 1404:          // The last one doesn't have the colon, but the extra byte is used
+        -: 1405:          // for the NULL terminator.
+        -: 1406:
+    #####: 1407:          serial_ascii = (char*) yr_malloc(bytes * 3);
+        -: 1408:
+    #####: 1409:          if (serial_ascii)
+        -: 1410:          {
+    #####: 1411:            for (j = 0; j < bytes; j++)
+        -: 1412:            {
+        -: 1413:              // Don't put the colon on the last one.
+    #####: 1414:              if (j < bytes - 1)
+    #####: 1415:                snprintf(
+    #####: 1416:                  serial_ascii + 3 * j, 4, "%02x:", serial_bytes[j]);
+        -: 1417:              else
+    #####: 1418:                snprintf(
+    #####: 1419:                  serial_ascii + 3 * j, 3, "%02x", serial_bytes[j]);
+        -: 1420:            }
+        -: 1421:
+    #####: 1422:            set_string(
+        -: 1423:                serial_ascii,
+        -: 1424:                pe->object,
+        -: 1425:                "signatures[%i].serial",
+        -: 1426:                *counter);
+        -: 1427:
+    #####: 1428:            yr_free(serial_ascii);
+        -: 1429:          }
+        -: 1430:
+    #####: 1431:          yr_free(serial_der);
+        -: 1432:        }
+        -: 1433:      }
+        -: 1434:    }
+        -: 1435:
+    #####: 1436:    date_time = ASN1_get_time_t(X509_get_notBefore(cert));
+    #####: 1437:    set_integer(date_time, pe->object, "signatures[%i].not_before", *counter);
+        -: 1438:
+    #####: 1439:    date_time = ASN1_get_time_t(X509_get_notAfter(cert));
+    #####: 1440:    set_integer(date_time, pe->object, "signatures[%i].not_after", *counter);
+        -: 1441:
+    #####: 1442:    (*counter)++;
+        -: 1443:  }
+        -: 1444:
+        -: 1445:  // See if there is a nested signature, which is apparently an authenticode
+        -: 1446:  // specific feature. See https://github.com/VirusTotal/yara/issues/515.
+    #####: 1447:  signer_info = sk_PKCS7_SIGNER_INFO_value(pkcs7->d.sign->signer_info, 0);
+    #####: 1448:  if (signer_info != NULL)
+        -: 1449:  {
+    #####: 1450:    attrs = PKCS7_get_attributes(signer_info);
+    #####: 1451:    idx = X509at_get_attr_by_NID(
+        -: 1452:        attrs, OBJ_txt2nid(SPC_NESTED_SIGNATURE_OBJID), -1);
+    #####: 1453:    xa = X509at_get_attr(attrs, idx);
+    #####: 1454:    for (j = 0; j < MAX_PE_CERTS; j++)
+        -: 1455:    {
+    #####: 1456:      nested = X509_ATTRIBUTE_get0_type(xa, j);
+    #####: 1457:      if (nested == NULL)
+    #####: 1458:        break;
+    #####: 1459:      value = nested->value.sequence;
+    #####: 1460:      p = value->data;
+    #####: 1461:      nested_pkcs7 = d2i_PKCS7(NULL, &p, value->length);
+    #####: 1462:      if (nested_pkcs7 != NULL)
+        -: 1463:      {
+    #####: 1464:        _parse_pkcs7(pe, nested_pkcs7, counter);
+    #####: 1465:        PKCS7_free(nested_pkcs7);
+        -: 1466:      }
+        -: 1467:    }
+        -: 1468:  }
+        -: 1469:
+    #####: 1470:  sk_X509_free(certs);
+        -: 1471:}
+        -: 1472:
+        -: 1473:
+    #####: 1474:static void pe_parse_certificates(
+        -: 1475:    PE* pe)
+        -: 1476:{
+    #####: 1477:  int counter = 0;
+        -: 1478:
+        -: 1479:  const uint8_t* eod;
+        -: 1480:  const unsigned char* cert_p;
+        -: 1481:  uintptr_t end;
+        -: 1482:
+        -: 1483:  PWIN_CERTIFICATE win_cert;
+        -: 1484:
+    #####: 1485:  PIMAGE_DATA_DIRECTORY directory = pe_get_directory_entry(
+        -: 1486:      pe, IMAGE_DIRECTORY_ENTRY_SECURITY);
+        -: 1487:
+    #####: 1488:  if (directory == NULL)
+    #####: 1489:    return;
+        -: 1490:
+        -: 1491:  // Default to 0 signatures until we know otherwise.
+    #####: 1492:  set_integer(0, pe->object, "number_of_signatures");
+        -: 1493:
+        -: 1494:  // directory->VirtualAddress is a file offset. Don't call pe_rva_to_offset().
+    #####: 1495:  if (yr_le32toh(directory->VirtualAddress) == 0 ||
+    #####: 1496:      yr_le32toh(directory->VirtualAddress) > pe->data_size ||
+    #####: 1497:      yr_le32toh(directory->Size) > pe->data_size ||
+    #####: 1498:      yr_le32toh(directory->VirtualAddress) + yr_le32toh(directory->Size) > pe->data_size)
+        -: 1499:  {
+    #####: 1500:    return;
+        -: 1501:  }
+        -: 1502:
+        -: 1503:  // Store the end of directory, making comparisons easier.
+    #####: 1504:  eod = pe->data + \
+    #####: 1505:      yr_le32toh(directory->VirtualAddress) + \
+    #####: 1506:      yr_le32toh(directory->Size);
+        -: 1507:
+    #####: 1508:  win_cert = (PWIN_CERTIFICATE) \
+    #####: 1509:      (pe->data + yr_le32toh(directory->VirtualAddress));
+        -: 1510:
+        -: 1511:  //
+        -: 1512:  // Walk the directory, pulling out certificates.
+        -: 1513:  //
+        -: 1514:  // Make sure WIN_CERTIFICATE fits within the directory.
+        -: 1515:  // Make sure the Length specified fits within directory too.
+        -: 1516:  //
+        -: 1517:  // The docs say that the length is only for the Certificate, but the next
+        -: 1518:  // paragraph contradicts that. All the binaries I've seen have the Length
+        -: 1519:  // being the entire structure (Certificate included).
+        -: 1520:  //
+        -: 1521:
+    #####: 1522:  while (struct_fits_in_pe(pe, win_cert, WIN_CERTIFICATE) &&
+    #####: 1523:         yr_le32toh(win_cert->Length) > sizeof(WIN_CERTIFICATE) &&
+    #####: 1524:         fits_in_pe(pe, win_cert, yr_le32toh(win_cert->Length)) &&
+    #####: 1525:         (uint8_t*) win_cert + sizeof(WIN_CERTIFICATE) < eod &&
+    #####: 1526:         (uint8_t*) win_cert + yr_le32toh(win_cert->Length) <= eod)
+        -: 1527:  {
+        -: 1528:    PKCS7* pkcs7;
+        -: 1529:
+        -: 1530:    // Some sanity checks
+        -: 1531:
+    #####: 1532:    if (yr_le32toh(win_cert->Length) == 0 ||
+    #####: 1533:        (yr_le16toh(win_cert->Revision) != WIN_CERT_REVISION_1_0 &&
+    #####: 1534:         yr_le16toh(win_cert->Revision) != WIN_CERT_REVISION_2_0))
+        -: 1535:    {
+        -: 1536:      break;
+        -: 1537:    }
+        -: 1538:
+        -: 1539:    // Don't support legacy revision for now.
+        -: 1540:    // Make sure type is PKCS#7 too.
+        -: 1541:
+    #####: 1542:    if (yr_le16toh(win_cert->Revision) != WIN_CERT_REVISION_2_0 ||
+    #####: 1543:        yr_le16toh(win_cert->CertificateType) != WIN_CERT_TYPE_PKCS_SIGNED_DATA)
+        -: 1544:    {
+    #####: 1545:      end = (uintptr_t)((uint8_t*) win_cert) + yr_le32toh(win_cert->Length);
+        -: 1546:
+    #####: 1547:      win_cert = (PWIN_CERTIFICATE) (end + (end % 8));
+    #####: 1548:      continue;
+        -: 1549:    }
+        -: 1550:
+    #####: 1551:    cert_p = win_cert->Certificate;
+    #####: 1552:    end = (uintptr_t)((uint8_t*) win_cert) + yr_le32toh(win_cert->Length);
+    #####: 1553:    while ((uintptr_t) cert_p < end && counter < MAX_PE_CERTS)
+        -: 1554:    {
+    #####: 1555:      pkcs7 = d2i_PKCS7(NULL, &cert_p, (yr_le32toh( (uint32_t)((uintptr_t)end - (uintptr_t)cert_p)) ));
+    #####: 1556:      if (pkcs7 == NULL)
+    #####: 1557:        break;
+    #####: 1558:      _parse_pkcs7(pe, pkcs7, &counter);
+    #####: 1559:      PKCS7_free(pkcs7);
+    #####: 1560:      pkcs7 = NULL;
+        -: 1561:    }
+        -: 1562:
+    #####: 1563:    win_cert = (PWIN_CERTIFICATE) (end + (end % 8));
+        -: 1564:  }
+        -: 1565:
+    #####: 1566:  set_integer(counter, pe->object, "number_of_signatures");
+        -: 1567:}
+        -: 1568:
+        -: 1569:#endif  // defined(HAVE_LIBCRYPTO)
+        -: 1570:
+        -: 1571:
+    #####: 1572:static void pe_parse_header(
+        -: 1573:    PE* pe,
+        -: 1574:    uint64_t base_address,
+        -: 1575:    int flags)
+        -: 1576:{
+        -: 1577:  PIMAGE_SECTION_HEADER section;
+        -: 1578:  PIMAGE_DATA_DIRECTORY data_dir;
+        -: 1579:
+        -: 1580:  char section_name[IMAGE_SIZEOF_SHORT_NAME + 1];
+        -: 1581:  int i, scount, ddcount;
+        -: 1582:
+    #####: 1583:  uint64_t highest_sec_siz = 0;
+    #####: 1584:  uint64_t highest_sec_ofs = 0;
+        -: 1585:  uint64_t section_end;
+        -: 1586:  uint64_t last_section_end;
+        -: 1587:
+        -: 1588:
+    #####: 1589:  set_integer(1, pe->object, "is_pe");
+        -: 1590:
+    #####: 1591:  set_integer(
+        -: 1592:      yr_le16toh(pe->header->FileHeader.Machine),
+        -: 1593:      pe->object, "machine");
+        -: 1594:
+    #####: 1595:  set_integer(
+        -: 1596:      yr_le16toh(pe->header->FileHeader.NumberOfSections),
+        -: 1597:      pe->object, "number_of_sections");
+        -: 1598:
+    #####: 1599:  set_integer(
+        -: 1600:      yr_le32toh(pe->header->FileHeader.TimeDateStamp),
+        -: 1601:      pe->object, "timestamp");
+        -: 1602:
+    #####: 1603:  set_integer(
+        -: 1604:      yr_le32toh(pe->header->FileHeader.PointerToSymbolTable),
+        -: 1605:      pe->object, "pointer_to_symbol_table");
+        -: 1606:
+    #####: 1607:  set_integer(
+        -: 1608:      yr_le32toh(pe->header->FileHeader.NumberOfSymbols),
+        -: 1609:      pe->object, "number_of_symbols");
+        -: 1610:
+    #####: 1611:  set_integer(
+        -: 1612:      yr_le32toh(pe->header->FileHeader.SizeOfOptionalHeader),
+        -: 1613:      pe->object, "size_of_optional_header");
+        -: 1614:
+    #####: 1615:  set_integer(
+        -: 1616:      yr_le16toh(pe->header->FileHeader.Characteristics),
+        -: 1617:      pe->object, "characteristics");
+        -: 1618:
+    #####: 1619:  set_integer(
+        -: 1620:      flags & SCAN_FLAGS_PROCESS_MEMORY ?
+        -: 1621:      base_address + yr_le32toh(OptionalHeader(pe, AddressOfEntryPoint)) :
+        -: 1622:      pe_rva_to_offset(pe, yr_le32toh(OptionalHeader(pe, AddressOfEntryPoint))),
+        -: 1623:      pe->object, "entry_point");
+        -: 1624:
+    #####: 1625:  set_integer(
+        -: 1626:      IS_64BITS_PE(pe) ?
+        -: 1627:      yr_le64toh(OptionalHeader(pe, ImageBase)) :
+        -: 1628:      yr_le32toh(OptionalHeader(pe, ImageBase)),
+        -: 1629:      pe->object, "image_base");
+        -: 1630:
+    #####: 1631:  set_integer(
+        -: 1632:      yr_le32toh(OptionalHeader(pe, NumberOfRvaAndSizes)),
+        -: 1633:      pe->object, "number_of_rva_and_sizes");
+        -: 1634:
+    #####: 1635:  set_integer(
+        -: 1636:      yr_le32toh(OptionalHeader(pe, Magic)),
+        -: 1637:      pe->object, "opthdr_magic");
+        -: 1638:
+    #####: 1639:  set_integer(
+        -: 1640:      OptionalHeader(pe, MajorLinkerVersion),
+        -: 1641:      pe->object, "linker_version.major");
+        -: 1642:
+    #####: 1643:  set_integer(
+        -: 1644:      OptionalHeader(pe, MinorLinkerVersion),
+        -: 1645:      pe->object, "linker_version.minor");
+        -: 1646:
+    #####: 1647:  set_integer(
+        -: 1648:      yr_le32toh(OptionalHeader(pe, SizeOfCode)),
+        -: 1649:      pe->object, "size_of_code");
+        -: 1650:
+    #####: 1651:  set_integer(
+        -: 1652:      yr_le32toh(OptionalHeader(pe, SizeOfInitializedData)),
+        -: 1653:      pe->object, "size_of_initialized_data");
+        -: 1654:
+    #####: 1655:  set_integer(
+        -: 1656:      yr_le32toh(OptionalHeader(pe, SizeOfUninitializedData)),
+        -: 1657:      pe->object, "size_of_uninitialized_data");
+        -: 1658:
+    #####: 1659:  set_integer(
+        -: 1660:      yr_le32toh(OptionalHeader(pe, BaseOfCode)),
+        -: 1661:      pe->object, "base_of_code");
+        -: 1662:
+    #####: 1663:  if (!IS_64BITS_PE(pe))
+        -: 1664:  {
+    #####: 1665:      set_integer(
+        -: 1666:        yr_le32toh(pe->header->OptionalHeader.BaseOfData),
+        -: 1667:        pe->object, "base_of_data");
+        -: 1668:  }
+        -: 1669:
+    #####: 1670:  set_integer(
+        -: 1671:      yr_le32toh(OptionalHeader(pe, SectionAlignment)),
+        -: 1672:      pe->object, "section_alignment");
+        -: 1673:
+    #####: 1674:  set_integer(
+        -: 1675:      yr_le32toh(OptionalHeader(pe, FileAlignment)),
+        -: 1676:      pe->object, "file_alignment");
+        -: 1677:
+    #####: 1678:  set_integer(
+        -: 1679:      yr_le16toh(OptionalHeader(pe, MajorOperatingSystemVersion)),
+        -: 1680:      pe->object, "os_version.major");
+        -: 1681:
+    #####: 1682:  set_integer(
+        -: 1683:      yr_le16toh(OptionalHeader(pe, MinorOperatingSystemVersion)),
+        -: 1684:      pe->object, "os_version.minor");
+        -: 1685:
+    #####: 1686:  set_integer(
+        -: 1687:      yr_le16toh(OptionalHeader(pe, MajorImageVersion)),
+        -: 1688:      pe->object, "image_version.major");
+        -: 1689:
+    #####: 1690:  set_integer(
+        -: 1691:      yr_le16toh(OptionalHeader(pe, MinorImageVersion)),
+        -: 1692:      pe->object, "image_version.minor");
+        -: 1693:
+    #####: 1694:  set_integer(
+        -: 1695:      yr_le16toh(OptionalHeader(pe, MajorSubsystemVersion)),
+        -: 1696:      pe->object, "subsystem_version.major");
+        -: 1697:
+    #####: 1698:  set_integer(
+        -: 1699:      yr_le16toh(OptionalHeader(pe, MinorSubsystemVersion)),
+        -: 1700:      pe->object, "subsystem_version.minor");
+        -: 1701:
+    #####: 1702:  set_integer(
+        -: 1703:      yr_le32toh(OptionalHeader(pe, Win32VersionValue)),
+        -: 1704:      pe->object, "win32_version_value");
+        -: 1705:
+    #####: 1706:  set_integer(
+        -: 1707:      yr_le32toh(OptionalHeader(pe, SizeOfImage)),
+        -: 1708:      pe->object, "size_of_image");
+        -: 1709:
+    #####: 1710:  set_integer(
+        -: 1711:      yr_le32toh(OptionalHeader(pe, SizeOfHeaders)),
+        -: 1712:      pe->object, "size_of_headers");
+        -: 1713:
+    #####: 1714:  set_integer(
+        -: 1715:      yr_le32toh(OptionalHeader(pe, CheckSum)),
+        -: 1716:      pe->object, "checksum");
+        -: 1717:
+    #####: 1718:  set_integer(
+        -: 1719:      yr_le16toh(OptionalHeader(pe, Subsystem)),
+        -: 1720:      pe->object, "subsystem");
+        -: 1721:
+    #####: 1722:  set_integer(
+        -: 1723:      OptionalHeader(pe, DllCharacteristics),
+        -: 1724:      pe->object, "dll_characteristics");
+        -: 1725:
+    #####: 1726:  set_integer(
+        -: 1727:      IS_64BITS_PE(pe) ?
+        -: 1728:      yr_le64toh(OptionalHeader(pe, SizeOfStackReserve)) :
+        -: 1729:      yr_le32toh(OptionalHeader(pe, SizeOfStackReserve)),
+        -: 1730:      pe->object, "size_of_stack_reserve");
+        -: 1731:
+    #####: 1732:  set_integer(
+        -: 1733:      IS_64BITS_PE(pe) ?
+        -: 1734:      yr_le64toh(OptionalHeader(pe, SizeOfStackCommit)) :
+        -: 1735:      yr_le32toh(OptionalHeader(pe, SizeOfStackCommit)),
+        -: 1736:      pe->object, "size_of_stack_commit");
+        -: 1737:
+    #####: 1738:  set_integer(
+        -: 1739:      IS_64BITS_PE(pe) ?
+        -: 1740:      yr_le64toh(OptionalHeader(pe, SizeOfHeapReserve)) :
+        -: 1741:      yr_le32toh(OptionalHeader(pe, SizeOfHeapReserve)),
+        -: 1742:      pe->object, "size_of_heap_reserve");
+        -: 1743:
+    #####: 1744:  set_integer(
+        -: 1745:      IS_64BITS_PE(pe) ?
+        -: 1746:      yr_le64toh(OptionalHeader(pe, SizeOfHeapCommit)) :
+        -: 1747:      yr_le32toh(OptionalHeader(pe, SizeOfHeapCommit)),
+        -: 1748:      pe->object, "size_of_heap_commit");
+        -: 1749:
+    #####: 1750:  set_integer(
+        -: 1751:      yr_le32toh(OptionalHeader(pe, LoaderFlags)),
+        -: 1752:      pe->object, "loader_flags");
+        -: 1753:
+    #####: 1754:  data_dir = IS_64BITS_PE(pe) ?
+    #####: 1755:      pe->header64->OptionalHeader.DataDirectory:
+    #####: 1756:      pe->header->OptionalHeader.DataDirectory;
+        -: 1757:
+    #####: 1758:  ddcount = yr_le16toh(OptionalHeader(pe, NumberOfRvaAndSizes));
+    #####: 1759:  ddcount = yr_min(ddcount, IMAGE_NUMBEROF_DIRECTORY_ENTRIES);
+        -: 1760:
+    #####: 1761:  for (i = 0; i < ddcount; i++)
+        -: 1762:  {
+    #####: 1763:    if (!struct_fits_in_pe(pe, data_dir, IMAGE_DATA_DIRECTORY))
+        -: 1764:      break;
+        -: 1765:
+    #####: 1766:    set_integer(
+        -: 1767:      yr_le32toh(data_dir->VirtualAddress),
+        -: 1768:      pe->object, "data_directories[%i].virtual_address", i);
+        -: 1769:
+    #####: 1770:    set_integer(
+        -: 1771:      yr_le32toh(data_dir->Size),
+        -: 1772:      pe->object, "data_directories[%i].size", i);
+        -: 1773:
+    #####: 1774:    data_dir++;
+        -: 1775:  }
+        -: 1776:
+    #####: 1777:  pe_iterate_resources(
+        -: 1778:      pe,
+        -: 1779:      (RESOURCE_CALLBACK_FUNC) pe_collect_resources,
+        -: 1780:      (void*) pe);
+        -: 1781:
+    #####: 1782:  set_integer(pe->resources, pe->object, "number_of_resources");
+        -: 1783:
+    #####: 1784:  section = IMAGE_FIRST_SECTION(pe->header);
+        -: 1785:
+    #####: 1786:  scount = yr_min(
+        -: 1787:      yr_le16toh(pe->header->FileHeader.NumberOfSections), MAX_PE_SECTIONS);
+        -: 1788:
+    #####: 1789:  for (i = 0; i < scount; i++)
+        -: 1790:  {
+    #####: 1791:    if (!struct_fits_in_pe(pe, section, IMAGE_SECTION_HEADER))
+        -: 1792:      break;
+        -: 1793:
+    #####: 1794:    strncpy(section_name, (char*) section->Name, IMAGE_SIZEOF_SHORT_NAME);
+    #####: 1795:    section_name[IMAGE_SIZEOF_SHORT_NAME] = '\0';
+        -: 1796:
+    #####: 1797:    set_string(
+        -: 1798:        section_name,
+        -: 1799:        pe->object, "sections[%i].name", i);
+        -: 1800:
+    #####: 1801:    set_integer(
+        -: 1802:        yr_le32toh(section->Characteristics),
+        -: 1803:        pe->object, "sections[%i].characteristics", i);
+        -: 1804:
+    #####: 1805:    set_integer(
+        -: 1806:        yr_le32toh(section->SizeOfRawData),
+        -: 1807:        pe->object, "sections[%i].raw_data_size", i);
+        -: 1808:
+    #####: 1809:    set_integer(
+        -: 1810:        yr_le32toh(section->PointerToRawData),
+        -: 1811:        pe->object, "sections[%i].raw_data_offset", i);
+        -: 1812:
+    #####: 1813:    set_integer(
+        -: 1814:        yr_le32toh(section->VirtualAddress),
+        -: 1815:        pe->object, "sections[%i].virtual_address", i);
+        -: 1816:
+    #####: 1817:    set_integer(
+        -: 1818:        yr_le32toh(section->Misc.VirtualSize),
+        -: 1819:        pe->object, "sections[%i].virtual_size", i);
+        -: 1820:
+    #####: 1821:    set_integer(
+        -: 1822:        yr_le32toh(section->PointerToRelocations),
+        -: 1823:        pe->object, "sections[%i].pointer_to_relocations", i);
+        -: 1824:
+    #####: 1825:    set_integer(
+        -: 1826:        yr_le32toh(section->PointerToLinenumbers),
+        -: 1827:        pe->object, "sections[%i].pointer_to_line_numbers", i);
+        -: 1828:
+    #####: 1829:    set_integer(
+        -: 1830:        yr_le32toh(section->NumberOfRelocations),
+        -: 1831:        pe->object, "sections[%i].number_of_relocations", i);
+        -: 1832:
+    #####: 1833:    set_integer(
+        -: 1834:        yr_le32toh(section->NumberOfLinenumbers),
+        -: 1835:        pe->object, "sections[%i].number_of_line_numbers", i);
+        -: 1836:
+        -: 1837:    // This will catch the section with the highest raw offset to help checking
+        -: 1838:    // if overlay data is present. If two sections have the same raw pointer
+        -: 1839:    // but different raw sizes the largest one is used. An example of this case
+        -: 1840:    // is file: cf62bf1815a93e68e6c5189f689286b66c4088b9507cf3ecf835e4ac3f9ededa
+        -: 1841:
+    #####: 1842:    section_end = yr_le32toh(section->PointerToRawData) +
+    #####: 1843:                  yr_le32toh(section->SizeOfRawData);
+        -: 1844:
+    #####: 1845:    if (section_end > highest_sec_ofs + highest_sec_siz)
+        -: 1846:    {
+    #####: 1847:      highest_sec_ofs = yr_le32toh(section->PointerToRawData);
+    #####: 1848:      highest_sec_siz = yr_le32toh(section->SizeOfRawData);
+        -: 1849:    }
+        -: 1850:
+    #####: 1851:    section++;
+        -: 1852:  }
+        -: 1853:
+        -: 1854:  // An overlay is data appended to a PE file. Its location is at
+        -: 1855:  // RawData + RawOffset of the last section on the physical file
+    #####: 1856:  last_section_end = highest_sec_siz + highest_sec_ofs;
+        -: 1857:
+        -: 1858:  // "overlay.offset" is set to YR_UNDEFINED for files that do not have an overlay
+    #####: 1859:  if (last_section_end && (pe->data_size > last_section_end))
+    #####: 1860:    set_integer(last_section_end, pe->object, "overlay.offset");
+        -: 1861:
+        -: 1862:  // "overlay.size" is zero for well formed PE files that do not have an
+        -: 1863:  // overlay and YR_UNDEFINED for malformed PE files or non-PE files.
+    #####: 1864:  if (last_section_end && (pe->data_size >= last_section_end))
+    #####: 1865:    set_integer(pe->data_size - last_section_end, pe->object, "overlay.size");
+    #####: 1866:}
+        -: 1867:
+        -: 1868://
+        -: 1869:// Given a posix timestamp argument, make sure not_before <= arg <= not_after
+        -: 1870://
+        -: 1871:
+    #####: 1872:define_function(valid_on)
+        -: 1873:{
+        -: 1874:  int64_t timestamp;
+        -: 1875:  int64_t not_before;
+        -: 1876:  int64_t not_after;
+        -: 1877:
+    #####: 1878:  if (is_undefined(parent(), "not_before") ||
+    #####: 1879:      is_undefined(parent(), "not_after"))
+        -: 1880:  {
+    #####: 1881:    return_integer(YR_UNDEFINED);
+        -: 1882:  }
+        -: 1883:
+    #####: 1884:  timestamp = integer_argument(1);
+        -: 1885:
+    #####: 1886:  not_before = get_integer(parent(), "not_before");
+    #####: 1887:  not_after = get_integer(parent(), "not_after");
+        -: 1888:
+    #####: 1889:  return_integer(timestamp >= not_before  && timestamp <= not_after);
+        -: 1890:}
+        -: 1891:
+        -: 1892:
+    #####: 1893:define_function(section_index_addr)
+        -: 1894:{
+    #####: 1895:  YR_OBJECT* module = module();
+    #####: 1896:  YR_SCAN_CONTEXT* context = scan_context();
+        -: 1897:
+        -: 1898:  int i;
+        -: 1899:  int64_t offset;
+        -: 1900:  int64_t size;
+        -: 1901:
+    #####: 1902:  int64_t addr = integer_argument(1);
+    #####: 1903:  int64_t n = get_integer(module, "number_of_sections");
+        -: 1904:
+    #####: 1905:  if (is_undefined(module, "number_of_sections"))
+    #####: 1906:    return_integer(YR_UNDEFINED);
+        -: 1907:
+    #####: 1908:  for (i = 0; i < yr_min(n, MAX_PE_SECTIONS); i++)
+        -: 1909:  {
+    #####: 1910:    if (context->flags & SCAN_FLAGS_PROCESS_MEMORY)
+        -: 1911:    {
+    #####: 1912:      offset = get_integer(module, "sections[%i].virtual_address", i);
+    #####: 1913:      size = get_integer(module, "sections[%i].virtual_size", i);
+        -: 1914:    }
+        -: 1915:    else
+        -: 1916:    {
+    #####: 1917:      offset = get_integer(module, "sections[%i].raw_data_offset", i);
+    #####: 1918:      size = get_integer(module, "sections[%i].raw_data_size", i);
+        -: 1919:    }
+        -: 1920:
+    #####: 1921:    if (addr >= offset && addr < offset + size)
+    #####: 1922:      return_integer(i);
+        -: 1923:  }
+        -: 1924:
+    #####: 1925:  return_integer(YR_UNDEFINED);
+        -: 1926:}
+        -: 1927:
+        -: 1928:
+    #####: 1929:define_function(section_index_name)
+        -: 1930:{
+    #####: 1931:  YR_OBJECT* module = module();
+        -: 1932:
+    #####: 1933:  char* name = string_argument(1);
+        -: 1934:
+    #####: 1935:  int64_t n = get_integer(module, "number_of_sections");
+        -: 1936:  int i;
+        -: 1937:
+    #####: 1938:  if (is_undefined(module, "number_of_sections"))
+    #####: 1939:    return_integer(YR_UNDEFINED);
+        -: 1940:
+    #####: 1941:  for (i = 0; i < yr_min(n, MAX_PE_SECTIONS); i++)
+        -: 1942:  {
+    #####: 1943:    SIZED_STRING* sect = get_string(module, "sections[%i].name", i);
+        -: 1944:
+    #####: 1945:    if (sect != NULL && strcmp(name, sect->c_string) == 0)
+    #####: 1946:      return_integer(i);
+        -: 1947:  }
+        -: 1948:
+    #####: 1949:  return_integer(YR_UNDEFINED);
+        -: 1950:}
+        -: 1951:
+        -: 1952:
+    #####: 1953:define_function(exports)
+        -: 1954:{
+    #####: 1955:  SIZED_STRING* search_name = sized_string_argument(1);
+        -: 1956:
+    #####: 1957:  SIZED_STRING* function_name = NULL;
+    #####: 1958:  YR_OBJECT* module = module();
+    #####: 1959:  PE* pe = (PE*) module->data;
+        -: 1960:
+        -: 1961:  int i, n;
+        -: 1962:
+        -: 1963:  // If not a PE, return YR_UNDEFINED.
+    #####: 1964:  if (pe == NULL)
+    #####: 1965:    return_integer(YR_UNDEFINED);
+        -: 1966:
+        -: 1967:  // If PE, but no exported functions, return false.
+    #####: 1968:  n = get_integer(module, "number_of_exports");
+    #####: 1969:  if (n == 0)
+    #####: 1970:    return_integer(0);
+        -: 1971:
+    #####: 1972:  for (i = 0; i < n; i++)
+        -: 1973:  {
+    #####: 1974:    function_name = get_string(module, "export_details[%i].name", i);
+    #####: 1975:    if (function_name == NULL)
+    #####: 1976:      continue;
+        -: 1977:
+    #####: 1978:    if (sized_string_cmp_nocase(function_name, search_name) == 0)
+        -: 1979:    {
+    #####: 1980:      return_integer(1);
+        -: 1981:    }
+        -: 1982:  }
+        -: 1983:
+    #####: 1984:  return_integer(0);
+        -: 1985:}
+        -: 1986:
+        -: 1987:
+    #####: 1988:define_function(exports_regexp)
+        -: 1989:{
+    #####: 1990:  RE* regex = regexp_argument(1);
+        -: 1991:
+    #####: 1992:  SIZED_STRING* function_name = NULL;
+    #####: 1993:  YR_OBJECT* module = module();
+    #####: 1994:  PE* pe = (PE*) module->data;
+        -: 1995:
+        -: 1996:  int i, n;
+        -: 1997:
+        -: 1998:  // If not a PE, return YR_UNDEFINED.
+    #####: 1999:  if (pe == NULL)
+    #####: 2000:    return_integer(YR_UNDEFINED);
+        -: 2001:
+        -: 2002:  // If PE, but no exported functions, return false.
+    #####: 2003:  n = get_integer(module, "number_of_exports");
+    #####: 2004:  if (n == 0)
+    #####: 2005:    return_integer(0);
+        -: 2006:
+    #####: 2007:  for (i = 0; i < n; i++)
+        -: 2008:  {
+    #####: 2009:    function_name = get_string(module, "export_details[%i].name", i);
+    #####: 2010:    if (function_name == NULL)
+    #####: 2011:      continue;
+        -: 2012:
+    #####: 2013:    if (yr_re_match(scan_context(), regex, function_name->c_string) != -1)
+        -: 2014:    {
+    #####: 2015:      return_integer(1);
+        -: 2016:    }
+        -: 2017:  }
+        -: 2018:
+    #####: 2019:  return_integer(0);
+        -: 2020:}
+        -: 2021:
+        -: 2022:
+    #####: 2023:define_function(exports_ordinal)
+        -: 2024:{
+    #####: 2025:  uint64_t ordinal = integer_argument(1);
+        -: 2026:
+    #####: 2027:  YR_OBJECT* module = module();
+    #####: 2028:  PE* pe = (PE*) module->data;
+        -: 2029:  int i, n, exported_ordinal;
+        -: 2030:
+        -: 2031:  // If not a PE, return YR_UNDEFINED.
+    #####: 2032:  if (pe == NULL)
+    #####: 2033:    return_integer(YR_UNDEFINED);
+        -: 2034:
+        -: 2035:  // If PE, but no exported functions, return false.
+    #####: 2036:  n = get_integer(module, "number_of_exports");
+    #####: 2037:  if (n == 0)
+    #####: 2038:    return_integer(0);
+        -: 2039:
+    #####: 2040:  if (ordinal == 0 || ordinal > n)
+    #####: 2041:    return_integer(0);
+        -: 2042:
+    #####: 2043:  for (i = 0; i < n; i++)
+        -: 2044:  {
+    #####: 2045:    exported_ordinal = yr_object_get_integer(
+        -: 2046:        module, "export_details[%i].ordinal", i);
+    #####: 2047:    if (exported_ordinal == ordinal)
+    #####: 2048:      return_integer(1);
+        -: 2049:  }
+        -: 2050:
+    #####: 2051:  return_integer(0);
+        -: 2052:}
+        -: 2053:
+        -: 2054:
+    #####: 2055:define_function(exports_index_name)
+        -: 2056:{
+    #####: 2057:  SIZED_STRING* search_name = sized_string_argument(1);
+        -: 2058:
+    #####: 2059:  SIZED_STRING* function_name = NULL;
+    #####: 2060:  YR_OBJECT* module = module();
+    #####: 2061:  PE* pe = (PE*) module->data;
+        -: 2062:
+        -: 2063:  int i, n;
+        -: 2064:
+        -: 2065:  // If not a PE, return YR_UNDEFINED.
+    #####: 2066:  if (pe == NULL)
+    #####: 2067:    return_integer(YR_UNDEFINED);
+        -: 2068:
+        -: 2069:  // If PE, but no exported functions, return false.
+    #####: 2070:  n = get_integer(module, "number_of_exports");
+    #####: 2071:  if (n == 0)
+    #####: 2072:    return_integer(YR_UNDEFINED);
+        -: 2073:
+    #####: 2074:  for (i = 0; i < n; i++)
+        -: 2075:  {
+    #####: 2076:    function_name = get_string(module, "export_details[%i].name", i);
+    #####: 2077:    if (function_name == NULL)
+    #####: 2078:      continue;
+        -: 2079:
+    #####: 2080:    if (sized_string_cmp_nocase(function_name, search_name) == 0)
+        -: 2081:    {
+    #####: 2082:      return_integer(i);
+        -: 2083:    }
+        -: 2084:  }
+        -: 2085:
+    #####: 2086:  return_integer(YR_UNDEFINED);
+        -: 2087:}
+        -: 2088:
+        -: 2089:
+    #####: 2090:define_function(exports_index_ordinal)
+        -: 2091:{
+    #####: 2092:  uint64_t ordinal = integer_argument(1);
+        -: 2093:
+    #####: 2094:  YR_OBJECT* module = module();
+    #####: 2095:  PE* pe = (PE*) module->data;
+        -: 2096:  int i, n, exported_ordinal;
+        -: 2097:
+        -: 2098:  // If not a PE, return YR_UNDEFINED.
+    #####: 2099:  if (pe == NULL)
+    #####: 2100:    return_integer(YR_UNDEFINED);
+        -: 2101:
+        -: 2102:  // If PE, but no exported functions, return false.
+    #####: 2103:  n = get_integer(module, "number_of_exports");
+    #####: 2104:  if (n == 0)
+    #####: 2105:    return_integer(YR_UNDEFINED);
+        -: 2106:
+    #####: 2107:  if (ordinal == 0 || ordinal > n)
+    #####: 2108:    return_integer(YR_UNDEFINED);
+        -: 2109:
+    #####: 2110:  for (i = 0; i < n; i++)
+        -: 2111:  {
+    #####: 2112:    exported_ordinal = yr_object_get_integer(
+        -: 2113:        module, "export_details[%i].ordinal", i);
+    #####: 2114:    if (exported_ordinal == ordinal)
+    #####: 2115:      return_integer(i);
+        -: 2116:  }
+        -: 2117:
+    #####: 2118:  return_integer(YR_UNDEFINED);
+        -: 2119:}
+        -: 2120:
+        -: 2121:
+    #####: 2122:define_function(exports_index_regex)
+        -: 2123:{
+    #####: 2124:  RE* regex = regexp_argument(1);
+        -: 2125:
+    #####: 2126:  SIZED_STRING* function_name = NULL;
+    #####: 2127:  YR_OBJECT* module = module();
+    #####: 2128:  PE* pe = (PE*) module->data;
+        -: 2129:
+        -: 2130:  int i, n;
+        -: 2131:
+        -: 2132:  // If not a PE, return YR_UNDEFINED.
+    #####: 2133:  if (pe == NULL)
+    #####: 2134:    return_integer(YR_UNDEFINED);
+        -: 2135:
+        -: 2136:  // If PE, but no exported functions, return false.
+    #####: 2137:  n = get_integer(module, "number_of_exports");
+    #####: 2138:  if (n == 0)
+    #####: 2139:    return_integer(YR_UNDEFINED);
+        -: 2140:
+    #####: 2141:  for (i = 0; i < n; i++)
+        -: 2142:  {
+    #####: 2143:    function_name = get_string(module, "export_details[%i].name", i);
+    #####: 2144:    if (function_name == NULL)
+    #####: 2145:      continue;
+        -: 2146:
+    #####: 2147:    if (yr_re_match(scan_context(), regex, function_name->c_string) != -1)
+        -: 2148:    {
+    #####: 2149:      return_integer(i);
+        -: 2150:    }
+        -: 2151:  }
+        -: 2152:
+    #####: 2153:  return_integer(YR_UNDEFINED);
+        -: 2154:}
+        -: 2155:
+        -: 2156:
+        -: 2157:#if defined(HAVE_LIBCRYPTO) || \
+        -: 2158:    defined(HAVE_WINCRYPT_H) || \
+        -: 2159:    defined(HAVE_COMMONCRYPTO_COMMONCRYPTO_H)
+        -: 2160:
+        -: 2161://
+        -: 2162:// Generate an import hash:
+        -: 2163:// https://www.mandiant.com/blog/tracking-malware-import-hashing/
+        -: 2164:// It is important to make duplicates of the strings as we don't want
+        -: 2165:// to alter the contents of the parsed import structures.
+        -: 2166://
+        -: 2167:
+    #####: 2168:define_function(imphash)
+        -: 2169:{
+    #####: 2170:  YR_OBJECT* module = module();
+        -: 2171:
+        -: 2172:  IMPORTED_DLL* dll;
+        -: 2173:  yr_md5_ctx ctx;
+        -: 2174:
+        -: 2175:  unsigned char digest[YR_MD5_LEN];
+        -: 2176:  char* digest_ascii;
+        -: 2177:
+        -: 2178:  size_t i;
+    #####: 2179:  bool first = true;
+        -: 2180:
+    #####: 2181:  PE* pe = (PE*) module->data;
+        -: 2182:
+        -: 2183:  // If not a PE, return YR_UNDEFINED.
+        -: 2184:
+    #####: 2185:  if (!pe)
+    #####: 2186:    return_string(YR_UNDEFINED);
+        -: 2187:
+        -: 2188:  // Lookup in cache first.
+    #####: 2189:  digest_ascii = (char*) yr_hash_table_lookup(
+        -: 2190:      pe->hash_table,
+        -: 2191:      "imphash",
+        -: 2192:      NULL);
+        -: 2193:
+    #####: 2194:  if (digest_ascii != NULL)
+    #####: 2195:    return_string(digest_ascii);
+        -: 2196:
+    #####: 2197:  yr_md5_init(&ctx);
+        -: 2198:
+    #####: 2199:  dll = pe->imported_dlls;
+        -: 2200:
+    #####: 2201:  while (dll)
+        -: 2202:  {
+        -: 2203:    IMPORT_FUNCTION* func;
+        -: 2204:
+        -: 2205:    size_t dll_name_len;
+        -: 2206:    char* dll_name;
+        -: 2207:
+        -: 2208:    // If extension is 'ocx', 'sys' or 'dll', chop it.
+        -: 2209:
+    #####: 2210:    char* ext = strstr(dll->name, ".");
+        -: 2211:
+    #####: 2212:    if (ext && (strncasecmp(ext, ".ocx", 4) == 0 ||
+    #####: 2213:                strncasecmp(ext, ".sys", 4) == 0 ||
+    #####: 2214:                strncasecmp(ext, ".dll", 4) == 0))
+        -: 2215:    {
+    #####: 2216:      dll_name_len = (ext - dll->name);
+        -: 2217:    }
+        -: 2218:    else
+        -: 2219:    {
+    #####: 2220:      dll_name_len = strlen(dll->name);
+        -: 2221:    }
+        -: 2222:
+        -: 2223:    // Allocate a new string to hold the dll name.
+        -: 2224:
+    #####: 2225:    dll_name = (char *) yr_malloc(dll_name_len + 1);
+        -: 2226:
+    #####: 2227:    if (!dll_name)
+    #####: 2228:      return ERROR_INSUFFICIENT_MEMORY;
+        -: 2229:
+    #####: 2230:    strlcpy(dll_name, dll->name, dll_name_len + 1);
+        -: 2231:
+    #####: 2232:    func = dll->functions;
+        -: 2233:
+    #####: 2234:    while (func)
+        -: 2235:    {
+        -: 2236:      char* final_name;
+    #####: 2237:      size_t final_name_len = dll_name_len + strlen(func->name) + 1;
+        -: 2238:
+    #####: 2239:      if (!first)
+    #####: 2240:        final_name_len++;   // Additional byte to accommodate the extra comma
+        -: 2241:
+    #####: 2242:      final_name = (char*) yr_malloc(final_name_len + 1);
+        -: 2243:
+    #####: 2244:      if (final_name == NULL)
+    #####: 2245:        break;
+        -: 2246:
+    #####: 2247:      sprintf(final_name, first ? "%s.%s": ",%s.%s", dll_name, func->name);
+        -: 2248:
+        -: 2249:      // Lowercase the whole thing.
+        -: 2250:
+    #####: 2251:      for (i = 0; i < final_name_len; i++)
+    #####: 2252:        final_name[i] = tolower(final_name[i]);
+        -: 2253:
+    #####: 2254:      yr_md5_update(&ctx, final_name, final_name_len);
+        -: 2255:
+    #####: 2256:      yr_free(final_name);
+        -: 2257:
+    #####: 2258:      func = func->next;
+    #####: 2259:      first = false;
+        -: 2260:    }
+        -: 2261:
+    #####: 2262:    yr_free(dll_name);
+        -: 2263:
+    #####: 2264:    dll = dll->next;
+        -: 2265:  }
+        -: 2266:
+    #####: 2267:  yr_md5_final(digest, &ctx);
+        -: 2268:
+    #####: 2269:  digest_ascii = (char*) yr_malloc(YR_MD5_LEN * 2 + 1);
+        -: 2270:
+    #####: 2271:  if (digest_ascii == NULL)
+    #####: 2272:    return ERROR_INSUFFICIENT_MEMORY;
+        -: 2273:
+        -: 2274:  // Transform the binary digest to ascii
+        -: 2275:
+    #####: 2276:  for (i = 0; i < YR_MD5_LEN; i++)
+        -: 2277:  {
+    #####: 2278:    sprintf(digest_ascii + (i * 2), "%02x", digest[i]);
+        -: 2279:  }
+        -: 2280:
+    #####: 2281:  digest_ascii[YR_MD5_LEN * 2] = '\0';
+        -: 2282:
+    #####: 2283:  yr_hash_table_add(pe->hash_table, "imphash", NULL, digest_ascii);
+        -: 2284:
+    #####: 2285:  return_string(digest_ascii);
+        -: 2286:}
+        -: 2287:
+        -: 2288:#endif  // defined(HAVE_LIBCRYPTO) || defined(HAVE_WINCRYPT_H)
+        -: 2289:
+        -: 2290:
+    #####: 2291:define_function(imports)
+        -: 2292:{
+    #####: 2293:  char* dll_name = string_argument(1);
+    #####: 2294:  char* function_name = string_argument(2);
+        -: 2295:
+    #####: 2296:  YR_OBJECT* module = module();
+    #####: 2297:  PE* pe = (PE*) module->data;
+        -: 2298:
+        -: 2299:  IMPORTED_DLL* imported_dll;
+        -: 2300:
+    #####: 2301:  if (!pe)
+    #####: 2302:    return_integer(YR_UNDEFINED);
+        -: 2303:
+    #####: 2304:  imported_dll = pe->imported_dlls;
+        -: 2305:
+    #####: 2306:  while (imported_dll != NULL)
+        -: 2307:  {
+    #####: 2308:    if (strcasecmp(imported_dll->name, dll_name) == 0)
+        -: 2309:    {
+    #####: 2310:      IMPORT_FUNCTION* imported_func = imported_dll->functions;
+        -: 2311:
+    #####: 2312:      while (imported_func != NULL)
+        -: 2313:      {
+    #####: 2314:        if (imported_func->name &&
+    #####: 2315:            strcasecmp(imported_func->name, function_name) == 0)
+    #####: 2316:          return_integer(1);
+        -: 2317:
+    #####: 2318:        imported_func = imported_func->next;
+        -: 2319:      }
+        -: 2320:    }
+        -: 2321:
+    #####: 2322:    imported_dll = imported_dll->next;
+        -: 2323:  }
+        -: 2324:
+    #####: 2325:  return_integer(0);
+        -: 2326:}
+        -: 2327:
+    #####: 2328:define_function(imports_ordinal)
+        -: 2329:{
+    #####: 2330:  char* dll_name = string_argument(1);
+    #####: 2331:  uint64_t ordinal = integer_argument(2);
+        -: 2332:
+    #####: 2333:  YR_OBJECT* module = module();
+    #####: 2334:  PE* pe = (PE*) module->data;
+        -: 2335:
+        -: 2336:  IMPORTED_DLL* imported_dll;
+        -: 2337:
+    #####: 2338:  if (!pe)
+    #####: 2339:    return_integer(YR_UNDEFINED);
+        -: 2340:
+    #####: 2341:  imported_dll = pe->imported_dlls;
+        -: 2342:
+    #####: 2343:  while (imported_dll != NULL)
+        -: 2344:  {
+    #####: 2345:    if (strcasecmp(imported_dll->name, dll_name) == 0)
+        -: 2346:    {
+    #####: 2347:      IMPORT_FUNCTION* imported_func = imported_dll->functions;
+        -: 2348:
+    #####: 2349:      while (imported_func != NULL)
+        -: 2350:      {
+    #####: 2351:        if (imported_func->has_ordinal && imported_func->ordinal == ordinal)
+    #####: 2352:          return_integer(1);
+        -: 2353:
+    #####: 2354:        imported_func = imported_func->next;
+        -: 2355:      }
+        -: 2356:    }
+        -: 2357:
+    #####: 2358:    imported_dll = imported_dll->next;
+        -: 2359:  }
+        -: 2360:
+    #####: 2361:  return_integer(0);
+        -: 2362:}
+        -: 2363:
+    #####: 2364:define_function(imports_regex)
+        -: 2365:{
+    #####: 2366:  YR_OBJECT* module = module();
+    #####: 2367:  PE* pe = (PE*)module->data;
+        -: 2368:
+        -: 2369:  IMPORTED_DLL* imported_dll;
+    #####: 2370:  uint64_t imported_func_count = 0;
+        -: 2371:
+    #####: 2372:  if (!pe)
+    #####: 2373:    return_integer(YR_UNDEFINED);
+        -: 2374:
+    #####: 2375:  imported_dll = pe->imported_dlls;
+        -: 2376:
+    #####: 2377:  while (imported_dll != NULL)
+        -: 2378:  {
+    #####: 2379:    if (yr_re_match(scan_context(), regexp_argument(1), imported_dll->name) > 0)
+        -: 2380:    {
+    #####: 2381:      IMPORT_FUNCTION* imported_func = imported_dll->functions;
+        -: 2382:
+    #####: 2383:      while (imported_func != NULL)
+        -: 2384:      {
+    #####: 2385:        if (yr_re_match(scan_context(), regexp_argument(2), imported_func->name) > 0)
+    #####: 2386:          imported_func_count++;
+    #####: 2387:        imported_func = imported_func->next;
+        -: 2388:      }
+        -: 2389:    }
+        -: 2390:
+    #####: 2391:    imported_dll = imported_dll->next;
+        -: 2392:  }
+        -: 2393:
+    #####: 2394:  return_integer(imported_func_count);
+        -: 2395:}
+        -: 2396:
+    #####: 2397:define_function(imports_dll)
+        -: 2398:{
+    #####: 2399:  char* dll_name = string_argument(1);
+        -: 2400:
+    #####: 2401:  YR_OBJECT* module = module();
+    #####: 2402:  PE* pe = (PE*) module->data;
+        -: 2403:
+        -: 2404:  IMPORTED_DLL* imported_dll;
+    #####: 2405:  uint64_t imported_func_count = 0;
+        -: 2406:
+    #####: 2407:  if (!pe)
+    #####: 2408:    return_integer(YR_UNDEFINED);
+        -: 2409:
+    #####: 2410:  imported_dll = pe->imported_dlls;
+        -: 2411:
+    #####: 2412:  while (imported_dll != NULL)
+        -: 2413:  {
+    #####: 2414:    if (strcasecmp(imported_dll->name, dll_name) == 0)
+        -: 2415:    {
+    #####: 2416:      IMPORT_FUNCTION* imported_func = imported_dll->functions;
+        -: 2417:
+    #####: 2418:      while (imported_func != NULL)
+        -: 2419:      {
+    #####: 2420:        imported_func_count++;
+    #####: 2421:        imported_func = imported_func->next;
+        -: 2422:      }
+        -: 2423:    }
+        -: 2424:
+    #####: 2425:    imported_dll = imported_dll->next;
+        -: 2426:  }
+        -: 2427:
+    #####: 2428:  return_integer(imported_func_count);
+        -: 2429:}
+        -: 2430:
+    #####: 2431:define_function(locale)
+        -: 2432:{
+    #####: 2433:  YR_OBJECT* module = module();
+    #####: 2434:  PE* pe = (PE*) module->data;
+        -: 2435:
+    #####: 2436:  uint64_t locale = integer_argument(1);
+        -: 2437:  int64_t n, i;
+        -: 2438:
+    #####: 2439:  if (is_undefined(module, "number_of_resources"))
+    #####: 2440:    return_integer(YR_UNDEFINED);
+        -: 2441:
+        -: 2442:  // If not a PE file, return YR_UNDEFINED
+        -: 2443:
+    #####: 2444:  if (pe == NULL)
+    #####: 2445:    return_integer(YR_UNDEFINED);
+        -: 2446:
+    #####: 2447:  n = get_integer(module, "number_of_resources");
+        -: 2448:
+    #####: 2449:  for (i = 0; i < n; i++)
+        -: 2450:  {
+    #####: 2451:    uint64_t rsrc_language = get_integer(
+        -: 2452:        module, "resources[%" PRIi32 "].language",  (int32_t)i);
+        -: 2453:
+    #####: 2454:    if ((rsrc_language & 0xFFFF) == locale)
+    #####: 2455:      return_integer(1);
+        -: 2456:  }
+        -: 2457:
+    #####: 2458:  return_integer(0);
+        -: 2459:}
+        -: 2460:
+        -: 2461:
+    #####: 2462:define_function(language)
+        -: 2463:{
+    #####: 2464:  YR_OBJECT* module = module();
+    #####: 2465:  PE* pe = (PE*) module->data;
+        -: 2466:
+    #####: 2467:  uint64_t language = integer_argument(1);
+        -: 2468:  int64_t n, i;
+        -: 2469:
+    #####: 2470:  if (is_undefined(module, "number_of_resources"))
+    #####: 2471:    return_integer(YR_UNDEFINED);
+        -: 2472:
+        -: 2473:  // If not a PE file, return YR_UNDEFINED
+        -: 2474:
+    #####: 2475:  if (pe == NULL)
+    #####: 2476:    return_integer(YR_UNDEFINED);
+        -: 2477:
+    #####: 2478:  n = get_integer(module, "number_of_resources");
+        -: 2479:
+    #####: 2480:  for (i = 0; i < n; i++)
+        -: 2481:  {
+    #####: 2482:    uint64_t rsrc_language = get_integer(
+        -: 2483:        module, "resources[%" PRIi32 "].language", (int32_t)i);
+        -: 2484:
+    #####: 2485:    if ((rsrc_language & 0xFF) == language)
+    #####: 2486:      return_integer(1);
+        -: 2487:  }
+        -: 2488:
+    #####: 2489:  return_integer(0);
+        -: 2490:}
+        -: 2491:
+        -: 2492:
+    #####: 2493:define_function(is_dll)
+        -: 2494:{
+        -: 2495:  int64_t characteristics;
+    #####: 2496:  YR_OBJECT* module = module();
+        -: 2497:
+    #####: 2498:  if (is_undefined(module, "characteristics"))
+    #####: 2499:    return_integer(YR_UNDEFINED);
+        -: 2500:
+    #####: 2501:  characteristics = get_integer(module, "characteristics");
+    #####: 2502:  return_integer(characteristics & IMAGE_FILE_DLL);
+        -: 2503:}
+        -: 2504:
+        -: 2505:
+    #####: 2506:define_function(is_32bit)
+        -: 2507:{
+    #####: 2508:  YR_OBJECT* module = module();
+    #####: 2509:  PE* pe = (PE*) module->data;
+        -: 2510:
+    #####: 2511:  if (pe == NULL)
+    #####: 2512:    return_integer(YR_UNDEFINED);
+        -: 2513:
+    #####: 2514:  return_integer(IS_64BITS_PE(pe) ? 0 : 1);
+        -: 2515:}
+        -: 2516:
+        -: 2517:
+    #####: 2518:define_function(is_64bit)
+        -: 2519:{
+    #####: 2520:  YR_OBJECT* module = module();
+    #####: 2521:  PE* pe = (PE*) module->data;
+        -: 2522:
+    #####: 2523:  if (pe == NULL)
+    #####: 2524:    return_integer(YR_UNDEFINED);
+        -: 2525:
+    #####: 2526:  return_integer(IS_64BITS_PE(pe) ? 1 : 0);
+        -: 2527:}
+        -: 2528:
+        -: 2529:
+        -: 2530:// _rich_version
+        -: 2531://
+        -: 2532:// Returns the number of rich signatures that match the specified version and
+        -: 2533:// toolid numbers.
+        -: 2534://
+    #####: 2535:static uint64_t _rich_version(
+        -: 2536:    YR_OBJECT* module,
+        -: 2537:    uint64_t version,
+        -: 2538:    uint64_t toolid)
+        -: 2539:{
+        -: 2540:  int64_t rich_length;
+        -: 2541:  int64_t rich_count;
+        -: 2542:
+        -: 2543:  int i;
+        -: 2544:
+        -: 2545:  PRICH_SIGNATURE clear_rich_signature;
+        -: 2546:  SIZED_STRING* rich_string;
+        -: 2547:
+    #####: 2548:  uint64_t result = 0;
+        -: 2549:
+        -: 2550:  // Check if the required fields are set
+    #####: 2551:  if (is_undefined(module, "rich_signature.length"))
+    #####: 2552:      return YR_UNDEFINED;
+        -: 2553:
+    #####: 2554:  rich_length = get_integer(module, "rich_signature.length");
+    #####: 2555:  rich_string = get_string(module, "rich_signature.clear_data");
+        -: 2556:
+        -: 2557:  // If the clear_data was not set, return YR_UNDEFINED
+    #####: 2558:  if (rich_string == NULL)
+    #####: 2559:      return YR_UNDEFINED;
+        -: 2560:
+    #####: 2561:  if (version == YR_UNDEFINED && toolid == YR_UNDEFINED)
+    #####: 2562:      return false;
+        -: 2563:
+    #####: 2564:  clear_rich_signature = (PRICH_SIGNATURE) rich_string->c_string;
+        -: 2565:
+        -: 2566:  // Loop over the versions in the rich signature
+        -: 2567:
+    #####: 2568:  rich_count = \
+    #####: 2569:      (rich_length - sizeof(RICH_SIGNATURE)) / sizeof(RICH_VERSION_INFO);
+        -: 2570:
+    #####: 2571:  for (i = 0; i < rich_count; i++)
+        -: 2572:  {
+    #####: 2573:    DWORD id_version = yr_le32toh(clear_rich_signature->versions[i].id_version);
+        -: 2574:
+    #####: 2575:    int match_version = (version == RICH_VERSION_VERSION(id_version));
+    #####: 2576:    int match_toolid = (toolid == RICH_VERSION_ID(id_version));
+        -: 2577:
+    #####: 2578:    if ((version == YR_UNDEFINED || match_version) &&
+    #####: 2579:        (toolid == YR_UNDEFINED || match_toolid))
+        -: 2580:    {
+    #####: 2581:      result += yr_le32toh(clear_rich_signature->versions[i].times);
+        -: 2582:    }
+        -: 2583:  }
+        -: 2584:
+    #####: 2585:  return result;
+        -: 2586:}
+        -: 2587:
+        -: 2588:
+    #####: 2589:define_function(rich_version)
+        -: 2590:{
+    #####: 2591:  return_integer(
+        -: 2592:      _rich_version(module(), integer_argument(1), YR_UNDEFINED));
+        -: 2593:}
+        -: 2594:
+        -: 2595:
+    #####: 2596:define_function(rich_version_toolid)
+        -: 2597:{
+    #####: 2598:  return_integer(
+        -: 2599:      _rich_version(module(), integer_argument(1), integer_argument(2)));
+        -: 2600:}
+        -: 2601:
+        -: 2602:
+    #####: 2603:define_function(rich_toolid)
+        -: 2604:{
+    #####: 2605:  return_integer(
+        -: 2606:      _rich_version(module(), YR_UNDEFINED, integer_argument(1)));
+        -: 2607:}
+        -: 2608:
+        -: 2609:
+    #####: 2610:define_function(rich_toolid_version)
+        -: 2611:{
+    #####: 2612:  return_integer(
+        -: 2613:      _rich_version(module(), integer_argument(2), integer_argument(1)));
+        -: 2614:}
+        -: 2615:
+        -: 2616:
+    #####: 2617:define_function(calculate_checksum)
+        -: 2618:{
+    #####: 2619:  YR_OBJECT* module = module();
+    #####: 2620:  PE* pe = (PE*) module->data;
+        -: 2621:
+    #####: 2622:  uint64_t csum = 0;
+        -: 2623:  size_t csum_offset;
+        -: 2624:  size_t i, j;
+        -: 2625:
+    #####: 2626:  if (pe == NULL)
+    #####: 2627:    return_integer(YR_UNDEFINED);
+        -: 2628:
+    #####: 2629:  csum_offset = ((uint8_t*) &(pe->header->OptionalHeader) +
+    #####: 2630:      offsetof(IMAGE_OPTIONAL_HEADER32, CheckSum)) - pe->data;
+        -: 2631:
+    #####: 2632:  for (i = 0; i <= pe->data_size / 4; i++)
+        -: 2633:  {
+        -: 2634:    // Treat the CheckSum field as 0 -- the offset is the same for
+        -: 2635:    // PE32 and PE64.
+        -: 2636:
+    #####: 2637:    if (4 * i == csum_offset)
+    #####: 2638:      continue;
+        -: 2639:
+    #####: 2640:    if (4 * i + 4 <= pe->data_size)
+        -: 2641:    {
+    #####: 2642:      csum += ((uint64_t) pe->data[4 * i] +
+    #####: 2643:          ((uint64_t) pe->data[4 * i + 1] << 8)  +
+    #####: 2644:          ((uint64_t) pe->data[4 * i + 2] << 16) +
+    #####: 2645:          ((uint64_t) pe->data[4 * i + 3] << 24));
+        -: 2646:    }
+        -: 2647:    else
+        -: 2648:    {
+    #####: 2649:      for (j = 0; j < pe->data_size % 4; j++)
+    #####: 2650:        csum += (uint64_t) pe->data[4 * i + j] << (8 * j);
+        -: 2651:    }
+        -: 2652:
+    #####: 2653:    if (csum > 0xffffffff)
+    #####: 2654:      csum = (csum & 0xffffffff) + (csum >> 32);
+        -: 2655:  }
+        -: 2656:
+    #####: 2657:  csum = (csum & 0xffff) + (csum >> 16);
+    #####: 2658:  csum += (csum >> 16);
+    #####: 2659:  csum &= 0xffff;
+    #####: 2660:  csum += pe->data_size;
+        -: 2661:
+    #####: 2662:  return_integer(csum);
+        -: 2663:}
+        -: 2664:
+        -: 2665:
+    #####: 2666:define_function(rva_to_offset)
+        -: 2667:{
+    #####: 2668:  YR_OBJECT* module = module();
+    #####: 2669:  PE* pe = (PE*) module->data;
+        -: 2670:
+        -: 2671:  uint64_t rva, offset;
+        -: 2672:
+    #####: 2673:  if (pe == NULL)
+    #####: 2674:    return_integer(YR_UNDEFINED);
+        -: 2675:
+    #####: 2676:  rva = integer_argument(1);
+    #####: 2677:  offset = pe_rva_to_offset(pe, rva);
+    #####: 2678:  if (offset == -1)
+    #####: 2679:    return_integer(YR_UNDEFINED);
+        -: 2680:
+    #####: 2681:  return_integer(offset);
+        -: 2682:}
+        -: 2683:
+        -: 2684:
+    #####: 2685:begin_declarations;
+        -: 2686:
+    #####: 2687:  declare_integer("MACHINE_UNKNOWN");
+    #####: 2688:  declare_integer("MACHINE_AM33");
+    #####: 2689:  declare_integer("MACHINE_AMD64");
+    #####: 2690:  declare_integer("MACHINE_ARM");
+    #####: 2691:  declare_integer("MACHINE_ARMNT");
+    #####: 2692:  declare_integer("MACHINE_ARM64");
+    #####: 2693:  declare_integer("MACHINE_EBC");
+    #####: 2694:  declare_integer("MACHINE_I386");
+    #####: 2695:  declare_integer("MACHINE_IA64");
+    #####: 2696:  declare_integer("MACHINE_M32R");
+    #####: 2697:  declare_integer("MACHINE_MIPS16");
+    #####: 2698:  declare_integer("MACHINE_MIPSFPU");
+    #####: 2699:  declare_integer("MACHINE_MIPSFPU16");
+    #####: 2700:  declare_integer("MACHINE_POWERPC");
+    #####: 2701:  declare_integer("MACHINE_POWERPCFP");
+    #####: 2702:  declare_integer("MACHINE_R4000");
+    #####: 2703:  declare_integer("MACHINE_SH3");
+    #####: 2704:  declare_integer("MACHINE_SH3DSP");
+    #####: 2705:  declare_integer("MACHINE_SH4");
+    #####: 2706:  declare_integer("MACHINE_SH5");
+    #####: 2707:  declare_integer("MACHINE_THUMB");
+    #####: 2708:  declare_integer("MACHINE_WCEMIPSV2");
+        -: 2709:
+    #####: 2710:  declare_integer("SUBSYSTEM_UNKNOWN");
+    #####: 2711:  declare_integer("SUBSYSTEM_NATIVE");
+    #####: 2712:  declare_integer("SUBSYSTEM_WINDOWS_GUI");
+    #####: 2713:  declare_integer("SUBSYSTEM_WINDOWS_CUI");
+    #####: 2714:  declare_integer("SUBSYSTEM_OS2_CUI");
+    #####: 2715:  declare_integer("SUBSYSTEM_POSIX_CUI");
+    #####: 2716:  declare_integer("SUBSYSTEM_NATIVE_WINDOWS");
+    #####: 2717:  declare_integer("SUBSYSTEM_WINDOWS_CE_GUI");
+    #####: 2718:  declare_integer("SUBSYSTEM_EFI_APPLICATION");
+    #####: 2719:  declare_integer("SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER");
+    #####: 2720:  declare_integer("SUBSYSTEM_EFI_RUNTIME_DRIVER");
+    #####: 2721:  declare_integer("SUBSYSTEM_XBOX");
+    #####: 2722:  declare_integer("SUBSYSTEM_WINDOWS_BOOT_APPLICATION");
+        -: 2723:
+    #####: 2724:  declare_integer("DYNAMIC_BASE");
+    #####: 2725:  declare_integer("FORCE_INTEGRITY");
+    #####: 2726:  declare_integer("NX_COMPAT");
+    #####: 2727:  declare_integer("NO_ISOLATION");
+    #####: 2728:  declare_integer("NO_SEH");
+    #####: 2729:  declare_integer("NO_BIND");
+    #####: 2730:  declare_integer("WDM_DRIVER");
+    #####: 2731:  declare_integer("TERMINAL_SERVER_AWARE");
+        -: 2732:
+    #####: 2733:  declare_integer("RELOCS_STRIPPED");
+    #####: 2734:  declare_integer("EXECUTABLE_IMAGE");
+    #####: 2735:  declare_integer("LINE_NUMS_STRIPPED");
+    #####: 2736:  declare_integer("LOCAL_SYMS_STRIPPED");
+    #####: 2737:  declare_integer("AGGRESIVE_WS_TRIM");
+    #####: 2738:  declare_integer("LARGE_ADDRESS_AWARE");
+    #####: 2739:  declare_integer("BYTES_REVERSED_LO");
+    #####: 2740:  declare_integer("MACHINE_32BIT");
+    #####: 2741:  declare_integer("DEBUG_STRIPPED");
+    #####: 2742:  declare_integer("REMOVABLE_RUN_FROM_SWAP");
+    #####: 2743:  declare_integer("NET_RUN_FROM_SWAP");
+    #####: 2744:  declare_integer("SYSTEM");
+    #####: 2745:  declare_integer("DLL");
+    #####: 2746:  declare_integer("UP_SYSTEM_ONLY");
+    #####: 2747:  declare_integer("BYTES_REVERSED_HI");
+        -: 2748:
+    #####: 2749:  declare_integer("IMAGE_DIRECTORY_ENTRY_EXPORT");
+    #####: 2750:  declare_integer("IMAGE_DIRECTORY_ENTRY_IMPORT");
+    #####: 2751:  declare_integer("IMAGE_DIRECTORY_ENTRY_RESOURCE");
+    #####: 2752:  declare_integer("IMAGE_DIRECTORY_ENTRY_EXCEPTION");
+    #####: 2753:  declare_integer("IMAGE_DIRECTORY_ENTRY_SECURITY");
+    #####: 2754:  declare_integer("IMAGE_DIRECTORY_ENTRY_BASERELOC");
+    #####: 2755:  declare_integer("IMAGE_DIRECTORY_ENTRY_DEBUG");
+    #####: 2756:  declare_integer("IMAGE_DIRECTORY_ENTRY_ARCHITECTURE");
+    #####: 2757:  declare_integer("IMAGE_DIRECTORY_ENTRY_GLOBALPTR");
+    #####: 2758:  declare_integer("IMAGE_DIRECTORY_ENTRY_TLS");
+    #####: 2759:  declare_integer("IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG");
+    #####: 2760:  declare_integer("IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT");
+    #####: 2761:  declare_integer("IMAGE_DIRECTORY_ENTRY_IAT");
+    #####: 2762:  declare_integer("IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT");
+    #####: 2763:  declare_integer("IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR");
+        -: 2764:
+    #####: 2765:  declare_integer("SECTION_CNT_CODE");
+    #####: 2766:  declare_integer("SECTION_CNT_INITIALIZED_DATA");
+    #####: 2767:  declare_integer("SECTION_CNT_UNINITIALIZED_DATA");
+    #####: 2768:  declare_integer("SECTION_GPREL");
+    #####: 2769:  declare_integer("SECTION_MEM_16BIT");
+    #####: 2770:  declare_integer("SECTION_LNK_NRELOC_OVFL");
+    #####: 2771:  declare_integer("SECTION_MEM_DISCARDABLE");
+    #####: 2772:  declare_integer("SECTION_MEM_NOT_CACHED");
+    #####: 2773:  declare_integer("SECTION_MEM_NOT_PAGED");
+    #####: 2774:  declare_integer("SECTION_MEM_SHARED");
+    #####: 2775:  declare_integer("SECTION_MEM_EXECUTE");
+    #####: 2776:  declare_integer("SECTION_MEM_READ");
+    #####: 2777:  declare_integer("SECTION_MEM_WRITE");
+        -: 2778:
+    #####: 2779:  declare_integer("RESOURCE_TYPE_CURSOR");
+    #####: 2780:  declare_integer("RESOURCE_TYPE_BITMAP");
+    #####: 2781:  declare_integer("RESOURCE_TYPE_ICON");
+    #####: 2782:  declare_integer("RESOURCE_TYPE_MENU");
+    #####: 2783:  declare_integer("RESOURCE_TYPE_DIALOG");
+    #####: 2784:  declare_integer("RESOURCE_TYPE_STRING");
+    #####: 2785:  declare_integer("RESOURCE_TYPE_FONTDIR");
+    #####: 2786:  declare_integer("RESOURCE_TYPE_FONT");
+    #####: 2787:  declare_integer("RESOURCE_TYPE_ACCELERATOR");
+    #####: 2788:  declare_integer("RESOURCE_TYPE_RCDATA");
+    #####: 2789:  declare_integer("RESOURCE_TYPE_MESSAGETABLE");
+    #####: 2790:  declare_integer("RESOURCE_TYPE_GROUP_CURSOR");
+    #####: 2791:  declare_integer("RESOURCE_TYPE_GROUP_ICON");
+    #####: 2792:  declare_integer("RESOURCE_TYPE_VERSION");
+    #####: 2793:  declare_integer("RESOURCE_TYPE_DLGINCLUDE");
+    #####: 2794:  declare_integer("RESOURCE_TYPE_PLUGPLAY");
+    #####: 2795:  declare_integer("RESOURCE_TYPE_VXD");
+    #####: 2796:  declare_integer("RESOURCE_TYPE_ANICURSOR");
+    #####: 2797:  declare_integer("RESOURCE_TYPE_ANIICON");
+    #####: 2798:  declare_integer("RESOURCE_TYPE_HTML");
+    #####: 2799:  declare_integer("RESOURCE_TYPE_MANIFEST");
+        -: 2800:
+        -: 2801:
+    #####: 2802:  declare_integer("is_pe");
+    #####: 2803:  declare_integer("machine");
+    #####: 2804:  declare_integer("number_of_sections");
+    #####: 2805:  declare_integer("timestamp");
+    #####: 2806:  declare_integer("pointer_to_symbol_table");
+    #####: 2807:  declare_integer("number_of_symbols");
+    #####: 2808:  declare_integer("size_of_optional_header");
+    #####: 2809:  declare_integer("characteristics");
+        -: 2810:
+    #####: 2811:  declare_integer("entry_point");
+    #####: 2812:  declare_integer("image_base");
+    #####: 2813:  declare_integer("number_of_rva_and_sizes");
+        -: 2814:
+    #####: 2815:  declare_string_dictionary("version_info");
+        -: 2816:
+    #####: 2817:  declare_integer("opthdr_magic");
+    #####: 2818:  declare_integer("size_of_code");
+    #####: 2819:  declare_integer("size_of_initialized_data");
+    #####: 2820:  declare_integer("size_of_uninitialized_data");
+    #####: 2821:  declare_integer("base_of_code");
+    #####: 2822:  declare_integer("base_of_data");
+    #####: 2823:  declare_integer("section_alignment");
+    #####: 2824:  declare_integer("file_alignment");
+        -: 2825:
+    #####: 2826:  begin_struct("linker_version");
+    #####: 2827:    declare_integer("major");
+    #####: 2828:    declare_integer("minor");
+    #####: 2829:  end_struct("linker_version");
+        -: 2830:
+    #####: 2831:  begin_struct("os_version");
+    #####: 2832:    declare_integer("major");
+    #####: 2833:    declare_integer("minor");
+    #####: 2834:  end_struct("os_version");
+        -: 2835:
+    #####: 2836:  begin_struct("image_version");
+    #####: 2837:    declare_integer("major");
+    #####: 2838:    declare_integer("minor");
+    #####: 2839:  end_struct("image_version");
+        -: 2840:
+    #####: 2841:  begin_struct("subsystem_version");
+    #####: 2842:    declare_integer("major");
+    #####: 2843:    declare_integer("minor");
+    #####: 2844:  end_struct("subsystem_version");
+        -: 2845:
+    #####: 2846:  declare_integer("win32_version_value");
+    #####: 2847:  declare_integer("size_of_image");
+    #####: 2848:  declare_integer("size_of_headers");
+        -: 2849:
+    #####: 2850:  declare_integer("checksum");
+    #####: 2851:  declare_function("calculate_checksum", "", "i", calculate_checksum);
+    #####: 2852:  declare_integer("subsystem");
+        -: 2853:
+    #####: 2854:  declare_integer("dll_characteristics");
+    #####: 2855:  declare_integer("size_of_stack_reserve");
+    #####: 2856:  declare_integer("size_of_stack_commit");
+    #####: 2857:  declare_integer("size_of_heap_reserve");
+    #####: 2858:  declare_integer("size_of_heap_commit");
+    #####: 2859:  declare_integer("loader_flags");
+        -: 2860:
+    #####: 2861:  begin_struct_array("data_directories");
+    #####: 2862:    declare_integer("virtual_address");
+    #####: 2863:    declare_integer("size");
+    #####: 2864:  end_struct_array("data_directories");
+        -: 2865:
+    #####: 2866:  begin_struct_array("sections");
+    #####: 2867:    declare_string("name");
+    #####: 2868:    declare_integer("characteristics");
+    #####: 2869:    declare_integer("virtual_address");
+    #####: 2870:    declare_integer("virtual_size");
+    #####: 2871:    declare_integer("raw_data_offset");
+    #####: 2872:    declare_integer("raw_data_size");
+    #####: 2873:    declare_integer("pointer_to_relocations");
+    #####: 2874:    declare_integer("pointer_to_line_numbers");
+    #####: 2875:    declare_integer("number_of_relocations");
+    #####: 2876:    declare_integer("number_of_line_numbers");
+    #####: 2877:  end_struct_array("sections");
+        -: 2878:
+    #####: 2879:  begin_struct("overlay");
+    #####: 2880:    declare_integer("offset");
+    #####: 2881:    declare_integer("size");
+    #####: 2882:  end_struct("overlay");
+        -: 2883:
+    #####: 2884:  begin_struct("rich_signature");
+    #####: 2885:    declare_integer("offset");
+    #####: 2886:    declare_integer("length");
+    #####: 2887:    declare_integer("key");
+    #####: 2888:    declare_string("raw_data");
+    #####: 2889:    declare_string("clear_data");
+    #####: 2890:    declare_function("version", "i", "i", rich_version);
+    #####: 2891:    declare_function("version", "ii", "i", rich_version_toolid);
+    #####: 2892:    declare_function("toolid", "i", "i", rich_toolid);
+    #####: 2893:    declare_function("toolid", "ii", "i", rich_toolid_version);
+    #####: 2894:  end_struct("rich_signature");
+        -: 2895:
+        -: 2896:  #if defined(HAVE_LIBCRYPTO) || \
+        -: 2897:      defined(HAVE_WINCRYPT_H) || \
+        -: 2898:      defined(HAVE_COMMONCRYPTO_COMMONCRYPTO_H)
+    #####: 2899:  declare_function("imphash", "", "s", imphash);
+        -: 2900:  #endif
+        -: 2901:
+    #####: 2902:  declare_function("section_index", "s", "i", section_index_name);
+    #####: 2903:  declare_function("section_index", "i", "i", section_index_addr);
+    #####: 2904:  declare_function("exports", "s", "i", exports);
+    #####: 2905:  declare_function("exports", "r", "i", exports_regexp);
+    #####: 2906:  declare_function("exports", "i", "i", exports_ordinal);
+    #####: 2907:  declare_function("exports_index", "s", "i", exports_index_name);
+    #####: 2908:  declare_function("exports_index", "i", "i", exports_index_ordinal);
+    #####: 2909:  declare_function("exports_index", "r", "i", exports_index_regex);
+    #####: 2910:  declare_function("imports", "ss", "i", imports);
+    #####: 2911:  declare_function("imports", "si", "i", imports_ordinal);
+    #####: 2912:  declare_function("imports", "s", "i", imports_dll);
+    #####: 2913:  declare_function("imports", "rr", "i", imports_regex);
+    #####: 2914:  declare_function("locale", "i", "i", locale);
+    #####: 2915:  declare_function("language", "i", "i", language);
+    #####: 2916:  declare_function("is_dll", "", "i", is_dll);
+    #####: 2917:  declare_function("is_32bit", "", "i", is_32bit);
+    #####: 2918:  declare_function("is_64bit", "", "i", is_64bit);
+        -: 2919:
+    #####: 2920:  declare_integer("number_of_imports");
+    #####: 2921:  declare_integer("number_of_exports");
+        -: 2922:
+    #####: 2923:  declare_string("dll_name");
+    #####: 2924:  declare_integer("export_timestamp");
+    #####: 2925:  begin_struct_array("export_details");
+    #####: 2926:    declare_integer("offset");
+    #####: 2927:    declare_string("name");
+    #####: 2928:    declare_string("forward_name");
+    #####: 2929:    declare_integer("ordinal");
+    #####: 2930:  end_struct_array("export_details");
+        -: 2931:
+    #####: 2932:  declare_integer("resource_timestamp");
+        -: 2933:
+    #####: 2934:  begin_struct("resource_version");
+    #####: 2935:    declare_integer("major");
+    #####: 2936:    declare_integer("minor");
+    #####: 2937:  end_struct("resource_version");
+        -: 2938:
+    #####: 2939:  begin_struct_array("resources");
+    #####: 2940:    declare_integer("offset");
+    #####: 2941:    declare_integer("length");
+    #####: 2942:    declare_integer("type");
+    #####: 2943:    declare_integer("id");
+    #####: 2944:    declare_integer("language");
+    #####: 2945:    declare_string("type_string");
+    #####: 2946:    declare_string("name_string");
+    #####: 2947:    declare_string("language_string");
+    #####: 2948:  end_struct_array("resources");
+        -: 2949:
+    #####: 2950:  declare_integer("number_of_resources");
+    #####: 2951:  declare_string("pdb_path");
+        -: 2952:
+        -: 2953:  #if defined(HAVE_LIBCRYPTO) && !defined(BORINGSSL)
+    #####: 2954:  begin_struct_array("signatures");
+    #####: 2955:    declare_string("thumbprint");
+    #####: 2956:    declare_string("issuer");
+    #####: 2957:    declare_string("subject");
+    #####: 2958:    declare_integer("version");
+    #####: 2959:    declare_string("algorithm");
+    #####: 2960:    declare_string("serial");
+    #####: 2961:    declare_integer("not_before");
+    #####: 2962:    declare_integer("not_after");
+    #####: 2963:    declare_function("valid_on", "i", "i", valid_on);
+    #####: 2964:  end_struct_array("signatures");
+        -: 2965:
+    #####: 2966:  declare_integer("number_of_signatures");
+        -: 2967:  #endif
+        -: 2968:
+    #####: 2969:  declare_function("rva_to_offset", "i", "i", rva_to_offset);
+        -: 2970:
+    #####: 2971:end_declarations;
+        -: 2972:
+        -: 2973:
+        6: 2974:int module_initialize(
+        -: 2975:    YR_MODULE* module)
+        -: 2976:{
+        -: 2977:#if defined(HAVE_LIBCRYPTO)
+        -: 2978:  // Not checking return value here because if it fails we will not parse the
+        -: 2979:  // nested signature silently.
+        6: 2980:  OBJ_create(SPC_NESTED_SIGNATURE_OBJID, NULL, NULL);
+        -: 2981:#endif
+        6: 2982:  return ERROR_SUCCESS;
+        -: 2983:}
+        -: 2984:
+        -: 2985:
+        5: 2986:int module_finalize(
+        -: 2987:    YR_MODULE* module)
+        -: 2988:{
+        5: 2989:  return ERROR_SUCCESS;
+        -: 2990:}
+        -: 2991:
+        -: 2992:
+    #####: 2993:int module_load(
+        -: 2994:    YR_SCAN_CONTEXT* context,
+        -: 2995:    YR_OBJECT* module_object,
+        -: 2996:    void* module_data,
+        -: 2997:    size_t module_data_size)
+        -: 2998:{
+        -: 2999:  YR_MEMORY_BLOCK* block;
+    #####: 3000:  YR_MEMORY_BLOCK_ITERATOR* iterator = context->iterator;
+        -: 3001:
+        -: 3002:  PIMAGE_NT_HEADERS32 pe_header;
+    #####: 3003:  const uint8_t* block_data = NULL;
+    #####: 3004:  PE* pe = NULL;
+        -: 3005:
+    #####: 3006:  set_integer(
+        -: 3007:      IMAGE_FILE_MACHINE_UNKNOWN, module_object,
+        -: 3008:      "MACHINE_UNKNOWN");
+    #####: 3009:  set_integer(
+        -: 3010:      IMAGE_FILE_MACHINE_AM33, module_object,
+        -: 3011:      "MACHINE_AM33");
+    #####: 3012:  set_integer(
+        -: 3013:      IMAGE_FILE_MACHINE_AMD64, module_object,
+        -: 3014:      "MACHINE_AMD64");
+    #####: 3015:  set_integer(
+        -: 3016:      IMAGE_FILE_MACHINE_ARM, module_object,
+        -: 3017:      "MACHINE_ARM");
+    #####: 3018:  set_integer(
+        -: 3019:      IMAGE_FILE_MACHINE_ARMNT, module_object,
+        -: 3020:      "MACHINE_ARMNT");
+    #####: 3021:  set_integer(
+        -: 3022:      IMAGE_FILE_MACHINE_ARM64, module_object,
+        -: 3023:      "MACHINE_ARM64");
+    #####: 3024:  set_integer(
+        -: 3025:      IMAGE_FILE_MACHINE_EBC, module_object,
+        -: 3026:      "MACHINE_EBC");
+    #####: 3027:  set_integer(
+        -: 3028:      IMAGE_FILE_MACHINE_I386, module_object,
+        -: 3029:      "MACHINE_I386");
+    #####: 3030:  set_integer(
+        -: 3031:      IMAGE_FILE_MACHINE_IA64, module_object,
+        -: 3032:      "MACHINE_IA64");
+    #####: 3033:  set_integer(
+        -: 3034:      IMAGE_FILE_MACHINE_M32R, module_object,
+        -: 3035:      "MACHINE_M32R");
+    #####: 3036:  set_integer(
+        -: 3037:      IMAGE_FILE_MACHINE_MIPS16, module_object,
+        -: 3038:      "MACHINE_MIPS16");
+    #####: 3039:  set_integer(
+        -: 3040:      IMAGE_FILE_MACHINE_MIPSFPU, module_object,
+        -: 3041:      "MACHINE_MIPSFPU");
+    #####: 3042:  set_integer(
+        -: 3043:      IMAGE_FILE_MACHINE_MIPSFPU16, module_object,
+        -: 3044:      "MACHINE_MIPSFPU16");
+    #####: 3045:  set_integer(
+        -: 3046:      IMAGE_FILE_MACHINE_POWERPC, module_object,
+        -: 3047:      "MACHINE_POWERPC");
+    #####: 3048:  set_integer(
+        -: 3049:      IMAGE_FILE_MACHINE_POWERPCFP, module_object,
+        -: 3050:      "MACHINE_POWERPCFP");
+    #####: 3051:  set_integer(
+        -: 3052:      IMAGE_FILE_MACHINE_R4000, module_object,
+        -: 3053:      "MACHINE_R4000");
+    #####: 3054:  set_integer(
+        -: 3055:      IMAGE_FILE_MACHINE_SH3, module_object,
+        -: 3056:      "MACHINE_SH3");
+    #####: 3057:  set_integer(
+        -: 3058:      IMAGE_FILE_MACHINE_SH3DSP, module_object,
+        -: 3059:      "MACHINE_SH3DSP");
+    #####: 3060:  set_integer(
+        -: 3061:      IMAGE_FILE_MACHINE_SH4, module_object,
+        -: 3062:      "MACHINE_SH4");
+    #####: 3063:  set_integer(
+        -: 3064:      IMAGE_FILE_MACHINE_SH5, module_object,
+        -: 3065:      "MACHINE_SH5");
+    #####: 3066:  set_integer(
+        -: 3067:      IMAGE_FILE_MACHINE_THUMB, module_object,
+        -: 3068:      "MACHINE_THUMB");
+    #####: 3069:  set_integer(
+        -: 3070:      IMAGE_FILE_MACHINE_WCEMIPSV2, module_object,
+        -: 3071:      "MACHINE_WCEMIPSV2");
+        -: 3072:
+    #####: 3073:  set_integer(
+        -: 3074:      IMAGE_SUBSYSTEM_UNKNOWN, module_object,
+        -: 3075:      "SUBSYSTEM_UNKNOWN");
+    #####: 3076:  set_integer(
+        -: 3077:      IMAGE_SUBSYSTEM_NATIVE, module_object,
+        -: 3078:      "SUBSYSTEM_NATIVE");
+    #####: 3079:  set_integer(
+        -: 3080:      IMAGE_SUBSYSTEM_WINDOWS_GUI, module_object,
+        -: 3081:      "SUBSYSTEM_WINDOWS_GUI");
+    #####: 3082:  set_integer(
+        -: 3083:      IMAGE_SUBSYSTEM_WINDOWS_CUI, module_object,
+        -: 3084:      "SUBSYSTEM_WINDOWS_CUI");
+    #####: 3085:  set_integer(
+        -: 3086:      IMAGE_SUBSYSTEM_OS2_CUI, module_object,
+        -: 3087:      "SUBSYSTEM_OS2_CUI");
+    #####: 3088:  set_integer(
+        -: 3089:      IMAGE_SUBSYSTEM_POSIX_CUI, module_object,
+        -: 3090:      "SUBSYSTEM_POSIX_CUI");
+    #####: 3091:  set_integer(
+        -: 3092:      IMAGE_SUBSYSTEM_NATIVE_WINDOWS, module_object,
+        -: 3093:      "SUBSYSTEM_NATIVE_WINDOWS");
+    #####: 3094:  set_integer(
+        -: 3095:      IMAGE_SUBSYSTEM_WINDOWS_CE_GUI, module_object,
+        -: 3096:      "SUBSYSTEM_WINDOWS_CE_GUI");
+    #####: 3097:  set_integer(
+        -: 3098:      IMAGE_SUBSYSTEM_EFI_APPLICATION, module_object,
+        -: 3099:      "SUBSYSTEM_EFI_APPLICATION");
+    #####: 3100:  set_integer(
+        -: 3101:      IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER, module_object,
+        -: 3102:      "SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER");
+    #####: 3103:  set_integer(
+        -: 3104:      IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER, module_object,
+        -: 3105:      "SUBSYSTEM_EFI_RUNTIME_DRIVER");
+    #####: 3106:  set_integer(
+        -: 3107:      IMAGE_SUBSYSTEM_XBOX, module_object,
+        -: 3108:      "SUBSYSTEM_XBOX");
+    #####: 3109:  set_integer(
+        -: 3110:      IMAGE_SUBSYSTEM_WINDOWS_BOOT_APPLICATION, module_object,
+        -: 3111:      "SUBSYSTEM_WINDOWS_BOOT_APPLICATION");
+        -: 3112:
+    #####: 3113:  set_integer(
+        -: 3114:      IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE, module_object,
+        -: 3115:      "DYNAMIC_BASE");
+    #####: 3116:  set_integer(
+        -: 3117:      IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY, module_object,
+        -: 3118:      "FORCE_INTEGRITY");
+    #####: 3119:  set_integer(
+        -: 3120:      IMAGE_DLLCHARACTERISTICS_NX_COMPAT, module_object,
+        -: 3121:      "NX_COMPAT");
+    #####: 3122:  set_integer(
+        -: 3123:      IMAGE_DLLCHARACTERISTICS_NO_ISOLATION, module_object,
+        -: 3124:      "NO_ISOLATION");
+    #####: 3125:  set_integer(
+        -: 3126:      IMAGE_DLLCHARACTERISTICS_NO_SEH, module_object,
+        -: 3127:      "NO_SEH");
+    #####: 3128:  set_integer(
+        -: 3129:      IMAGE_DLLCHARACTERISTICS_NO_BIND, module_object,
+        -: 3130:      "NO_BIND");
+    #####: 3131:  set_integer(
+        -: 3132:      IMAGE_DLLCHARACTERISTICS_WDM_DRIVER, module_object,
+        -: 3133:      "WDM_DRIVER");
+    #####: 3134:  set_integer(
+        -: 3135:      IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE, module_object,
+        -: 3136:      "TERMINAL_SERVER_AWARE");
+        -: 3137:
+    #####: 3138:  set_integer(
+        -: 3139:      IMAGE_FILE_RELOCS_STRIPPED, module_object,
+        -: 3140:      "RELOCS_STRIPPED");
+    #####: 3141:  set_integer(
+        -: 3142:      IMAGE_FILE_EXECUTABLE_IMAGE, module_object,
+        -: 3143:      "EXECUTABLE_IMAGE");
+    #####: 3144:  set_integer(
+        -: 3145:      IMAGE_FILE_LINE_NUMS_STRIPPED, module_object,
+        -: 3146:      "LINE_NUMS_STRIPPED");
+    #####: 3147:  set_integer(
+        -: 3148:      IMAGE_FILE_LOCAL_SYMS_STRIPPED, module_object,
+        -: 3149:      "LOCAL_SYMS_STRIPPED");
+    #####: 3150:  set_integer(
+        -: 3151:      IMAGE_FILE_AGGRESIVE_WS_TRIM, module_object,
+        -: 3152:      "AGGRESIVE_WS_TRIM");
+    #####: 3153:  set_integer(
+        -: 3154:      IMAGE_FILE_LARGE_ADDRESS_AWARE, module_object,
+        -: 3155:      "LARGE_ADDRESS_AWARE");
+    #####: 3156:  set_integer(
+        -: 3157:      IMAGE_FILE_BYTES_REVERSED_LO, module_object,
+        -: 3158:      "BYTES_REVERSED_LO");
+    #####: 3159:  set_integer(
+        -: 3160:      IMAGE_FILE_32BIT_MACHINE, module_object,
+        -: 3161:      "MACHINE_32BIT");
+    #####: 3162:  set_integer(
+        -: 3163:      IMAGE_FILE_DEBUG_STRIPPED, module_object,
+        -: 3164:      "DEBUG_STRIPPED");
+    #####: 3165:  set_integer(
+        -: 3166:      IMAGE_FILE_REMOVABLE_RUN_FROM_SWAP, module_object,
+        -: 3167:      "REMOVABLE_RUN_FROM_SWAP");
+    #####: 3168:  set_integer(
+        -: 3169:      IMAGE_FILE_NET_RUN_FROM_SWAP, module_object,
+        -: 3170:      "NET_RUN_FROM_SWAP");
+    #####: 3171:  set_integer(
+        -: 3172:      IMAGE_FILE_SYSTEM, module_object,
+        -: 3173:      "SYSTEM");
+    #####: 3174:  set_integer(
+        -: 3175:      IMAGE_FILE_DLL, module_object,
+        -: 3176:      "DLL");
+    #####: 3177:  set_integer(
+        -: 3178:      IMAGE_FILE_UP_SYSTEM_ONLY, module_object,
+        -: 3179:      "UP_SYSTEM_ONLY");
+    #####: 3180:  set_integer(
+        -: 3181:      IMAGE_FILE_BYTES_REVERSED_HI, module_object,
+        -: 3182:      "BYTES_REVERSED_HI");
+        -: 3183:
+    #####: 3184:  set_integer(
+        -: 3185:      IMAGE_DIRECTORY_ENTRY_EXPORT, module_object,
+        -: 3186:      "IMAGE_DIRECTORY_ENTRY_EXPORT");
+    #####: 3187:  set_integer(
+        -: 3188:      IMAGE_DIRECTORY_ENTRY_IMPORT, module_object,
+        -: 3189:      "IMAGE_DIRECTORY_ENTRY_IMPORT");
+    #####: 3190:  set_integer(
+        -: 3191:      IMAGE_DIRECTORY_ENTRY_RESOURCE, module_object,
+        -: 3192:      "IMAGE_DIRECTORY_ENTRY_RESOURCE");
+    #####: 3193:  set_integer(
+        -: 3194:      IMAGE_DIRECTORY_ENTRY_EXCEPTION, module_object,
+        -: 3195:      "IMAGE_DIRECTORY_ENTRY_EXCEPTION");
+    #####: 3196:  set_integer(
+        -: 3197:      IMAGE_DIRECTORY_ENTRY_SECURITY, module_object,
+        -: 3198:      "IMAGE_DIRECTORY_ENTRY_SECURITY");
+    #####: 3199:  set_integer(
+        -: 3200:      IMAGE_DIRECTORY_ENTRY_BASERELOC, module_object,
+        -: 3201:      "IMAGE_DIRECTORY_ENTRY_BASERELOC");
+    #####: 3202:  set_integer(
+        -: 3203:      IMAGE_DIRECTORY_ENTRY_DEBUG, module_object,
+        -: 3204:      "IMAGE_DIRECTORY_ENTRY_DEBUG");
+    #####: 3205:  set_integer(
+        -: 3206:      IMAGE_DIRECTORY_ENTRY_ARCHITECTURE, module_object,
+        -: 3207:      "IMAGE_DIRECTORY_ENTRY_ARCHITECTURE");
+    #####: 3208:  set_integer(
+        -: 3209:      IMAGE_DIRECTORY_ENTRY_GLOBALPTR, module_object,
+        -: 3210:      "IMAGE_DIRECTORY_ENTRY_GLOBALPTR");
+    #####: 3211:  set_integer(
+        -: 3212:      IMAGE_DIRECTORY_ENTRY_TLS, module_object,
+        -: 3213:      "IMAGE_DIRECTORY_ENTRY_TLS");
+    #####: 3214:  set_integer(
+        -: 3215:      IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, module_object,
+        -: 3216:      "IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG");
+    #####: 3217:  set_integer(
+        -: 3218:      IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT, module_object,
+        -: 3219:      "IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT");
+    #####: 3220:  set_integer(
+        -: 3221:      IMAGE_DIRECTORY_ENTRY_IAT, module_object,
+        -: 3222:      "IMAGE_DIRECTORY_ENTRY_IAT");
+    #####: 3223:  set_integer(
+        -: 3224:      IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, module_object,
+        -: 3225:      "IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT");
+    #####: 3226:  set_integer(
+        -: 3227:      IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR, module_object,
+        -: 3228:      "IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR");
+        -: 3229:
+    #####: 3230:  set_integer(
+        -: 3231:      IMAGE_SCN_CNT_CODE, module_object,
+        -: 3232:      "SECTION_CNT_CODE");
+    #####: 3233:  set_integer(
+        -: 3234:      IMAGE_SCN_CNT_INITIALIZED_DATA, module_object,
+        -: 3235:      "SECTION_CNT_INITIALIZED_DATA");
+    #####: 3236:  set_integer(
+        -: 3237:      IMAGE_SCN_CNT_UNINITIALIZED_DATA, module_object,
+        -: 3238:      "SECTION_CNT_UNINITIALIZED_DATA");
+    #####: 3239:  set_integer(
+        -: 3240:      IMAGE_SCN_GPREL, module_object,
+        -: 3241:      "SECTION_GPREL");
+    #####: 3242:  set_integer(
+        -: 3243:      IMAGE_SCN_MEM_16BIT, module_object,
+        -: 3244:      "SECTION_MEM_16BIT");
+    #####: 3245:  set_integer(
+        -: 3246:      IMAGE_SCN_LNK_NRELOC_OVFL, module_object,
+        -: 3247:      "SECTION_LNK_NRELOC_OVFL");
+    #####: 3248:  set_integer(
+        -: 3249:      IMAGE_SCN_MEM_DISCARDABLE, module_object,
+        -: 3250:      "SECTION_MEM_DISCARDABLE");
+    #####: 3251:  set_integer(
+        -: 3252:      IMAGE_SCN_MEM_NOT_CACHED, module_object,
+        -: 3253:      "SECTION_MEM_NOT_CACHED");
+    #####: 3254:  set_integer(
+        -: 3255:      IMAGE_SCN_MEM_NOT_PAGED, module_object,
+        -: 3256:      "SECTION_MEM_NOT_PAGED");
+    #####: 3257:  set_integer(
+        -: 3258:      IMAGE_SCN_MEM_SHARED, module_object,
+        -: 3259:      "SECTION_MEM_SHARED");
+    #####: 3260:  set_integer(
+        -: 3261:      IMAGE_SCN_MEM_EXECUTE, module_object,
+        -: 3262:      "SECTION_MEM_EXECUTE");
+    #####: 3263:  set_integer(
+        -: 3264:      IMAGE_SCN_MEM_READ, module_object,
+        -: 3265:      "SECTION_MEM_READ");
+    #####: 3266:  set_integer(
+        -: 3267:      IMAGE_SCN_MEM_WRITE, module_object,
+        -: 3268:      "SECTION_MEM_WRITE");
+        -: 3269:
+    #####: 3270:  set_integer(
+        -: 3271:      RESOURCE_TYPE_CURSOR, module_object,
+        -: 3272:      "RESOURCE_TYPE_CURSOR");
+    #####: 3273:  set_integer(
+        -: 3274:      RESOURCE_TYPE_BITMAP, module_object,
+        -: 3275:      "RESOURCE_TYPE_BITMAP");
+    #####: 3276:  set_integer(
+        -: 3277:      RESOURCE_TYPE_ICON, module_object,
+        -: 3278:      "RESOURCE_TYPE_ICON");
+    #####: 3279:  set_integer(
+        -: 3280:      RESOURCE_TYPE_MENU, module_object,
+        -: 3281:      "RESOURCE_TYPE_MENU");
+    #####: 3282:  set_integer(
+        -: 3283:      RESOURCE_TYPE_DIALOG, module_object,
+        -: 3284:      "RESOURCE_TYPE_DIALOG");
+    #####: 3285:  set_integer(
+        -: 3286:      RESOURCE_TYPE_STRING, module_object,
+        -: 3287:      "RESOURCE_TYPE_STRING");
+    #####: 3288:  set_integer(
+        -: 3289:      RESOURCE_TYPE_FONTDIR, module_object,
+        -: 3290:      "RESOURCE_TYPE_FONTDIR");
+    #####: 3291:  set_integer(
+        -: 3292:      RESOURCE_TYPE_FONT, module_object,
+        -: 3293:      "RESOURCE_TYPE_FONT");
+    #####: 3294:  set_integer(
+        -: 3295:      RESOURCE_TYPE_ACCELERATOR, module_object,
+        -: 3296:      "RESOURCE_TYPE_ACCELERATOR");
+    #####: 3297:  set_integer(
+        -: 3298:      RESOURCE_TYPE_RCDATA, module_object,
+        -: 3299:      "RESOURCE_TYPE_RCDATA");
+    #####: 3300:  set_integer(
+        -: 3301:      RESOURCE_TYPE_MESSAGETABLE, module_object,
+        -: 3302:      "RESOURCE_TYPE_MESSAGETABLE");
+    #####: 3303:  set_integer(
+        -: 3304:      RESOURCE_TYPE_GROUP_CURSOR, module_object,
+        -: 3305:      "RESOURCE_TYPE_GROUP_CURSOR");
+    #####: 3306:  set_integer(
+        -: 3307:      RESOURCE_TYPE_GROUP_ICON, module_object,
+        -: 3308:      "RESOURCE_TYPE_GROUP_ICON");
+    #####: 3309:  set_integer(
+        -: 3310:      RESOURCE_TYPE_VERSION, module_object,
+        -: 3311:      "RESOURCE_TYPE_VERSION");
+    #####: 3312:  set_integer(
+        -: 3313:      RESOURCE_TYPE_DLGINCLUDE, module_object,
+        -: 3314:      "RESOURCE_TYPE_DLGINCLUDE");
+    #####: 3315:  set_integer(
+        -: 3316:      RESOURCE_TYPE_PLUGPLAY, module_object,
+        -: 3317:      "RESOURCE_TYPE_PLUGPLAY");
+    #####: 3318:  set_integer(
+        -: 3319:      RESOURCE_TYPE_VXD, module_object,
+        -: 3320:      "RESOURCE_TYPE_VXD");
+    #####: 3321:  set_integer(
+        -: 3322:      RESOURCE_TYPE_ANICURSOR, module_object,
+        -: 3323:      "RESOURCE_TYPE_ANICURSOR");
+    #####: 3324:  set_integer(
+        -: 3325:      RESOURCE_TYPE_ANIICON, module_object,
+        -: 3326:      "RESOURCE_TYPE_ANIICON");
+    #####: 3327:  set_integer(
+        -: 3328:      RESOURCE_TYPE_HTML, module_object,
+        -: 3329:      "RESOURCE_TYPE_HTML");
+    #####: 3330:  set_integer(
+        -: 3331:      RESOURCE_TYPE_MANIFEST, module_object,
+        -: 3332:      "RESOURCE_TYPE_MANIFEST");
+    #####: 3333:  set_integer(0, module_object, "is_pe");
+        -: 3334:
+    #####: 3335:  foreach_memory_block(iterator, block)
+        -: 3336:  {
+    #####: 3337:    block_data = block->fetch_data(block);
+        -: 3338:
+    #####: 3339:    if (block_data == NULL)
+    #####: 3340:      continue;
+        -: 3341:
+    #####: 3342:    pe_header = pe_get_header(block_data, block->size);
+        -: 3343:
+    #####: 3344:    if (pe_header != NULL)
+        -: 3345:    {
+        -: 3346:      // Ignore DLLs while scanning a process
+        -: 3347:
+    #####: 3348:      if (!(context->flags & SCAN_FLAGS_PROCESS_MEMORY) ||
+    #####: 3349:          !(yr_le16toh(pe_header->FileHeader.Characteristics) & IMAGE_FILE_DLL))
+        -: 3350:      {
+    #####: 3351:        pe = (PE*) yr_malloc(sizeof(PE));
+        -: 3352:
+    #####: 3353:        if (pe == NULL)
+    #####: 3354:          return ERROR_INSUFFICIENT_MEMORY;
+        -: 3355:
+    #####: 3356:        FAIL_ON_ERROR_WITH_CLEANUP(
+        -: 3357:            yr_hash_table_create(17, &pe->hash_table),
+        -: 3358:            yr_free(pe));
+        -: 3359:
+    #####: 3360:        pe->data = block_data;
+    #####: 3361:        pe->data_size = block->size;
+    #####: 3362:        pe->header = pe_header;
+    #####: 3363:        pe->object = module_object;
+    #####: 3364:        pe->resources = 0;
+        -: 3365:
+    #####: 3366:        module_object->data = pe;
+        -: 3367:
+    #####: 3368:        pe_parse_header(pe, block->base, context->flags);
+    #####: 3369:        pe_parse_rich_signature(pe, block->base);
+    #####: 3370:        pe_parse_debug_directory(pe);
+        -: 3371:        
+        -: 3372:        #if defined(HAVE_LIBCRYPTO) && !defined(BORINGSSL)
+    #####: 3373:        pe_parse_certificates(pe);
+        -: 3374:        #endif
+        -: 3375:
+    #####: 3376:        pe->imported_dlls = pe_parse_imports(pe);
+    #####: 3377:        pe_parse_exports(pe);
+        -: 3378:
+    #####: 3379:        break;
+        -: 3380:      }
+        -: 3381:    }
+        -: 3382:  }
+        -: 3383:
+    #####: 3384:  return ERROR_SUCCESS;
+        -: 3385:}
+        -: 3386:
+        -: 3387:
+    #####: 3388:int module_unload(
+        -: 3389:    YR_OBJECT* module_object)
+        -: 3390:{
+    #####: 3391:  IMPORTED_DLL* dll = NULL;
+    #####: 3392:  IMPORTED_DLL* next_dll = NULL;
+    #####: 3393:  IMPORT_FUNCTION* func = NULL;
+    #####: 3394:  IMPORT_FUNCTION* next_func = NULL;
+        -: 3395:
+    #####: 3396:  PE* pe = (PE *) module_object->data;
+        -: 3397:
+    #####: 3398:  if (pe == NULL)
+    #####: 3399:    return ERROR_SUCCESS;
+        -: 3400:
+    #####: 3401:  if (pe->hash_table != NULL)
+    #####: 3402:    yr_hash_table_destroy(
+        -: 3403:        pe->hash_table,
+        -: 3404:        (YR_HASH_TABLE_FREE_VALUE_FUNC) yr_free);
+        -: 3405:
+    #####: 3406:  dll = pe->imported_dlls;
+        -: 3407:
+    #####: 3408:  while (dll)
+        -: 3409:  {
+    #####: 3410:    if (dll->name)
+    #####: 3411:      yr_free(dll->name);
+        -: 3412:
+    #####: 3413:    func = dll->functions;
+        -: 3414:
+    #####: 3415:    while (func)
+        -: 3416:    {
+    #####: 3417:      if (func->name)
+    #####: 3418:        yr_free(func->name);
+        -: 3419:
+    #####: 3420:      next_func = func->next;
+    #####: 3421:      yr_free(func);
+    #####: 3422:      func = next_func;
+        -: 3423:    }
+        -: 3424:
+    #####: 3425:    next_dll = dll->next;
+    #####: 3426:    yr_free(dll);
+    #####: 3427:    dll = next_dll;
+        -: 3428:  }
+        -: 3429:
+    #####: 3430:  yr_free(pe);
+        -: 3431:
+    #####: 3432:  return ERROR_SUCCESS;
+        -: 3433:}

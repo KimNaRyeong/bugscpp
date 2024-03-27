@@ -1,0 +1,725 @@
+        -:    0:Source:arena.c
+        -:    0:Graph:/home/workspace/libyara/arena.gcno
+        -:    0:Data:/home/workspace/libyara/arena.gcda
+        -:    0:Runs:10
+        -:    1:/*
+        -:    2:Copyright (c) 2020. The YARA Authors. All Rights Reserved.
+        -:    3:
+        -:    4:Redistribution and use in source and binary forms, with or without modification,
+        -:    5:are permitted provided that the following conditions are met:
+        -:    6:
+        -:    7:1. Redistributions of source code must retain the above copyright notice, this
+        -:    8:list of conditions and the following disclaimer.
+        -:    9:
+        -:   10:2. Redistributions in binary form must reproduce the above copyright notice,
+        -:   11:this list of conditions and the following disclaimer in the documentation and/or
+        -:   12:other materials provided with the distribution.
+        -:   13:
+        -:   14:3. Neither the name of the copyright holder nor the names of its contributors
+        -:   15:may be used to endorse or promote products derived from this software without
+        -:   16:specific prior written permission.
+        -:   17:
+        -:   18:THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+        -:   19:ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+        -:   20:WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+        -:   21:DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+        -:   22:ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+        -:   23:(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+        -:   24:LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+        -:   25:ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        -:   26:(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+        -:   27:SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        -:   28:*/
+        -:   29:
+        -:   30:
+        -:   31:#include <stdarg.h>
+        -:   32:#include <stddef.h>
+        -:   33:
+        -:   34:#include <yara/arena.h>
+        -:   35:#include <yara/mem.h>
+        -:   36:#include <yara/error.h>
+        -:   37:
+        -:   38:typedef struct YR_ARENA_FILE_HEADER YR_ARENA_FILE_HEADER;
+        -:   39:typedef struct YR_ARENA_FILE_BUFFER YR_ARENA_FILE_BUFFER;
+        -:   40:
+        -:   41:#pragma pack(push)
+        -:   42:#pragma pack(1)
+        -:   43:
+        -:   44:struct YR_ARENA_FILE_HEADER
+        -:   45:{
+        -:   46:  uint8_t magic[4];
+        -:   47:  uint8_t version;
+        -:   48:  uint8_t num_buffers;
+        -:   49:};
+        -:   50:
+        -:   51:struct YR_ARENA_FILE_BUFFER
+        -:   52:{
+        -:   53:  uint64_t offset;
+        -:   54:  uint32_t size;
+        -:   55:};
+        -:   56:
+        -:   57:#pragma pack(pop)
+        -:   58:
+        -:   59:
+        -:   60://
+        -:   61:// _yr_arena_make_ptr_relocatable
+        -:   62://
+        -:   63:// Tells the arena that certain offsets within a buffer contain relocatable
+        -:   64:// pointers. The offsets are passed as a vararg list where the end of the
+        -:   65:// list is indicated by the special value EOL (-1), offsets in the list are
+        -:   66:// relative to base_offset, which in turns is relative to the beginning of the
+        -:   67:// buffer.
+        -:   68://
+        -:   69:// Args:
+        -:   70://    [in]  YR_ARENA* arena     - Pointer the arena.
+        -:   71://    [in]  uint32_t buffer_id  - Buffer number.
+        -:   72://    [in]  size_t base_offset  - Base offset.
+        -:   73://    [in]  va_list offsets     - List of offsets relative to base offset.
+        -:   74://
+        -:   75:// Returns:
+        -:   76://    ERROR_SUCCESS if succeed or the corresponding error code otherwise.
+        -:   77://
+        -:   78:
+      551:   79:static int _yr_arena_make_ptr_relocatable(
+        -:   80:    YR_ARENA* arena,
+        -:   81:    uint32_t buffer_id,
+        -:   82:    yr_arena_off_t base_offset,
+        -:   83:    va_list offsets)
+        -:   84:{
+        -:   85:  yr_arena_off_t offset;
+        -:   86:
+      551:   87:  int result = ERROR_SUCCESS;
+        -:   88:
+      551:   89:  offset = va_arg(offsets, yr_arena_off_t);
+        -:   90:
+     2735:   91:  while (offset != EOL)
+        -:   92:  {
+     2184:   93:    YR_RELOC* reloc = (YR_RELOC*) yr_malloc(sizeof(YR_RELOC));
+        -:   94:
+     2184:   95:    if (reloc == NULL)
+    #####:   96:      return ERROR_INSUFFICIENT_MEMORY;
+        -:   97:
+     2184:   98:    reloc->buffer_id = buffer_id;
+     2184:   99:    reloc->offset = base_offset + offset;
+     2184:  100:    reloc->next = NULL;
+        -:  101:
+     2184:  102:    if (arena->reloc_list_head == NULL)
+        7:  103:      arena->reloc_list_head = reloc;
+        -:  104:
+     2184:  105:    if (arena->reloc_list_tail != NULL)
+     2177:  106:      arena->reloc_list_tail->next = reloc;
+        -:  107:
+     2184:  108:    arena->reloc_list_tail = reloc;
+     2184:  109:    offset = va_arg(offsets, size_t);
+        -:  110:  }
+        -:  111:
+      551:  112:  return result;
+        -:  113:}
+        -:  114:
+        -:  115:// Flags for _yr_arena_allocate_memory.
+        -:  116:#define YR_ARENA_ZERO_MEMORY  1
+        -:  117:
+        -:  118:
+        -:  119://
+        -:  120:// _yr_arena_allocate_memory
+        -:  121://
+        -:  122:// Allocates memory in a buffer within the arena.
+        -:  123://
+        -:  124:// Args:
+        -:  125://    [in]  YR_ARENA* arena    - Pointer to the arena.
+        -:  126://    [in]  int flags          - Flags.
+        -:  127://    [in]  uint32_t buffer_id - Buffer number.
+        -:  128://    [in]  size_t size        - Size of the region to be allocated.
+        -:  129://    [out] size_t* offset     - Pointer to a variable where the function puts
+        -:  130://                              the offset within the buffer of the allocated
+        -:  131://                              region. The pointer can be NULL.
+        -:  132:// Returns:
+        -:  133://    ERROR_SUCCESS if succeed or the corresponding error code if otherwise.
+        -:  134://
+        -:  135:
+      649:  136:static int _yr_arena_allocate_memory(
+        -:  137:    YR_ARENA* arena,
+        -:  138:    int flags,
+        -:  139:    uint32_t buffer_id,
+        -:  140:    size_t size,
+        -:  141:    YR_ARENA_REF* ref)
+        -:  142:{
+      649:  143:  if (buffer_id > arena->num_buffers)
+    #####:  144:    return ERROR_INVALID_ARGUMENT;
+        -:  145:
+      649:  146:  YR_ARENA_BUFFER* b = &arena->buffers[buffer_id];
+        -:  147:
+        -:  148:  // If the new data doesn't fit in the remaining space the buffer must be
+        -:  149:  // re-sized. This implies moving the buffer to a different memory location
+        -:  150:  // and adjusting the pointers listed in the relocation list.
+        -:  151:
+      649:  152:  if (b->size - b->used < size)
+        -:  153:  {
+      43*:  154:    size_t new_size = (b->size == 0) ? arena->initial_buffer_size : b->size * 2;
+        -:  155:
+       43:  156:    while (new_size < b->used + size)
+    #####:  157:      new_size *= 2;
+        -:  158:
+       43:  159:    uint8_t* new_data = yr_realloc(b->data, new_size);
+        -:  160:
+       43:  161:    if (new_data == NULL)
+    #####:  162:      return ERROR_INSUFFICIENT_MEMORY;
+        -:  163:
+        -:  164:    // When yr_realloc uses the Windows API (HeapAlloc, HeapReAlloc) under the
+        -:  165:    // hood this is not necessary because HeapReAlloc already sets the new
+        -:  166:    // memory to zero.
+        -:  167:    #if !defined(_WIN32) && !defined(__CYGWIN__)
+       43:  168:    if (flags & YR_ARENA_ZERO_MEMORY)
+       26:  169:      memset(new_data + b->used, 0, new_size - b->used);
+        -:  170:    #endif
+        -:  171:
+       43:  172:    YR_RELOC* reloc = arena->reloc_list_head;
+        -:  173:
+      216:  174:    while (reloc != NULL)
+        -:  175:    {
+        -:  176:      // If the reloc entry is for the same buffer that is being relocated,
+        -:  177:      // the base pointer that we use to access the buffer must be new_data,
+        -:  178:      // as arena->buffers[reloc->buffer_id].data which is the same than
+        -:  179:      // b->data can't be accessed anymore after the call to yr_realloc.
+      346:  180:      uint8_t* base = buffer_id == reloc->buffer_id ?
+     173*:  181:                      new_data : arena->buffers[reloc->buffer_id].data;
+        -:  182:
+        -:  183:      // reloc_address holds the address inside the buffer where the pointer
+        -:  184:      // to be relocated resides.
+      173:  185:      void** reloc_address = (void**) (base + reloc->offset);
+        -:  186:
+        -:  187:      // reloc_target is the value of the relocatable pointer.
+      173:  188:      void* reloc_target = *reloc_address;
+        -:  189:
+      173:  190:      if ((uint8_t*) reloc_target >= b->data &&
+      173:  191:          (uint8_t*) reloc_target < b->data + b->used)
+        -:  192:      {
+        -:  193:        // reloc_target points to some data inside the buffer being moved, so
+        -:  194:        // the pointer needs to be adjusted.
+    #####:  195:        *reloc_address = (uint8_t*) reloc_target - b->data + new_data;
+        -:  196:      }
+        -:  197:
+      173:  198:      reloc = reloc->next;
+        -:  199:    }
+        -:  200:
+       43:  201:    b->size = new_size;
+       43:  202:    b->data = new_data;
+        -:  203:  }
+        -:  204:
+      649:  205:  if (ref != NULL)
+        -:  206:  {
+      649:  207:    ref->buffer_id = buffer_id;
+      649:  208:    ref->offset = b->used;
+        -:  209:  }
+        -:  210:
+      649:  211:  b->used += size;
+        -:  212:
+      649:  213:  return ERROR_SUCCESS;
+        -:  214:}
+        -:  215:
+        -:  216:
+        -:  217://
+        -:  218:// yr_arena_create
+        -:  219://
+        -:  220:// Creates an arena with the specified number of buffers.
+        -:  221://
+        -:  222:// Args:
+        -:  223://    [in]  int num_buffers             - Number of buffers
+        -:  224://    [in]  size_t initial_buffer_size  - Initial size of each buffer.
+        -:  225://    [out] YR_ARENA** arena           - Address of a YR_ARENA* pointer that
+        -:  226://                                        will receive the address of the newly
+        -:  227://                                        created arena.
+        -:  228://
+        -:  229:
+        7:  230:int yr_arena_create(
+        -:  231:    int number_of_buffers,
+        -:  232:    size_t initial_buffer_size,
+        -:  233:    YR_ARENA** arena)
+        -:  234:{
+        7:  235:  YR_ARENA* new_arena = (YR_ARENA*) yr_calloc(1, sizeof(YR_ARENA));
+        -:  236:
+        7:  237:  if (new_arena == NULL)
+    #####:  238:    return ERROR_INSUFFICIENT_MEMORY;
+        -:  239:
+        7:  240:  new_arena->xrefs = 1;
+        7:  241:  new_arena->num_buffers = number_of_buffers;
+        7:  242:  new_arena->initial_buffer_size = initial_buffer_size;
+        -:  243:
+        7:  244:  *arena = new_arena;
+        -:  245:
+        7:  246:  return ERROR_SUCCESS;
+        -:  247:}
+        -:  248:
+    #####:  249:void yr_arena_acquire(
+        -:  250:    YR_ARENA* arena)
+        -:  251:{
+    #####:  252:  arena->xrefs++;
+    #####:  253:}
+        -:  254:
+        -:  255://
+        -:  256:// yr_arena_release
+        -:  257://
+        -:  258:// Releases the arena. If the number of cross-references to this arena drops
+        -:  259:// to zero the arena is destroyed and all its resources are freed.
+        -:  260://
+        -:  261:// Args:
+        -:  262://    [in] YR_ARENA* arena    - Pointer to the arena.
+        -:  263://
+        -:  264:
+        6:  265:int yr_arena_release(
+        -:  266:    YR_ARENA* arena)
+        -:  267:{
+        6:  268:  arena->xrefs--;
+        -:  269:
+        6:  270:  if (arena->xrefs > 0)
+    #####:  271:    return ERROR_SUCCESS;
+        -:  272:
+       78:  273:  for (int i = 0; i < arena->num_buffers; i++)
+        -:  274:  {
+       72:  275:    if (arena->buffers[i].data != NULL)
+       39:  276:      yr_free(arena->buffers[i].data);
+        -:  277:  }
+        -:  278:
+        6:  279:  YR_RELOC* reloc = arena->reloc_list_head;
+        -:  280:
+     2184:  281:  while (reloc != NULL)
+        -:  282:  {
+     2178:  283:    YR_RELOC* next = reloc->next;
+     2178:  284:    yr_free(reloc);
+     2178:  285:    reloc = next;
+        -:  286:  }
+        -:  287:
+        6:  288:  yr_free(arena);
+        -:  289:
+        6:  290:  return ERROR_SUCCESS;
+        -:  291:}
+        -:  292:
+        -:  293:
+       98:  294:int yr_arena_allocate_memory(
+        -:  295:    YR_ARENA* arena,
+        -:  296:    uint32_t buffer_id,
+        -:  297:    size_t size,
+        -:  298:    YR_ARENA_REF* ref)
+        -:  299:{
+       98:  300:  return _yr_arena_allocate_memory(
+        -:  301:      arena, 0, buffer_id, size, ref);
+        -:  302:}
+        -:  303:
+        -:  304:
+    #####:  305:int yr_arena_allocate_zeroed_memory(
+        -:  306:    YR_ARENA* arena,
+        -:  307:    uint32_t buffer_id,
+        -:  308:    size_t size,
+        -:  309:    YR_ARENA_REF* ref)
+        -:  310:{
+    #####:  311:  return _yr_arena_allocate_memory(
+        -:  312:      arena, YR_ARENA_ZERO_MEMORY, buffer_id, size, ref);
+        -:  313:}
+        -:  314:
+        -:  315:
+        -:  316://
+        -:  317:// yr_arena_allocate_struct
+        -:  318://
+        -:  319:// Allocates a structure within the arena. This function is similar to
+        -:  320:// yr_arena_allocate_memory but additionally receives a variable-length
+        -:  321:// list of offsets within the structure where pointers reside. This allows
+        -:  322:// the arena to keep track of pointers that must be adjusted when memory
+        -:  323:// is relocated. This is an example on how to invoke this function:
+        -:  324://
+        -:  325://  yr_arena_allocate_struct(
+        -:  326://        arena,
+        -:  327://        0,
+        -:  328://        sizeof(MY_STRUCTURE),
+        -:  329://        &ref,
+        -:  330://        offsetof(MY_STRUCTURE, field_1),
+        -:  331://        offsetof(MY_STRUCTURE, field_2),
+        -:  332://        ..
+        -:  333://        offsetof(MY_STRUCTURE, field_N),
+        -:  334://        EOL);
+        -:  335://
+        -:  336:// Args:
+        -:  337://    [in]  YR_ARENA* arena     - Pointer to the arena.
+        -:  338://    [in]  uint32_t buffer_id   - Buffer number.
+        -:  339://    [in]  size_t size         - Size of the region to be allocated.
+        -:  340://    [out] YR_ARENA_REF* ref   - Pointer to a reference that will point to the
+        -:  341://                                newly allocated structure when the function
+        -:  342://                                returns. The pointer can be NULL if you don't
+        -:  343://                                need the reference.
+        -:  344://    ...                       - Variable number of offsets relative to the
+        -:  345://                                beginning of the struct. Offsets are of type
+        -:  346://                                size_t.
+        -:  347://
+        -:  348:// Returns:
+        -:  349://    ERROR_SUCCESS if succeed or the corresponding error code otherwise.
+        -:  350://
+        -:  351:
+      551:  352:int yr_arena_allocate_struct(
+        -:  353:    YR_ARENA* arena,
+        -:  354:    uint32_t buffer_id,
+        -:  355:    size_t size,
+        -:  356:    YR_ARENA_REF* ref,
+        -:  357:    ...)
+        -:  358:{
+        -:  359:  YR_ARENA_REF r;
+        -:  360:
+      551:  361:  int result = _yr_arena_allocate_memory(
+        -:  362:      arena, YR_ARENA_ZERO_MEMORY, buffer_id, size, &r);
+        -:  363:
+      551:  364:  if (result != ERROR_SUCCESS)
+    #####:  365:    return result;
+        -:  366:
+        -:  367:  va_list field_offsets;
+      551:  368:  va_start(field_offsets, ref);
+        -:  369:
+      551:  370:  result = _yr_arena_make_ptr_relocatable(
+        -:  371:      arena, buffer_id, r.offset, field_offsets);
+        -:  372:
+      551:  373:  va_end(field_offsets);
+        -:  374:
+      551:  375:  if (result == ERROR_SUCCESS && ref != NULL)
+        -:  376:  {
+      551:  377:    ref->buffer_id = r.buffer_id;
+      551:  378:    ref->offset = r.offset;
+        -:  379:  }
+        -:  380:
+      551:  381:  return result;
+        -:  382:}
+        -:  383:
+        -:  384:
+     2209:  385:void* yr_arena_get_ptr(
+        -:  386:    YR_ARENA* arena,
+        -:  387:    uint32_t buffer_id,
+        -:  388:    yr_arena_off_t offset)
+        -:  389:{
+    2209*:  390:  assert(buffer_id < arena->num_buffers);
+     2209:  391:  assert(offset <= arena->buffers[buffer_id].used);
+        -:  392:
+     2208:  393:  return arena->buffers[buffer_id].data + offset;
+        -:  394:}
+        -:  395:
+        -:  396:
+       16:  397:yr_arena_off_t yr_arena_get_current_offset(
+        -:  398:    YR_ARENA* arena,
+        -:  399:    uint32_t buffer_id)
+        -:  400:{
+      16*:  401:  assert(buffer_id < arena->num_buffers);
+        -:  402:
+       16:  403:  return arena->buffers[buffer_id].used;
+        -:  404:}
+        -:  405:
+        -:  406:
+    #####:  407:int yr_arena_ptr_to_ref(
+        -:  408:    YR_ARENA* arena,
+        -:  409:    const void* address,
+        -:  410:    YR_ARENA_REF* ref)
+        -:  411:{
+    #####:  412:  *ref = YR_ARENA_NULL_REF;
+        -:  413:
+    #####:  414:  if (address == NULL)
+    #####:  415:    return 1;
+        -:  416:
+    #####:  417:  for (int i = 0; i < arena->num_buffers; ++i)
+        -:  418:  {
+    #####:  419:    if ((uint8_t*) address >= arena->buffers[i].data &&
+    #####:  420:        (uint8_t*) address <  arena->buffers[i].data + arena->buffers[i].used)
+        -:  421:    {
+    #####:  422:      ref->buffer_id = i;
+    #####:  423:      ref->offset = (uint8_t*) address - arena->buffers[i].data;
+    #####:  424:      return 1;
+        -:  425:    }
+        -:  426:  }
+        -:  427:
+    #####:  428:  return 0;
+        -:  429:}
+        -:  430:
+     2187:  431:void* yr_arena_ref_to_ptr(
+        -:  432:    YR_ARENA* arena,
+        -:  433:    YR_ARENA_REF* ref)
+        -:  434:{
+     2187:  435:  if (YR_ARENA_IS_NULL_REF(*ref))
+      547:  436:    return NULL;
+        -:  437:
+        -:  438:  #if defined(__arm__)
+        -:  439:  YR_ARENA_REF tmp_ref;
+        -:  440:  memcpy(&tmp_ref, ref, sizeof(YR_ARENA_REF));
+        -:  441:  ref = &tmp_ref;
+        -:  442:  #endif
+        -:  443:
+     1640:  444:  return yr_arena_get_ptr(arena, ref->buffer_id, ref->offset);
+        -:  445:}
+        -:  446:
+        -:  447:
+        -:  448:
+        -:  449://
+        -:  450:// yr_arena_make_ptr_relocatable
+        -:  451://
+        -:  452:// Tells the arena that certain addresses contains a relocatable pointer.
+        -:  453://
+        -:  454:// Args:
+        -:  455://    YR_ARENA* arena    - Pointer to the arena.
+        -:  456://    uint32_t buffer_id - Buffer number.
+        -:  457://    ...                - Variable number of size_t arguments with offsets
+        -:  458://                         within the buffer.
+        -:  459://
+        -:  460:// Returns:
+        -:  461://    ERROR_SUCCESS if succeed or the corresponding error code otherwise.
+        -:  462://
+        -:  463:
+    #####:  464:int yr_arena_make_ptr_relocatable(
+        -:  465:    YR_ARENA* arena,
+        -:  466:    uint32_t buffer_id,
+        -:  467:    ...)
+        -:  468:{
+        -:  469:  int result;
+        -:  470:
+        -:  471:  va_list offsets;
+    #####:  472:  va_start(offsets, buffer_id);
+        -:  473:
+    #####:  474:  result = _yr_arena_make_ptr_relocatable(
+        -:  475:      arena, buffer_id, 0, offsets);
+        -:  476:
+    #####:  477:  va_end(offsets);
+        -:  478:
+    #####:  479:  return result;
+        -:  480:}
+        -:  481:
+        -:  482:
+       98:  483:int yr_arena_write_data(
+        -:  484:    YR_ARENA* arena,
+        -:  485:    uint32_t buffer_id,
+        -:  486:    const void* data,
+        -:  487:    size_t size,
+        -:  488:    YR_ARENA_REF* ref)
+        -:  489:{
+        -:  490:  YR_ARENA_REF r;
+        -:  491:
+        -:  492:  // Allocate space in the buffer.
+      98*:  493:  FAIL_ON_ERROR(yr_arena_allocate_memory(arena, buffer_id, size, &r));
+        -:  494:
+        -:  495:  // Copy the data into the allocated space.
+       98:  496:  memcpy(arena->buffers[buffer_id].data + r.offset, data, size);
+        -:  497:
+       98:  498:  if (ref != NULL)
+        -:  499:  {
+       56:  500:    ref->buffer_id = r.buffer_id;
+       56:  501:    ref->offset = r.offset;
+        -:  502:  }
+        -:  503:
+       98:  504:  return ERROR_SUCCESS;
+        -:  505:}
+        -:  506:
+        -:  507:
+       20:  508:int yr_arena_write_string(
+        -:  509:    YR_ARENA* arena,
+        -:  510:    uint32_t buffer_id,
+        -:  511:    const char* string,
+        -:  512:    YR_ARENA_REF* ref)
+        -:  513:{
+       40:  514:  return yr_arena_write_data(
+       20:  515:      arena, buffer_id, string, strlen(string) + 1, ref);
+        -:  516:}
+        -:  517:
+        -:  518:
+    #####:  519:int yr_arena_write_uint32(
+        -:  520:    YR_ARENA* arena,
+        -:  521:    uint32_t buffer_id,
+        -:  522:    uint32_t integer,
+        -:  523:    YR_ARENA_REF* ref)
+        -:  524:{
+    #####:  525:  return yr_arena_write_data(
+        -:  526:      arena, buffer_id, &integer, sizeof(integer), ref);
+        -:  527:}
+        -:  528:
+        -:  529:
+        -:  530:
+    #####:  531:int yr_arena_load_stream(
+        -:  532:    YR_STREAM* stream,
+        -:  533:    YR_ARENA** arena)
+        -:  534:{
+        -:  535:  YR_ARENA_FILE_HEADER hdr;
+        -:  536:
+    #####:  537:  if (yr_stream_read(&hdr, sizeof(hdr), 1, stream) != 1)
+    #####:  538:    return ERROR_INVALID_FILE;
+        -:  539:
+    #####:  540:  if (hdr.magic[0] != 'Y' ||
+    #####:  541:      hdr.magic[1] != 'A' ||
+    #####:  542:      hdr.magic[2] != 'R' ||
+    #####:  543:      hdr.magic[3] != 'A')
+        -:  544:  {
+    #####:  545:    return ERROR_INVALID_FILE;
+        -:  546:  }
+        -:  547:
+    #####:  548:  if (hdr.version != YR_ARENA_FILE_VERSION)
+    #####:  549:    return ERROR_UNSUPPORTED_FILE_VERSION;
+        -:  550:
+    #####:  551:  if (hdr.num_buffers > YR_MAX_ARENA_BUFFERS)
+    #####:  552:    return ERROR_INVALID_FILE;
+        -:  553:
+        -:  554:  YR_ARENA_FILE_BUFFER buffers[YR_MAX_ARENA_BUFFERS];
+        -:  555:
+    #####:  556:  int read = yr_stream_read(
+    #####:  557:      buffers, sizeof(buffers[0]), hdr.num_buffers, stream);
+        -:  558:
+    #####:  559:  if (read != hdr.num_buffers)
+    #####:  560:    return ERROR_CORRUPT_FILE;
+        -:  561:
+        -:  562:  YR_ARENA* new_arena;
+        -:  563:
+    #####:  564:  FAIL_ON_ERROR(yr_arena_create(hdr.num_buffers, 1048576, &new_arena))
+        -:  565:
+    #####:  566:  for (int i = 0; i < hdr.num_buffers; ++i)
+        -:  567:  {
+    #####:  568:    if (buffers[i].size == 0)
+    #####:  569:      continue;
+        -:  570:
+        -:  571:    YR_ARENA_REF ref;
+        -:  572:
+    #####:  573:    FAIL_ON_ERROR_WITH_CLEANUP(
+        -:  574:        yr_arena_allocate_memory(
+        -:  575:            new_arena, i, buffers[i].size, &ref),
+        -:  576:        yr_arena_release(new_arena))
+        -:  577:
+    #####:  578:    void* ptr = yr_arena_get_ptr(new_arena, i, ref.offset);
+        -:  579:
+    #####:  580:    if (yr_stream_read(ptr, buffers[i].size, 1, stream) != 1)
+        -:  581:    {
+    #####:  582:      yr_arena_release(new_arena);
+    #####:  583:      return ERROR_CORRUPT_FILE;
+        -:  584:    }
+        -:  585:  }
+        -:  586:
+        -:  587:  YR_ARENA_REF ref;
+        -:  588:
+    #####:  589:  while (yr_stream_read(&ref, sizeof(ref), 1, stream) == 1)
+        -:  590:  {
+    #####:  591:    YR_ARENA_BUFFER* b = &new_arena->buffers[ref.buffer_id];
+        -:  592:
+    #####:  593:    if (ref.buffer_id >= new_arena->num_buffers ||
+    #####:  594:        ref.offset > b->used - sizeof(void*))
+        -:  595:    {
+    #####:  596:      yr_arena_release(new_arena);
+    #####:  597:      return ERROR_CORRUPT_FILE;
+        -:  598:    }
+        -:  599:
+    #####:  600:    void** reloc_ptr = (void**) (b->data + ref.offset);
+        -:  601:
+        -:  602:    // Let's convert the reference into a pointer.
+    #####:  603:    *reloc_ptr = yr_arena_ref_to_ptr(new_arena, (YR_ARENA_REF*) reloc_ptr);
+        -:  604:
+    #####:  605:    FAIL_ON_ERROR_WITH_CLEANUP(
+        -:  606:        yr_arena_make_ptr_relocatable(
+        -:  607:           new_arena,
+        -:  608:           ref.buffer_id,
+        -:  609:           ref.offset,
+        -:  610:           EOL),
+        -:  611:        yr_arena_release(new_arena))
+        -:  612:  }
+        -:  613:
+    #####:  614:  *arena = new_arena;
+        -:  615:
+    #####:  616:  return ERROR_SUCCESS;
+        -:  617:}
+        -:  618:
+        -:  619:
+    #####:  620:int yr_arena_save_stream(
+        -:  621:    YR_ARENA* arena,
+        -:  622:    YR_STREAM* stream)
+        -:  623:{
+        -:  624:  YR_ARENA_FILE_HEADER hdr;
+        -:  625:
+    #####:  626:  hdr.magic[0] = 'Y';
+    #####:  627:  hdr.magic[1] = 'A';
+    #####:  628:  hdr.magic[2] = 'R';
+    #####:  629:  hdr.magic[3] = 'A';
+        -:  630:
+    #####:  631:  hdr.version = YR_ARENA_FILE_VERSION;
+    #####:  632:  hdr.num_buffers = arena->num_buffers;
+        -:  633:
+    #####:  634:  if (yr_stream_write(&hdr, sizeof(hdr), 1, stream) != 1)
+    #####:  635:    return ERROR_WRITING_FILE;
+        -:  636:
+        -:  637:  // The first buffer in the file is after the header and the buffer table,
+        -:  638:  // calculate its offset accordingly.
+    #####:  639:  uint64_t offset = sizeof(YR_ARENA_FILE_HEADER)
+    #####:  640:      + sizeof(YR_ARENA_FILE_BUFFER) * arena->num_buffers;
+        -:  641:
+    #####:  642:  for (int i = 0; i < arena->num_buffers; ++i)
+        -:  643:  {
+    #####:  644:    YR_ARENA_FILE_BUFFER buffer = {
+        -:  645:      .offset = offset,
+    #####:  646:      .size = arena->buffers[i].used,
+        -:  647:    };
+        -:  648:
+    #####:  649:    if (yr_stream_write(&buffer, sizeof(buffer), 1, stream) != 1)
+    #####:  650:      return ERROR_WRITING_FILE;
+        -:  651:
+    #####:  652:    offset += buffer.size;
+        -:  653:  }
+        -:  654:
+        -:  655:  // Iterate the relocation list and replace all the relocatable pointers by
+        -:  656:  // references to the buffer and offset where they are pointing to. All
+        -:  657:  // relocatable pointers are expected to be null or point to data stored in
+        -:  658:  // some of the arena's buffers. If a relocatable pointer points outside the
+        -:  659:  // arena that's an error.
+    #####:  660:  YR_RELOC* reloc = arena->reloc_list_head;
+        -:  661:
+    #####:  662:  while (reloc != NULL)
+        -:  663:  {
+        -:  664:    // reloc_ptr is a pointer to the relocatable pointer, while *reloc_ptr
+        -:  665:    // is the relocatable pointer itself.
+    #####:  666:    void** reloc_ptr = (void**) (
+    #####:  667:        arena->buffers[reloc->buffer_id].data + reloc->offset);
+        -:  668:
+        -:  669:    YR_ARENA_REF ref;
+        -:  670:
+    #####:  671:    int found = yr_arena_ptr_to_ref(arena, *reloc_ptr, &ref);
+        -:  672:
+        -:  673:    // yr_arena_ptr_to_ref returns 0 if the relocatable pointer is pointing
+        -:  674:    // outside the arena, this should not happen.
+    #####:  675:    assert(found);
+        -:  676:
+        -:  677:    // Replace the relocatable pointer with a reference that holds information
+        -:  678:    // about the buffer and offset where the relocatable pointer is pointing to.
+    #####:  679:    memcpy(reloc_ptr, &ref, sizeof(ref));
+        -:  680:
+    #####:  681:    reloc = reloc->next;
+        -:  682:  }
+        -:  683:
+        -:  684:  // Now that all relocatable pointers are converted to references, write the
+        -:  685:  // buffers.
+    #####:  686:  for (int i = 0; i < arena->num_buffers; ++i)
+        -:  687:  {
+    #####:  688:    YR_ARENA_BUFFER* b = &arena->buffers[i];
+        -:  689:
+    #####:  690:    if (b->used > 0)
+    #####:  691:      if (yr_stream_write(b->data, b->used, 1, stream) != 1)
+    #####:  692:        return ERROR_WRITING_FILE;
+        -:  693:  }
+        -:  694:
+        -:  695:  // Write the relocation list and restore the pointers back.
+    #####:  696:  reloc = arena->reloc_list_head;
+        -:  697:
+    #####:  698:  while (reloc != NULL)
+        -:  699:  {
+    #####:  700:    YR_ARENA_REF ref = {
+    #####:  701:      .buffer_id = reloc->buffer_id,
+    #####:  702:      .offset = reloc->offset,
+        -:  703:    };
+        -:  704:
+    #####:  705:    if (yr_stream_write(&ref, sizeof(ref), 1, stream) != 1)
+    #####:  706:      return ERROR_WRITING_FILE;
+        -:  707:
+    #####:  708:    void** reloc_ptr = (void**) (
+    #####:  709:        arena->buffers[reloc->buffer_id].data + reloc->offset);
+        -:  710:
+        -:  711:    // reloc_ptr is now pointing to a YR_ARENA_REF.
+    #####:  712:    YR_ARENA_REF* ref_ptr = (YR_ARENA_REF*) reloc_ptr;
+        -:  713:
+        -:  714:    // Let's convert the reference into a pointer again.
+    #####:  715:    *reloc_ptr = yr_arena_ref_to_ptr(arena, ref_ptr);
+        -:  716:
+    #####:  717:    reloc = reloc->next;
+        -:  718:  }
+        -:  719:
+    #####:  720:  return ERROR_SUCCESS;
+        -:  721:}
