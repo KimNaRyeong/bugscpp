@@ -1,0 +1,423 @@
+        -:    0:Source:/home/workspace/jerry-core/ecma/operations/ecma-reference.c
+        -:    0:Programs:299
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "ecma-reference.h"
+        -:   17:
+        -:   18:#include "ecma-exceptions.h"
+        -:   19:#include "ecma-function-object.h"
+        -:   20:#include "ecma-gc.h"
+        -:   21:#include "ecma-globals.h"
+        -:   22:#include "ecma-helpers.h"
+        -:   23:#include "ecma-lcache.h"
+        -:   24:#include "ecma-lex-env.h"
+        -:   25:#include "ecma-objects.h"
+        -:   26:#include "ecma-proxy-object.h"
+        -:   27:
+        -:   28:#include "jrt.h"
+        -:   29:
+        -:   30:/** \addtogroup ecma ECMA
+        -:   31: * @{
+        -:   32: *
+        -:   33: * \addtogroup references ECMA-Reference
+        -:   34: * @{
+        -:   35: */
+        -:   36:
+        -:   37:/**
+        -:   38: * Resolve syntactic reference.
+        -:   39: *
+        -:   40: * @return ECMA_OBJECT_POINTER_ERROR - if the operation fails
+        -:   41: *         pointer to lexical environment - if the reference's base is resolved successfully,
+        -:   42: *         NULL - otherwise.
+        -:   43: */
+        -:   44:ecma_object_t *
+    #####:   45:ecma_op_resolve_reference_base (ecma_object_t *lex_env_p, /**< starting lexical environment */
+        -:   46:                                ecma_string_t *name_p) /**< identifier's name */
+        -:   47:{
+    #####:   48:  JERRY_ASSERT (lex_env_p != NULL);
+        -:   49:
+        -:   50:  while (true)
+    #####:   51:  {
+    #####:   52:    ecma_value_t has_binding = ecma_op_has_binding (lex_env_p, name_p);
+        -:   53:
+        -:   54:#if JERRY_BUILTIN_PROXY
+    #####:   55:    if (ECMA_IS_VALUE_ERROR (has_binding))
+        -:   56:    {
+    #####:   57:      return ECMA_OBJECT_POINTER_ERROR;
+        -:   58:    }
+        -:   59:#endif /* JERRY_BUILTIN_PROXY */
+        -:   60:
+    #####:   61:    if (ecma_is_value_true (has_binding))
+        -:   62:    {
+    #####:   63:      return lex_env_p;
+        -:   64:    }
+        -:   65:
+    #####:   66:    if (lex_env_p->u2.outer_reference_cp == JMEM_CP_NULL)
+        -:   67:    {
+    #####:   68:      return NULL;
+        -:   69:    }
+        -:   70:
+    #####:   71:    lex_env_p = ECMA_GET_NON_NULL_POINTER (ecma_object_t, lex_env_p->u2.outer_reference_cp);
+        -:   72:  }
+        -:   73:} /* ecma_op_resolve_reference_base */
+        -:   74:
+        -:   75:#if JERRY_ESNEXT
+        -:   76:
+        -:   77:/**
+        -:   78: * Check if the passed lexical environment is a global lexical environment
+        -:   79: *
+        -:   80: * @return true  - if the lexical environment is a global lexical environment
+        -:   81: *         false - otherwise
+        -:   82: */
+        -:   83:static inline bool JERRY_ATTR_ALWAYS_INLINE
+        -:   84:ecma_op_is_global_environment (ecma_object_t *lex_env_p) /**< lexical environment */
+        -:   85:{
+    #####:   86:  JERRY_ASSERT (ecma_get_lex_env_type (lex_env_p) == ECMA_LEXICAL_ENVIRONMENT_THIS_OBJECT_BOUND);
+        -:   87:#if JERRY_BUILTIN_REALMS
+    #####:   88:  JERRY_ASSERT (lex_env_p->u2.outer_reference_cp != JMEM_CP_NULL
+        -:   89:                || (ecma_make_object_value (ecma_get_lex_env_binding_object (lex_env_p))
+        -:   90:                    == ((ecma_global_object_t *) ecma_builtin_get_global ())->this_binding));
+        -:   91:#else /* !JERRY_BUILTIN_REALMS */
+        -:   92:  JERRY_ASSERT (lex_env_p->u2.outer_reference_cp != JMEM_CP_NULL
+        -:   93:                || ecma_get_lex_env_binding_object (lex_env_p) == ecma_builtin_get_global ());
+        -:   94:#endif /* JERRY_BUILTIN_REALMS */
+        -:   95:
+    #####:   96:  return lex_env_p->u2.outer_reference_cp == JMEM_CP_NULL;
+        -:   97:} /* ecma_op_is_global_environment */
+        -:   98:
+        -:   99:/**
+        -:  100: * Perform GetThisEnvironment and GetSuperBase operations
+        -:  101: *
+        -:  102: * See also: ECMAScript v6, 8.1.1.3.5
+        -:  103: *
+        -:  104: * @return ECMA_VALUE_ERROR - if the operation fails
+        -:  105: *         ECMA_VALUE_UNDEFINED - if the home object is null
+        -:  106: *         value of the [[HomeObject]].[[Prototype]] internal slot - otherwise
+        -:  107: */
+        -:  108:ecma_value_t
+    #####:  109:ecma_op_resolve_super_base (ecma_object_t *lex_env_p) /**< starting lexical environment */
+        -:  110:{
+        -:  111:  while (true)
+        -:  112:  {
+    #####:  113:    JERRY_ASSERT (lex_env_p != NULL);
+        -:  114:
+    #####:  115:    if (ecma_get_lex_env_type (lex_env_p) == ECMA_LEXICAL_ENVIRONMENT_CLASS
+    #####:  116:        && !ECMA_LEX_ENV_CLASS_IS_MODULE (lex_env_p))
+        -:  117:    {
+    #####:  118:      ecma_object_t *home_p = ECMA_GET_NON_NULL_POINTER (ecma_object_t, lex_env_p->u1.home_object_cp);
+        -:  119:
+        -:  120:#if JERRY_BUILTIN_PROXY
+    #####:  121:      if (ECMA_OBJECT_IS_PROXY (home_p))
+        -:  122:      {
+    #####:  123:        return ecma_proxy_object_get_prototype_of (home_p);
+        -:  124:      }
+        -:  125:#endif /* JERRY_BUILTIN_PROXY */
+        -:  126:
+    #####:  127:      jmem_cpointer_t proto_cp = ecma_op_ordinary_object_get_prototype_of (home_p);
+        -:  128:
+    #####:  129:      if (proto_cp == JMEM_CP_NULL)
+        -:  130:      {
+    #####:  131:        return ECMA_VALUE_NULL;
+        -:  132:      }
+        -:  133:
+    #####:  134:      ecma_object_t *proto_p = ECMA_GET_NON_NULL_POINTER (ecma_object_t, proto_cp);
+    #####:  135:      ecma_ref_object (proto_p);
+        -:  136:
+    #####:  137:      return ecma_make_object_value (proto_p);
+        -:  138:    }
+        -:  139:
+    #####:  140:    if (lex_env_p->u2.outer_reference_cp == JMEM_CP_NULL)
+        -:  141:    {
+    #####:  142:      break;
+        -:  143:    }
+        -:  144:
+    #####:  145:    lex_env_p = ECMA_GET_NON_NULL_POINTER (ecma_object_t, lex_env_p->u2.outer_reference_cp);
+        -:  146:  }
+        -:  147:
+    #####:  148:  return ECMA_VALUE_UNDEFINED;
+        -:  149:} /* ecma_op_resolve_super_base */
+        -:  150:
+        -:  151:/**
+        -:  152: * Helper method for HasBindig operation
+        -:  153: *
+        -:  154: * See also:
+        -:  155: *         ECMA-262 v6, 8.1.1.2.1 steps 7-9;
+        -:  156: *
+        -:  157: * @return ECMA_VALUE_TRUE - if the property is unscopable
+        -:  158: *         ECMA_VALUE_FALSE - if a the property is not unscopable
+        -:  159: *         ECMA_VALUE_ERROR - otherwise
+        -:  160: */
+        -:  161:static ecma_value_t
+    #####:  162:ecma_op_is_prop_unscopable (ecma_object_t *binding_obj_p, /**< binding object */
+        -:  163:                            ecma_string_t *prop_name_p) /**< property's name */
+        -:  164:{
+    #####:  165:  ecma_value_t unscopables = ecma_op_object_get_by_symbol_id (binding_obj_p, LIT_GLOBAL_SYMBOL_UNSCOPABLES);
+        -:  166:
+    #####:  167:  if (ECMA_IS_VALUE_ERROR (unscopables))
+        -:  168:  {
+    #####:  169:    return unscopables;
+        -:  170:  }
+        -:  171:
+    #####:  172:  if (ecma_is_value_object (unscopables))
+        -:  173:  {
+    #####:  174:    ecma_object_t *unscopables_obj_p = ecma_get_object_from_value (unscopables);
+    #####:  175:    ecma_value_t get_unscopables_value = ecma_op_object_get (unscopables_obj_p, prop_name_p);
+    #####:  176:    ecma_deref_object (unscopables_obj_p);
+        -:  177:
+    #####:  178:    if (ECMA_IS_VALUE_ERROR (get_unscopables_value))
+        -:  179:    {
+    #####:  180:      return get_unscopables_value;
+        -:  181:    }
+        -:  182:
+    #####:  183:    bool is_blocked = ecma_op_to_boolean (get_unscopables_value);
+        -:  184:
+    #####:  185:    ecma_free_value (get_unscopables_value);
+        -:  186:
+    #####:  187:    return ecma_make_boolean_value (is_blocked);
+        -:  188:  }
+        -:  189:
+    #####:  190:  ecma_free_value (unscopables);
+        -:  191:
+    #####:  192:  return ECMA_VALUE_FALSE;
+        -:  193:} /* ecma_op_is_prop_unscopable */
+        -:  194:
+        -:  195:#endif /* JERRY_ESNEXT */
+        -:  196:
+        -:  197:/**
+        -:  198: * Helper method for HasBindig operation
+        -:  199: *
+        -:  200: * See also:
+        -:  201: *         ECMA-262 v6, 8.1.1.2.1 steps 7-9;
+        -:  202: *
+        -:  203: * @return ECMA_VALUE_TRUE - if the property is unscopable
+        -:  204: *         ECMA_VALUE_FALSE - if a the property is not unscopable
+        -:  205: *         ECMA_VALUE_ERROR - otherwise
+        -:  206: */
+        -:  207:
+        -:  208:/**
+        -:  209: * Resolve value corresponding to the given object environment reference.
+        -:  210: *
+        -:  211: * Note: the steps are already include the HasBindig operation steps
+        -:  212: *
+        -:  213: *  See also:
+        -:  214: *         ECMA-262 v6, 8.1.1.2.1
+        -:  215: *
+        -:  216: * @return ECMA_VALUE_ERROR - if the operation fails
+        -:  217: *         ECMA_VALUE_NOT_FOUND - if the binding not exists or blocked via @@unscopables
+        -:  218: *         result of the binding - otherwise
+        -:  219: */
+        -:  220:ecma_value_t
+    #####:  221:ecma_op_object_bound_environment_resolve_reference_value (ecma_object_t *lex_env_p, /**< lexical environment */
+        -:  222:                                                          ecma_string_t *name_p) /**< variable name */
+        -:  223:{
+    #####:  224:  ecma_object_t *binding_obj_p = ecma_get_lex_env_binding_object (lex_env_p);
+        -:  225:  ecma_value_t found_binding;
+        -:  226:
+        -:  227:#if JERRY_BUILTIN_PROXY
+    #####:  228:  if (ECMA_OBJECT_IS_PROXY (binding_obj_p))
+        -:  229:  {
+    #####:  230:    found_binding = ecma_proxy_object_has (binding_obj_p, name_p);
+        -:  231:
+    #####:  232:    if (!ecma_is_value_true (found_binding))
+        -:  233:    {
+    #####:  234:      return ECMA_IS_VALUE_ERROR (found_binding) ? found_binding : ECMA_VALUE_NOT_FOUND;
+        -:  235:    }
+        -:  236:  }
+        -:  237:  else
+        -:  238:  {
+        -:  239:#endif /* JERRY_BUILTIN_PROXY */
+    #####:  240:    found_binding = ecma_op_object_find (binding_obj_p, name_p);
+        -:  241:
+    #####:  242:    if (ECMA_IS_VALUE_ERROR (found_binding) || !ecma_is_value_found (found_binding))
+        -:  243:    {
+    #####:  244:      return found_binding;
+        -:  245:    }
+        -:  246:
+        -:  247:#if JERRY_ESNEXT
+    #####:  248:    if (JERRY_LIKELY (ecma_op_is_global_environment (lex_env_p)))
+        -:  249:#endif /* JERRY_ESNEXT */
+        -:  250:    {
+    #####:  251:      return found_binding;
+        -:  252:    }
+        -:  253:#if JERRY_BUILTIN_PROXY
+        -:  254:  }
+        -:  255:#endif /* JERRY_BUILTIN_PROXY */
+        -:  256:
+        -:  257:#if JERRY_ESNEXT
+    #####:  258:  ecma_value_t blocked = ecma_op_is_prop_unscopable (binding_obj_p, name_p);
+        -:  259:
+    #####:  260:  if (ecma_is_value_false (blocked))
+        -:  261:  {
+        -:  262:#if JERRY_BUILTIN_PROXY
+    #####:  263:    if (ECMA_OBJECT_IS_PROXY (binding_obj_p))
+        -:  264:    {
+    #####:  265:      return ecma_proxy_object_get (binding_obj_p, name_p, ecma_make_object_value (binding_obj_p));
+        -:  266:    }
+        -:  267:#endif /* JERRY_BUILTIN_PROXY */
+    #####:  268:    return found_binding;
+        -:  269:  }
+        -:  270:
+        -:  271:#if JERRY_BUILTIN_PROXY
+    #####:  272:  if (!ECMA_OBJECT_IS_PROXY (binding_obj_p))
+        -:  273:  {
+    #####:  274:    ecma_free_value (found_binding);
+        -:  275:  }
+        -:  276:#endif /* JERRY_BUILTIN_PROXY */
+        -:  277:
+    #####:  278:  return ECMA_IS_VALUE_ERROR (blocked) ? blocked : ECMA_VALUE_NOT_FOUND;
+        -:  279:#endif /* JERRY_ESNEXT */
+        -:  280:} /* ecma_op_object_bound_environment_resolve_reference_value */
+        -:  281:
+        -:  282:/**
+        -:  283: * Resolve value corresponding to reference.
+        -:  284: *
+        -:  285: * @return value of the reference
+        -:  286: */
+        -:  287:ecma_value_t
+        3:  288:ecma_op_resolve_reference_value (ecma_object_t *lex_env_p, /**< starting lexical environment */
+        -:  289:                                 ecma_string_t *name_p) /**< identifier's name */
+        -:  290:{
+        3:  291:  JERRY_ASSERT (lex_env_p != NULL);
+        -:  292:
+        -:  293:  while (true)
+        -:  294:  {
+        3:  295:    switch (ecma_get_lex_env_type (lex_env_p))
+        -:  296:    {
+        3:  297:      case ECMA_LEXICAL_ENVIRONMENT_DECLARATIVE:
+        -:  298:      {
+        3:  299:        ecma_property_t *property_p = ecma_find_named_property (lex_env_p, name_p);
+        -:  300:
+        3:  301:        if (property_p == NULL)
+        -:  302:        {
+    #####:  303:          break;
+        -:  304:        }
+        -:  305:
+        3:  306:        ecma_property_value_t *property_value_p = ECMA_PROPERTY_VALUE_PTR (property_p);
+        -:  307:
+        -:  308:#if JERRY_ESNEXT
+        3:  309:        if (JERRY_UNLIKELY (property_value_p->value == ECMA_VALUE_UNINITIALIZED))
+        -:  310:        {
+    #####:  311:          return ecma_raise_reference_error (ECMA_ERR_LET_CONST_NOT_INITIALIZED);
+        -:  312:        }
+        -:  313:#endif /* JERRY_ESNEXT */
+        -:  314:
+        3:  315:        return ecma_fast_copy_value (property_value_p->value);
+        -:  316:      }
+        -:  317:#if JERRY_ESNEXT
+    #####:  318:      case ECMA_LEXICAL_ENVIRONMENT_CLASS:
+        -:  319:      {
+        -:  320:#if JERRY_MODULE_SYSTEM
+    #####:  321:        if (ECMA_LEX_ENV_CLASS_IS_MODULE (lex_env_p))
+        -:  322:        {
+    #####:  323:          ecma_property_t *property_p = ecma_find_named_property (lex_env_p, name_p);
+        -:  324:
+    #####:  325:          if (property_p == NULL)
+        -:  326:          {
+    #####:  327:            break;
+        -:  328:          }
+        -:  329:
+    #####:  330:          ecma_property_value_t *property_value_p = ECMA_PROPERTY_VALUE_PTR (property_p);
+        -:  331:
+    #####:  332:          if (!(*property_p & ECMA_PROPERTY_FLAG_DATA))
+        -:  333:          {
+    #####:  334:            property_value_p = ecma_get_property_value_from_named_reference (property_value_p);
+        -:  335:          }
+        -:  336:
+    #####:  337:          if (JERRY_UNLIKELY (property_value_p->value == ECMA_VALUE_UNINITIALIZED))
+        -:  338:          {
+    #####:  339:            return ecma_raise_reference_error (ECMA_ERR_LET_CONST_NOT_INITIALIZED);
+        -:  340:          }
+        -:  341:
+    #####:  342:          return ecma_fast_copy_value (property_value_p->value);
+        -:  343:        }
+        -:  344:#endif /* JERRY_MODULE_SYSTEM */
+    #####:  345:        break;
+        -:  346:      }
+        -:  347:#endif /* JERRY_ESNEXT */
+    #####:  348:      default:
+        -:  349:      {
+    #####:  350:        JERRY_ASSERT (ecma_get_lex_env_type (lex_env_p) == ECMA_LEXICAL_ENVIRONMENT_THIS_OBJECT_BOUND);
+        -:  351:#if JERRY_ESNEXT
+    #####:  352:        bool lcache_lookup_allowed = ecma_op_is_global_environment (lex_env_p);
+        -:  353:#else /* !JERRY_ESNEXT*/
+    #####:  354:        bool lcache_lookup_allowed = true;
+        -:  355:#endif /* JERRY_ESNEXT */
+        -:  356:
+    #####:  357:        if (lcache_lookup_allowed)
+        -:  358:        {
+        -:  359:#if JERRY_LCACHE
+    #####:  360:          ecma_object_t *binding_obj_p = ecma_get_lex_env_binding_object (lex_env_p);
+    #####:  361:          ecma_property_t *property_p = ecma_lcache_lookup (binding_obj_p, name_p);
+        -:  362:
+    #####:  363:          if (property_p != NULL)
+        -:  364:          {
+    #####:  365:            JERRY_ASSERT (ECMA_PROPERTY_IS_RAW (*property_p));
+        -:  366:
+    #####:  367:            ecma_property_value_t *prop_value_p = ECMA_PROPERTY_VALUE_PTR (property_p);
+        -:  368:
+    #####:  369:            if (*property_p & ECMA_PROPERTY_FLAG_DATA)
+        -:  370:            {
+    #####:  371:              return ecma_fast_copy_value (prop_value_p->value);
+        -:  372:            }
+        -:  373:
+    #####:  374:            ecma_getter_setter_pointers_t *get_set_pair_p = ecma_get_named_accessor_property (prop_value_p);
+        -:  375:
+    #####:  376:            if (get_set_pair_p->getter_cp == JMEM_CP_NULL)
+        -:  377:            {
+    #####:  378:              return ECMA_VALUE_UNDEFINED;
+        -:  379:            }
+        -:  380:
+    #####:  381:            ecma_object_t *getter_p = ECMA_GET_NON_NULL_POINTER (ecma_object_t, get_set_pair_p->getter_cp);
+        -:  382:
+    #####:  383:            ecma_value_t base_value = ecma_make_object_value (binding_obj_p);
+    #####:  384:            return ecma_op_function_call (getter_p, base_value, NULL, 0);
+        -:  385:          }
+        -:  386:#endif /* JERRY_LCACHE */
+        -:  387:        }
+        -:  388:
+    #####:  389:        ecma_value_t result = ecma_op_object_bound_environment_resolve_reference_value (lex_env_p, name_p);
+        -:  390:
+    #####:  391:        if (ecma_is_value_found (result))
+        -:  392:        {
+        -:  393:          /* Note: the result may contains ECMA_VALUE_ERROR */
+    #####:  394:          return result;
+        -:  395:        }
+    #####:  396:        break;
+        -:  397:      }
+        -:  398:    }
+        -:  399:
+    #####:  400:    if (lex_env_p->u2.outer_reference_cp == JMEM_CP_NULL)
+        -:  401:    {
+    #####:  402:      break;
+        -:  403:    }
+        -:  404:
+    #####:  405:    lex_env_p = ECMA_GET_NON_NULL_POINTER (ecma_object_t, lex_env_p->u2.outer_reference_cp);
+        -:  406:  }
+        -:  407:
+        -:  408:#if JERRY_ERROR_MESSAGES
+    #####:  409:  ecma_value_t name_val = ecma_make_string_value (name_p);
+    #####:  410:  ecma_value_t error_value =
+        -:  411:    ecma_raise_standard_error_with_format (JERRY_ERROR_REFERENCE, "% is not defined", name_val);
+        -:  412:#else /* JERRY_ERROR_MESSAGES */
+        -:  413:  ecma_value_t error_value = ecma_raise_reference_error (ECMA_ERR_EMPTY);
+        -:  414:#endif /* !JERRY_ERROR_MESSAGES */
+    #####:  415:  return error_value;
+        -:  416:} /* ecma_op_resolve_reference_value */
+        -:  417:
+        -:  418:/**
+        -:  419: * @}
+        -:  420: * @}
+        -:  421: */

@@ -1,0 +1,929 @@
+        -:    0:Source:/home/workspace/tests/unit-ext/test-ext-arg.c
+        -:    0:Programs:291
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:/**
+        -:   17: * Unit test for jerry-ext/args.
+        -:   18: */
+        -:   19:
+        -:   20:#include <string.h>
+        -:   21:#include "jerryscript.h"
+        -:   22:#include "jerryscript-ext/arg.h"
+        -:   23:#include "test-common.h"
+        -:   24:
+        -:   25:static const jerry_char_t test_source[] = TEST_STRING_LITERAL (
+        -:   26:  "var arg1 = true;"
+        -:   27:  "var arg2 = 10.5;"
+        -:   28:  "var arg3 = 'abc';"
+        -:   29:  "var arg4 = function foo() {};"
+        -:   30:  "test_validator1(arg1, arg2, arg3, arg4);"
+        -:   31:  "arg1 = new Boolean(true);"
+        -:   32:  "arg3 = new String('abc');"
+        -:   33:  "test_validator1(arg1, arg2, arg3);"
+        -:   34:  "test_validator1(arg1, arg2, '');"
+        -:   35:  "arg2 = new Number(10.5);"
+        -:   36:  "test_validator1(arg1, arg2, arg3);"
+        -:   37:  "test_validator1(arg1, 10.5, 'abcdef');"
+        -:   38:  "test_validator3(arg1, arg1);"
+        -:   39:  "test_validator3(arg1);"
+        -:   40:  "test_validator3();"
+        -:   41:  "test_validator3(undefined, undefined);"
+        -:   42:  "var obj_a = new MyObjectA();"
+        -:   43:  "var obj_b = new MyObjectB();"
+        -:   44:  "test_validator2.call(obj_a, 5);"
+        -:   45:  "test_validator2.call(obj_b, 5);"
+        -:   46:  "test_validator2.call(obj_a, 1);"
+        -:   47:  "var obj1 = {prop1:true, prop2:'1.5'};"
+        -:   48:  "test_validator_prop1(obj1);"
+        -:   49:  "test_validator_prop2(obj1);"
+        -:   50:  "test_validator_prop2();"
+        -:   51:  "var obj2 = {prop1:true};"
+        -:   52:  "Object.defineProperty(obj2, 'prop2', {"
+        -:   53:  "  get: function() { throw new TypeError('prop2 error') }"
+        -:   54:  "});"
+        -:   55:  "test_validator_prop3(obj2);"
+        -:   56:  "test_validator_int1(-1000, 1000, 128, -1000, 1000, -127,"
+        -:   57:  "                    -1000, 4294967297, 65536, -2200000000, 4294967297, -2147483647);"
+        -:   58:  "test_validator_int2(-1.5, -1.5, -1.5, 1.5, 1.5, 1.5, Infinity, -Infinity, 300.5, 300.5);"
+        -:   59:  "test_validator_int3(NaN);"
+        -:   60:  "var arr = [1, 2];"
+        -:   61:  "test_validator_array1(arr);"
+        -:   62:  "test_validator_array1();"
+        -:   63:  "test_validator_array2(arr);"
+        -:   64:  "test_validator_restore(false, 3.0);"
+        -:   65:  "test_validator_restore(3.0, false);"
+        -:   66:);
+        -:   67:
+        -:   68:static const jerry_object_native_info_t thing_a_info =
+        -:   69:{
+        -:   70:  .free_cb = NULL,
+        -:   71:  .number_of_references = 0,
+        -:   72:  .offset_of_references = 0,
+        -:   73:};
+        -:   74:
+        -:   75:static const jerry_object_native_info_t thing_b_info =
+        -:   76:{
+        -:   77:  .free_cb = NULL,
+        -:   78:  .number_of_references = 0,
+        -:   79:  .offset_of_references = 0,
+        -:   80:};
+        -:   81:
+        -:   82:typedef struct
+        -:   83:{
+        -:   84:  int x;
+        -:   85:} my_type_a_t;
+        -:   86:
+        -:   87:typedef struct
+        -:   88:{
+        -:   89:  bool x;
+        -:   90:} my_type_b_t;
+        -:   91:
+        -:   92:static my_type_a_t my_thing_a;
+        -:   93:static my_type_b_t my_thing_b;
+        -:   94:
+        -:   95:static int validator1_count = 0;
+        -:   96:static int validator2_count = 0;
+        -:   97:static int validator3_count = 0;
+        -:   98:static int validator_int_count = 0;
+        -:   99:static int validator_prop_count = 0;
+        -:  100:static int validator_array_count = 0;
+        -:  101:static int validator_restore_count = 0;
+        -:  102:
+        -:  103:/**
+        -:  104: * The handler should have following arguments:
+        -:  105: *   this: Ignore.
+        -:  106: *   arg1: Bool.
+        -:  107: *   arg2: Number. It must be strict primitive number.
+        -:  108: *   arg3: String.
+        -:  109: *   arg4: function. It is an optional argument.
+        -:  110: *
+        -:  111: */
+        -:  112:static jerry_value_t
+    #####:  113:test_validator1_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  114:                         const jerry_value_t args_p[], /**< arguments list */
+        -:  115:                         const jerry_length_t args_cnt) /**< arguments length */
+        -:  116:{
+        -:  117:  bool arg1;
+    #####:  118:  double arg2 = 0.0;
+    #####:  119:  char arg3[5] = "1234";
+    #####:  120:  jerry_value_t arg4 = jerry_create_undefined ();
+        -:  121:
+    #####:  122:  jerryx_arg_t mapping[] =
+        -:  123:  {
+        -:  124:    /* ignore this */
+        -:  125:    jerryx_arg_ignore (),
+        -:  126:    /* 1st argument should be boolean */
+        -:  127:    jerryx_arg_boolean (&arg1, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  128:    /* 2nd argument should be strict number */
+        -:  129:    jerryx_arg_number (&arg2, JERRYX_ARG_NO_COERCE, JERRYX_ARG_REQUIRED),
+        -:  130:    /* 3th argument should be string */
+        -:  131:    jerryx_arg_string (arg3, 5, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  132:    /* 4th argument should be function, and it is optional */
+        -:  133:    jerryx_arg_function (&arg4, JERRYX_ARG_OPTIONAL)
+        -:  134:  };
+        -:  135:
+    #####:  136:  jerry_value_t is_ok = jerryx_arg_transform_this_and_args (call_info_p->this_value,
+        -:  137:                                                            args_p,
+        -:  138:                                                            args_cnt,
+        -:  139:                                                            mapping,
+        -:  140:                                                            ARRAY_SIZE (mapping));
+        -:  141:
+    #####:  142:  if (validator1_count == 0)
+        -:  143:  {
+    #####:  144:    TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  145:    TEST_ASSERT (arg1);
+    #####:  146:    TEST_ASSERT (arg2 == 10.5);
+    #####:  147:    TEST_ASSERT (strcmp (arg3, "abc") == 0);
+    #####:  148:    TEST_ASSERT (jerry_value_is_function (arg4));
+        -:  149:  }
+    #####:  150:  else if (validator1_count == 1)
+        -:  151:  {
+    #####:  152:    TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  153:    TEST_ASSERT (arg1);
+    #####:  154:    TEST_ASSERT (arg2 == 10.5);
+    #####:  155:    TEST_ASSERT (strcmp (arg3, "abc") == 0);
+    #####:  156:    TEST_ASSERT (jerry_value_is_undefined (arg4));
+        -:  157:  }
+    #####:  158:  else if (validator1_count == 2)
+        -:  159:  {
+    #####:  160:    TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  161:    TEST_ASSERT (arg1);
+    #####:  162:    TEST_ASSERT (arg2 == 10.5);
+    #####:  163:    TEST_ASSERT (strcmp (arg3, "") == 0);
+    #####:  164:    TEST_ASSERT (jerry_value_is_undefined (arg4));
+        -:  165:  }
+        -:  166:  else
+        -:  167:  {
+    #####:  168:    TEST_ASSERT (jerry_value_is_error (is_ok));
+        -:  169:  }
+        -:  170:
+    #####:  171:  jerry_release_value (is_ok);
+    #####:  172:  jerry_release_value (arg4);
+    #####:  173:  validator1_count++;
+        -:  174:
+    #####:  175:  return jerry_create_undefined ();
+        -:  176:} /* test_validator1_handler */
+        -:  177:
+        -:  178:/**
+        -:  179: * The JS argument should be number, whose value is equal with the extra_info .
+        -:  180: */
+        -:  181:static jerry_value_t
+    #####:  182:my_custom_transform (jerryx_arg_js_iterator_t *js_arg_iter_p, /**< available JS args */
+        -:  183:                     const jerryx_arg_t *c_arg_p) /**< the native arg */
+        -:  184:{
+    #####:  185:  jerry_value_t js_arg = jerryx_arg_js_iterator_pop (js_arg_iter_p);
+    #####:  186:  jerry_value_t to_number = jerry_value_to_number (js_arg);
+        -:  187:
+    #####:  188:  if (jerry_value_is_error (to_number))
+        -:  189:  {
+    #####:  190:    jerry_release_value (to_number);
+        -:  191:
+    #####:  192:    return jerry_create_error (JERRY_ERROR_TYPE,
+        -:  193:                               (jerry_char_t *) "It can not be converted to a number.");
+        -:  194:  }
+        -:  195:
+    #####:  196:  int expected_num = (int) c_arg_p->extra_info;
+    #####:  197:  int get_num = (int) jerry_get_number_value (to_number);
+        -:  198:
+    #####:  199:  if (get_num != expected_num)
+        -:  200:  {
+    #####:  201:    return jerry_create_error (JERRY_ERROR_TYPE,
+        -:  202:                               (jerry_char_t *) "Number value is not expected.");
+        -:  203:  }
+        -:  204:
+    #####:  205:  return jerry_create_undefined ();
+        -:  206:} /* my_custom_transform */
+        -:  207:
+        -:  208:/**
+        -:  209: * The handler should have following arguments:
+        -:  210: *   this: with native pointer whose type is bind_a_info.
+        -:  211: *   arg1: should pass the custom tranform function.
+        -:  212: */
+        -:  213:static jerry_value_t
+    #####:  214:test_validator2_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  215:                         const jerry_value_t args_p[], /**< arguments list */
+        -:  216:                         const jerry_length_t args_cnt) /**< arguments length */
+        -:  217:{
+        -:  218:  my_type_a_t *thing_p;
+        -:  219:
+    #####:  220:  jerryx_arg_t mapping[] =
+        -:  221:  {
+        -:  222:    /* this should has native pointer, whose type is thing_a_info */
+        -:  223:    jerryx_arg_native_pointer ((void **) &thing_p, &thing_a_info, JERRYX_ARG_REQUIRED),
+        -:  224:    /* custom tranform function */
+        -:  225:    jerryx_arg_custom (NULL, 5, my_custom_transform)
+        -:  226:  };
+        -:  227:
+    #####:  228:  jerry_value_t is_ok = jerryx_arg_transform_this_and_args (call_info_p->this_value,
+        -:  229:                                                            args_p,
+        -:  230:                                                            args_cnt,
+        -:  231:                                                            mapping,
+        -:  232:                                                            ARRAY_SIZE (mapping));
+        -:  233:
+    #####:  234:  if (validator2_count == 0)
+        -:  235:  {
+    #####:  236:    TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  237:    TEST_ASSERT (thing_p == &my_thing_a);
+    #####:  238:    TEST_ASSERT (thing_p->x == 1);
+        -:  239:  }
+        -:  240:  else
+        -:  241:  {
+    #####:  242:    TEST_ASSERT (jerry_value_is_error (is_ok));
+        -:  243:  }
+        -:  244:
+    #####:  245:  jerry_release_value (is_ok);
+    #####:  246:  validator2_count++;
+        -:  247:
+    #####:  248:  return jerry_create_undefined ();
+        -:  249:} /* test_validator2_handler */
+        -:  250:
+        -:  251:/**
+        -:  252: * The handler should have following arguments:
+        -:  253: *   arg1: Bool. It is an optional argument.
+        -:  254: *
+        -:  255: */
+        -:  256:static jerry_value_t
+    #####:  257:test_validator3_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  258:                         const jerry_value_t args_p[], /**< arguments list */
+        -:  259:                         const jerry_length_t args_cnt) /**< arguments length */
+        -:  260:{
+    #####:  261:  bool arg1 = false;
+    #####:  262:  bool arg2 = false;
+        -:  263:
+    #####:  264:  jerryx_arg_t mapping[] =
+        -:  265:  {
+        -:  266:    /* ignore this */
+        -:  267:    jerryx_arg_ignore (),
+        -:  268:    /* 1th argument should be boolean, and it is optional */
+        -:  269:    jerryx_arg_boolean (&arg1, JERRYX_ARG_COERCE, JERRYX_ARG_OPTIONAL),
+        -:  270:    /* 2nd argument should be boolean, and it is optional */
+        -:  271:    jerryx_arg_boolean (&arg2, JERRYX_ARG_COERCE, JERRYX_ARG_OPTIONAL),
+        -:  272:  };
+        -:  273:
+    #####:  274:  jerry_value_t is_ok = jerryx_arg_transform_this_and_args (call_info_p->this_value,
+        -:  275:                                                            args_p,
+        -:  276:                                                            args_cnt,
+        -:  277:                                                            mapping,
+        -:  278:                                                            ARRAY_SIZE (mapping));
+        -:  279:
+    #####:  280:  if (validator3_count == 0)
+        -:  281:  {
+    #####:  282:    TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  283:    TEST_ASSERT (arg1);
+    #####:  284:    TEST_ASSERT (arg2);
+        -:  285:  }
+    #####:  286:  else if (validator3_count == 1)
+        -:  287:  {
+    #####:  288:    TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  289:    TEST_ASSERT (arg1);
+        -:  290:    /* arg2 must be unchanged */
+    #####:  291:    TEST_ASSERT (!arg2);
+        -:  292:  }
+    #####:  293:  else if (validator3_count == 2)
+        -:  294:  {
+    #####:  295:    TEST_ASSERT (!jerry_value_is_error (is_ok));
+        -:  296:    /* arg1 must be unchanged */
+    #####:  297:    TEST_ASSERT (!arg1);
+        -:  298:    /* arg2 must be unchanged */
+    #####:  299:    TEST_ASSERT (!arg2);
+        -:  300:  }
+    #####:  301:  else if (validator3_count == 3)
+        -:  302:  {
+    #####:  303:    TEST_ASSERT (!jerry_value_is_error (is_ok));
+        -:  304:    /* arg1 must be unchanged */
+    #####:  305:    TEST_ASSERT (!arg1);
+        -:  306:    /* arg2 must be unchanged */
+    #####:  307:    TEST_ASSERT (!arg2);
+        -:  308:  }
+        -:  309:
+    #####:  310:  jerry_release_value (is_ok);
+    #####:  311:  validator3_count++;
+        -:  312:
+    #####:  313:  return jerry_create_undefined ();
+        -:  314:} /* test_validator3_handler */
+        -:  315:
+        -:  316:/**
+        -:  317: * Calling jerryx_arg_transform_object_properties directly.
+        -:  318: */
+        -:  319:static jerry_value_t
+    #####:  320:test_validator_prop1_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  321:                              const jerry_value_t args_p[], /**< arguments list */
+        -:  322:                              const jerry_length_t args_cnt) /**< arguments length */
+        -:  323:{
+        -:  324:  JERRY_UNUSED (call_info_p);
+        -:  325:  JERRY_UNUSED (args_cnt);
+        -:  326:
+    #####:  327:  bool native1 = false;
+    #####:  328:  double native2 = 0;
+    #####:  329:  double native3 = 3;
+        -:  330:
+    #####:  331:  const char *name_p[] = {"prop1", "prop2", "prop3"};
+        -:  332:
+    #####:  333:  jerryx_arg_t mapping[] =
+        -:  334:  {
+        -:  335:    jerryx_arg_boolean (&native1, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  336:    jerryx_arg_number (&native2, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  337:    jerryx_arg_number (&native3, JERRYX_ARG_COERCE, JERRYX_ARG_OPTIONAL)
+        -:  338:  };
+        -:  339:
+    #####:  340:  jerry_value_t is_ok = jerryx_arg_transform_object_properties (args_p[0],
+        -:  341:                                                                (const jerry_char_t **) name_p,
+        -:  342:                                                                ARRAY_SIZE (name_p),
+        -:  343:                                                                mapping,
+        -:  344:                                                                ARRAY_SIZE (mapping));
+        -:  345:
+    #####:  346:  TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  347:  TEST_ASSERT (native1);
+    #####:  348:  TEST_ASSERT (native2 == 1.5);
+    #####:  349:  TEST_ASSERT (native3 == 3);
+        -:  350:
+    #####:  351:  validator_prop_count++;
+        -:  352:
+    #####:  353:  return jerry_create_undefined ();
+        -:  354:} /* test_validator_prop1_handler */
+        -:  355:
+        -:  356:/**
+        -:  357: * Calling jerryx_arg_transform_object_properties indirectly by
+        -:  358: * using jerryx_arg_object_properties.
+        -:  359: */
+        -:  360:static jerry_value_t
+    #####:  361:test_validator_prop2_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  362:                              const jerry_value_t args_p[], /**< arguments list */
+        -:  363:                              const jerry_length_t args_cnt) /**< arguments length */
+        -:  364:{
+        -:  365:  JERRY_UNUSED (call_info_p);
+        -:  366:
+    #####:  367:  bool native1 = false;
+    #####:  368:  double native2 = 0;
+    #####:  369:  double native3 = 3;
+        -:  370:
+        -:  371:  jerryx_arg_object_props_t prop_info;
+        -:  372:
+    #####:  373:  const char *name_p[] = { "prop1", "prop2", "prop3" };
+        -:  374:
+    #####:  375:  jerryx_arg_t prop_mapping[] =
+        -:  376:  {
+        -:  377:    jerryx_arg_boolean (&native1, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  378:    jerryx_arg_number (&native2, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  379:    jerryx_arg_number (&native3, JERRYX_ARG_COERCE, JERRYX_ARG_OPTIONAL)
+        -:  380:  };
+        -:  381:
+    #####:  382:  prop_info.name_p = (const jerry_char_t **) name_p;
+    #####:  383:  prop_info.name_cnt = 3;
+    #####:  384:  prop_info.c_arg_p = prop_mapping;
+    #####:  385:  prop_info.c_arg_cnt = 3;
+        -:  386:
+    #####:  387:  jerryx_arg_t mapping[] =
+        -:  388:  {
+        -:  389:    jerryx_arg_object_properties (&prop_info, JERRYX_ARG_OPTIONAL),
+        -:  390:  };
+        -:  391:
+    #####:  392:  jerry_value_t is_ok = jerryx_arg_transform_args (args_p, args_cnt, mapping, ARRAY_SIZE (mapping));
+        -:  393:
+    #####:  394:  TEST_ASSERT (!jerry_value_is_error (is_ok));
+        -:  395:
+    #####:  396:  if (validator_prop_count == 1)
+        -:  397:  {
+    #####:  398:    TEST_ASSERT (native1);
+    #####:  399:    TEST_ASSERT (native2 == 1.5);
+    #####:  400:    TEST_ASSERT (native3 == 3);
+        -:  401:  }
+        -:  402:
+    #####:  403:  validator_prop_count++;
+        -:  404:
+    #####:  405:  return jerry_create_undefined ();
+        -:  406:} /* test_validator_prop2_handler */
+        -:  407:
+        -:  408:static jerry_value_t
+    #####:  409:test_validator_prop3_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  410:                              const jerry_value_t args_p[], /**< arguments list */
+        -:  411:                              const jerry_length_t args_cnt) /**< arguments length */
+        -:  412:{
+        -:  413:  JERRY_UNUSED (call_info_p);
+        -:  414:  JERRY_UNUSED (args_cnt);
+        -:  415:
+    #####:  416:  bool native1 = false;
+    #####:  417:  bool native2 = true;
+        -:  418:
+    #####:  419:  const char *name_p[] = { "prop1", "prop2" };
+        -:  420:
+    #####:  421:  jerryx_arg_t mapping[] =
+        -:  422:  {
+        -:  423:    jerryx_arg_boolean (&native1, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  424:    jerryx_arg_boolean (&native2, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  425:  };
+        -:  426:
+    #####:  427:  jerry_value_t is_ok = jerryx_arg_transform_object_properties (args_p[0],
+        -:  428:                                                                (const jerry_char_t **) name_p,
+        -:  429:                                                                ARRAY_SIZE (name_p),
+        -:  430:                                                                mapping,
+        -:  431:                                                                ARRAY_SIZE (mapping));
+        -:  432:
+    #####:  433:  TEST_ASSERT (jerry_value_is_error (is_ok));
+    #####:  434:  TEST_ASSERT (!native1);
+    #####:  435:  TEST_ASSERT (native2);
+        -:  436:
+    #####:  437:  validator_prop_count++;
+    #####:  438:  jerry_release_value (is_ok);
+        -:  439:
+    #####:  440:  return jerry_create_undefined ();
+        -:  441:} /* test_validator_prop3_handler */
+        -:  442:
+        -:  443:/*
+        -:  444: * args_p[0-2] are uint8, args_p[3-5] are int8, args_p[6-8] are uint32, args_p[9-11] are int32.
+        -:  445: */
+        -:  446:static jerry_value_t
+    #####:  447:test_validator_int1_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  448:                             const jerry_value_t args_p[], /**< arguments list */
+        -:  449:                             const jerry_length_t args_cnt) /**< arguments length */
+        -:  450:{
+        -:  451:  JERRY_UNUSED (call_info_p);
+        -:  452:
+        -:  453:  uint8_t num0, num1, num2;
+        -:  454:  int8_t num3, num4, num5;
+        -:  455:  uint32_t num6, num7, num8;
+        -:  456:  int32_t num9, num10, num11;
+        -:  457:
+    #####:  458:  jerryx_arg_t mapping[] =
+        -:  459:  {
+        -:  460:    jerryx_arg_uint8 (&num0, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  461:    jerryx_arg_uint8 (&num1, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  462:    jerryx_arg_uint8 (&num2, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  463:    jerryx_arg_int8 (&num3, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  464:    jerryx_arg_int8 (&num4, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  465:    jerryx_arg_int8 (&num5, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  466:    jerryx_arg_uint32 (&num6, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  467:    jerryx_arg_uint32 (&num7, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  468:    jerryx_arg_uint32 (&num8, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  469:    jerryx_arg_int32 (&num9, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  470:    jerryx_arg_int32 (&num10, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  471:    jerryx_arg_int32 (&num11, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED)
+        -:  472:  };
+        -:  473:
+    #####:  474:  jerry_value_t is_ok = jerryx_arg_transform_args (args_p,
+        -:  475:                                                   args_cnt,
+        -:  476:                                                   mapping,
+        -:  477:                                                   ARRAY_SIZE (mapping));
+        -:  478:
+    #####:  479:  TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  480:  TEST_ASSERT (num0 == 0);
+    #####:  481:  TEST_ASSERT (num1 == 255);
+    #####:  482:  TEST_ASSERT (num2 == 128);
+    #####:  483:  TEST_ASSERT (num3 == -128);
+    #####:  484:  TEST_ASSERT (num4 == 127);
+    #####:  485:  TEST_ASSERT (num5 == -127);
+    #####:  486:  TEST_ASSERT (num6 == 0);
+    #####:  487:  TEST_ASSERT (num7 == 4294967295);
+    #####:  488:  TEST_ASSERT (num8 == 65536);
+    #####:  489:  TEST_ASSERT (num9 == -2147483648);
+    #####:  490:  TEST_ASSERT (num10 == 2147483647);
+    #####:  491:  TEST_ASSERT (num11 == -2147483647);
+        -:  492:
+    #####:  493:  jerry_release_value (is_ok);
+    #####:  494:  validator_int_count++;
+        -:  495:
+    #####:  496:  return jerry_create_undefined ();
+        -:  497:} /* test_validator_int1_handler */
+        -:  498:
+        -:  499:static jerry_value_t
+    #####:  500:test_validator_int2_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  501:                             const jerry_value_t args_p[], /**< arguments list */
+        -:  502:                             const jerry_length_t args_cnt) /**< arguments length */
+        -:  503:{
+        -:  504:  JERRY_UNUSED (call_info_p);
+        -:  505:
+        -:  506:  int8_t num0, num1, num2, num3, num4, num5, num6, num7, num8, num9;
+    #####:  507:  num8 = 123;
+    #####:  508:  num9 = 123;
+        -:  509:
+    #####:  510:  jerryx_arg_t mapping[] =
+        -:  511:  {
+        -:  512:    jerryx_arg_int8 (&num0, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  513:    jerryx_arg_int8 (&num1, JERRYX_ARG_FLOOR, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  514:    jerryx_arg_int8 (&num2, JERRYX_ARG_CEIL, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  515:    jerryx_arg_int8 (&num3, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  516:    jerryx_arg_int8 (&num4, JERRYX_ARG_FLOOR, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  517:    jerryx_arg_int8 (&num5, JERRYX_ARG_CEIL, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  518:    jerryx_arg_int8 (&num6, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  519:    jerryx_arg_int8 (&num7, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  520:    jerryx_arg_int8 (&num8, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  521:    jerryx_arg_int8 (&num9, JERRYX_ARG_ROUND, JERRYX_ARG_NO_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  522:  };
+        -:  523:
+    #####:  524:  jerry_value_t is_ok = jerryx_arg_transform_args (args_p,
+        -:  525:                                                   args_cnt,
+        -:  526:                                                   mapping,
+        -:  527:                                                   ARRAY_SIZE (mapping));
+        -:  528:
+    #####:  529:  TEST_ASSERT (jerry_value_is_error (is_ok));
+    #####:  530:  TEST_ASSERT (num0 == -2);
+    #####:  531:  TEST_ASSERT (num1 == -2);
+    #####:  532:  TEST_ASSERT (num2 == -1);
+    #####:  533:  TEST_ASSERT (num3 == 2);
+    #####:  534:  TEST_ASSERT (num4 == 1);
+    #####:  535:  TEST_ASSERT (num5 == 2);
+    #####:  536:  TEST_ASSERT (num6 == 127);
+    #####:  537:  TEST_ASSERT (num7 == -128);
+    #####:  538:  TEST_ASSERT (num8 == 127);
+    #####:  539:  TEST_ASSERT (num9 == 123);
+        -:  540:
+    #####:  541:  jerry_release_value (is_ok);
+    #####:  542:  validator_int_count++;
+        -:  543:
+    #####:  544:  return jerry_create_undefined ();
+        -:  545:} /* test_validator_int2_handler */
+        -:  546:
+        -:  547:static jerry_value_t
+    #####:  548:test_validator_int3_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  549:                             const jerry_value_t args_p[], /**< arguments list */
+        -:  550:                             const jerry_length_t args_cnt) /**< arguments length */
+        -:  551:{
+        -:  552:  JERRY_UNUSED (call_info_p);
+        -:  553:
+        -:  554:  int8_t num0;
+        -:  555:
+    #####:  556:  jerryx_arg_t mapping[] =
+        -:  557:  {
+        -:  558:    jerryx_arg_int8 (&num0, JERRYX_ARG_ROUND, JERRYX_ARG_CLAMP, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  559:  };
+        -:  560:
+    #####:  561:  jerry_value_t is_ok = jerryx_arg_transform_args (args_p,
+        -:  562:                                                   args_cnt,
+        -:  563:                                                   mapping,
+        -:  564:                                                   ARRAY_SIZE (mapping));
+        -:  565:
+    #####:  566:  TEST_ASSERT (jerry_value_is_error (is_ok));
+        -:  567:
+    #####:  568:  jerry_release_value (is_ok);
+    #####:  569:  validator_int_count++;
+        -:  570:
+    #####:  571:  return jerry_create_undefined ();
+        -:  572:} /* test_validator_int3_handler */
+        -:  573:
+        -:  574:static jerry_value_t
+    #####:  575:test_validator_array1_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  576:                               const jerry_value_t args_p[], /**< arguments list */
+        -:  577:                               const jerry_length_t args_cnt) /**< arguments length */
+        -:  578:{
+        -:  579:  JERRY_UNUSED (call_info_p);
+        -:  580:
+    #####:  581:  double native1 = 0;
+    #####:  582:  double native2 = 0;
+    #####:  583:  double native3 = 0;
+        -:  584:
+        -:  585:  jerryx_arg_array_items_t arr_info;
+        -:  586:
+    #####:  587:  jerryx_arg_t item_mapping[] =
+        -:  588:  {
+        -:  589:    jerryx_arg_number (&native1, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  590:    jerryx_arg_number (&native2, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  591:    jerryx_arg_number (&native3, JERRYX_ARG_COERCE, JERRYX_ARG_OPTIONAL)
+        -:  592:  };
+        -:  593:
+    #####:  594:  arr_info.c_arg_p = item_mapping;
+    #####:  595:  arr_info.c_arg_cnt = 3;
+        -:  596:
+    #####:  597:  jerryx_arg_t mapping[] =
+        -:  598:  {
+        -:  599:    jerryx_arg_array (&arr_info, JERRYX_ARG_OPTIONAL),
+        -:  600:  };
+        -:  601:
+    #####:  602:  jerry_value_t is_ok = jerryx_arg_transform_args (args_p, args_cnt, mapping, ARRAY_SIZE (mapping));
+        -:  603:
+    #####:  604:  TEST_ASSERT (!jerry_value_is_error (is_ok));
+        -:  605:
+    #####:  606:  if (validator_array_count == 0)
+        -:  607:  {
+    #####:  608:    TEST_ASSERT (native1 == 1);
+    #####:  609:    TEST_ASSERT (native2 == 2);
+    #####:  610:    TEST_ASSERT (native3 == 0);
+        -:  611:  }
+        -:  612:
+    #####:  613:  validator_array_count++;
+        -:  614:
+    #####:  615:  return jerry_create_undefined ();
+        -:  616:} /* test_validator_array1_handler */
+        -:  617:
+        -:  618:static jerry_value_t
+    #####:  619:test_validator_array2_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  620:                               const jerry_value_t args_p[], /**< arguments list */
+        -:  621:                               const jerry_length_t args_cnt) /**< arguments length */
+        -:  622:{
+        -:  623:  JERRY_UNUSED (call_info_p);
+        -:  624:  JERRY_UNUSED (args_cnt);
+        -:  625:
+    #####:  626:  double native1 = 0;
+    #####:  627:  bool native2 = false;
+        -:  628:
+    #####:  629:  jerryx_arg_t item_mapping[] =
+        -:  630:  {
+        -:  631:    jerryx_arg_number (&native1, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  632:    jerryx_arg_boolean (&native2, JERRYX_ARG_NO_COERCE, JERRYX_ARG_REQUIRED)
+        -:  633:  };
+        -:  634:
+    #####:  635:  jerry_value_t is_ok = jerryx_arg_transform_array (args_p[0], item_mapping, ARRAY_SIZE (item_mapping));
+        -:  636:
+    #####:  637:  TEST_ASSERT (jerry_value_is_error (is_ok));
+    #####:  638:  TEST_ASSERT (native1 == 1);
+    #####:  639:  TEST_ASSERT (!native2);
+        -:  640:
+    #####:  641:  validator_array_count++;
+    #####:  642:  jerry_release_value (is_ok);
+        -:  643:
+    #####:  644:  return jerry_create_undefined ();
+        -:  645:} /* test_validator_array2_handler */
+        -:  646:
+        -:  647:/**
+        -:  648: * This validator is designed to test the
+        -:  649: * jerryx_arg_js_iterator_restore function.  We'll introduce a union
+        -:  650: * type to hold a bool or double and a transform function that will
+        -:  651: * look for this type.  Then, we'll call the handler with two
+        -:  652: * parameters, one bool and one double and see if we correctly build
+        -:  653: * the union types for each parameter.  To check that the code protects
+        -:  654: * against backing up too far, when the check for the double fails,
+        -:  655: * we'll "restore" the stack three times; this shouldn't break
+        -:  656: * anything.
+        -:  657:*/
+        -:  658:/*
+        -:  659: * This enumeration type specifies the kind of thing held in the union.
+        -:  660:*/
+        -:  661:typedef enum
+        -:  662:{
+        -:  663:  DOUBLE_VALUE,
+        -:  664:  BOOL_VALUE
+        -:  665:} union_type_t;
+        -:  666:
+        -:  667:/*
+        -:  668: * This struct holds either a boolean or double in a union and has a
+        -:  669: * second field that describes the type held in the union.
+        -:  670:*/
+        -:  671:typedef struct
+        -:  672:{
+        -:  673:  union_type_t type_of_value;
+        -:  674:  union
+        -:  675:  {
+        -:  676:    double double_field;
+        -:  677:    bool bool_field;
+        -:  678:  } value;
+        -:  679:} double_or_bool_t;
+        -:  680:
+        -:  681:/**
+        -:  682: * This creates a jerryx_arg_t that can be used like any
+        -:  683: * of the installed functions, like jerryx_arg_bool().
+        -:  684: */
+        -:  685:#define jerryx_arg_double_or_bool_t(value_ptr, coerce_or_not, optional_or_not, last_parameter) \
+        -:  686:        jerryx_arg_custom (value_ptr, \
+        -:  687:                           (uintptr_t)&((uintptr_t []){(uintptr_t)coerce_or_not, \
+        -:  688:                                                       (uintptr_t)optional_or_not, \
+        -:  689:                                                       (uintptr_t)last_parameter}), \
+        -:  690:                           jerry_arg_to_double_or_bool_t)
+        -:  691:/*
+        -:  692: * This function is the argument validator used in the above macro called
+        -:  693: * jerryx_arg_double_or_bool. It calls jerryx_arg_js_iterator_restore()
+        -:  694: * more times than it should to ensure that calling that function too
+        -:  695: * often doesn't cause an error.
+        -:  696:*/
+        -:  697:static jerry_value_t
+    #####:  698:jerry_arg_to_double_or_bool_t (jerryx_arg_js_iterator_t *js_arg_iter_p,
+        -:  699:                             const jerryx_arg_t *c_arg_p)
+        -:  700:{
+        -:  701:  /* c_arg_p has two fields: dest, which is a pointer to the data that
+        -:  702:   * gets filled in, and extra_info, which contains the flags used to
+        -:  703:   * control coercion and optional-ness, respectively. For this test,
+        -:  704:   * we added an extra flag that tells us that we're working on the
+        -:  705:   * last parameter; when we know it's the last parameter, we'll "restore"
+        -:  706:   * the stack more times than there are actual stack values to ensure
+        -:  707:   * that the restore function doesn't produce an error. */
+    #####:  708:  double_or_bool_t *destination = c_arg_p->dest;
+    #####:  709:  uintptr_t *extra_info = (uintptr_t *) (c_arg_p->extra_info);
+        -:  710:  jerryx_arg_t conversion_function;
+        -:  711:  jerry_value_t conversion_result;
+        -:  712:  jerry_value_t restore_result;
+    #####:  713:  bool last_parameter = (extra_info[2] == 1);
+        -:  714:
+    #####:  715:  validator_restore_count++;
+        -:  716:
+    #####:  717:  conversion_function = jerryx_arg_number ((double *) (&(destination->value.double_field)),
+    #####:  718:                                           (jerryx_arg_coerce_t) extra_info[0],
+        -:  719:                                           JERRYX_ARG_OPTIONAL);
+    #####:  720:  conversion_result = conversion_function.func (js_arg_iter_p, &conversion_function);
+    #####:  721:  if (!jerry_value_is_error (conversion_result))
+        -:  722:  {
+    #####:  723:    if (last_parameter)
+        -:  724:    {
+        -:  725:      /* The stack is only two parameters high, but we want to ensure that
+        -:  726:       * excessive calls will not result in aberrant behavior... */
+    #####:  727:      jerryx_arg_js_iterator_restore (js_arg_iter_p);
+    #####:  728:      jerryx_arg_js_iterator_restore (js_arg_iter_p);
+    #####:  729:      jerryx_arg_js_iterator_restore (js_arg_iter_p);
+    #####:  730:      restore_result = jerryx_arg_js_iterator_restore (js_arg_iter_p);
+    #####:  731:      TEST_ASSERT (jerry_value_is_undefined (restore_result));
+        -:  732:    }
+        -:  733:
+    #####:  734:    destination->type_of_value = DOUBLE_VALUE;
+    #####:  735:    return conversion_result;
+        -:  736:  }
+        -:  737:
+    #####:  738:  jerryx_arg_js_iterator_restore (js_arg_iter_p);
+        -:  739:
+    #####:  740:  conversion_function = jerryx_arg_boolean ((bool *) (&(destination->value.bool_field)),
+    #####:  741:                                            (jerryx_arg_coerce_t) extra_info[0],
+    #####:  742:                                            (jerryx_arg_optional_t) extra_info[1]);
+        -:  743:
+    #####:  744:  jerry_release_value (conversion_result);
+    #####:  745:  conversion_result = conversion_function.func (js_arg_iter_p, &conversion_function);
+    #####:  746:  if (!jerry_value_is_error (conversion_result))
+        -:  747:  {
+    #####:  748:    if (last_parameter)
+        -:  749:    {
+        -:  750:      /* The stack is only two parameters high, but we want to ensure that
+        -:  751:       * excessive calls will not result in aberrant behavior... */
+    #####:  752:      jerryx_arg_js_iterator_restore (js_arg_iter_p);
+    #####:  753:      jerryx_arg_js_iterator_restore (js_arg_iter_p);
+    #####:  754:      jerryx_arg_js_iterator_restore (js_arg_iter_p);
+    #####:  755:      restore_result = jerryx_arg_js_iterator_restore (js_arg_iter_p);
+    #####:  756:      TEST_ASSERT (jerry_value_is_undefined (restore_result));
+        -:  757:    }
+        -:  758:
+    #####:  759:    destination->type_of_value = BOOL_VALUE;
+    #####:  760:    return conversion_result;
+        -:  761:  }
+        -:  762:
+        -:  763:  /* Fall through indicates that whatever they gave us, it wasn't
+        -:  764:   * one of the types we were expecting... */
+    #####:  765:  jerry_release_value (conversion_result);
+    #####:  766:  return jerry_create_error (JERRY_ERROR_TYPE,
+        -:  767:                             (const jerry_char_t *) "double_or_bool-type error.");
+        -:  768:} /* jerry_arg_to_double_or_bool_t */
+        -:  769:
+        -:  770:/**
+        -:  771: * This validator expects two parameters, one a bool and one a double -- the
+        -:  772: * order doesn't matter (so we'll call it twice with the orders reversed).
+        -:  773:*/
+        -:  774:static jerry_value_t
+    #####:  775:test_validator_restore_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  776:                                const jerry_value_t args_p[], /**< arguments list */
+        -:  777:                                const jerry_length_t args_cnt) /**< arguments length */
+        -:  778:{
+        -:  779:  JERRY_UNUSED (call_info_p);
+        -:  780:
+        -:  781:  double_or_bool_t arg1;
+        -:  782:  double_or_bool_t arg2;
+        -:  783:
+    #####:  784:  jerryx_arg_t item_mapping[] =
+        -:  785:  {
+    #####:  786:    jerryx_arg_double_or_bool_t (&arg1, JERRYX_ARG_NO_COERCE, JERRYX_ARG_REQUIRED, 0),
+    #####:  787:    jerryx_arg_double_or_bool_t (&arg2, JERRYX_ARG_NO_COERCE, JERRYX_ARG_REQUIRED, 1)
+        -:  788:  };
+        -:  789:
+    #####:  790:  jerry_value_t is_ok = jerryx_arg_transform_args (args_p, args_cnt, item_mapping, ARRAY_SIZE (item_mapping));
+        -:  791:
+    #####:  792:  TEST_ASSERT (!jerry_value_is_error (is_ok));
+        -:  793:
+        -:  794:  /* We are going to call this with [false, 3.0] and [3.0, false] parameters... */
+    #####:  795:  bool arg1_is_false = (arg1.type_of_value == BOOL_VALUE && arg1.value.bool_field == false);
+    #####:  796:  bool arg1_is_three = (arg1.type_of_value == DOUBLE_VALUE && arg1.value.double_field == 3.0);
+    #####:  797:  bool arg2_is_false = (arg2.type_of_value == BOOL_VALUE && arg2.value.bool_field == false);
+    #####:  798:  bool arg2_is_three = (arg2.type_of_value == DOUBLE_VALUE && arg2.value.double_field == 3.0);
+    #####:  799:  TEST_ASSERT ((arg1_is_false && arg2_is_three) || (arg1_is_three && arg2_is_false));
+        -:  800:
+    #####:  801:  jerry_release_value (is_ok);
+        -:  802:
+    #####:  803:  return jerry_create_undefined ();
+        -:  804:} /* test_validator_restore_handler */
+        -:  805:
+        -:  806:static void
+    #####:  807:test_utf8_string (void)
+    #####:  808:{
+        -:  809:  /* test string: 'str: {DESERET CAPITAL LETTER LONG I}' */
+    #####:  810:  jerry_value_t str = jerry_create_string ((jerry_char_t *) "\x73\x74\x72\x3a \xed\xa0\x81\xed\xb0\x80");
+    #####:  811:  char expect_utf8_buf[] = "\x73\x74\x72\x3a \xf0\x90\x90\x80";
+    #####:  812:  size_t buf_len = sizeof (expect_utf8_buf) - 1;
+    #####:  813:  JERRY_VLA (char, buf, buf_len + 1);
+        -:  814:
+    #####:  815:  jerryx_arg_t mapping[] =
+        -:  816:  {
+    #####:  817:    jerryx_arg_utf8_string (buf, (uint32_t) buf_len + 1, JERRYX_ARG_COERCE, JERRYX_ARG_REQUIRED),
+        -:  818:  };
+        -:  819:
+    #####:  820:  jerry_value_t is_ok = jerryx_arg_transform_args (&str,
+        -:  821:                                                   1,
+        -:  822:                                                   mapping,
+        -:  823:                                                   ARRAY_SIZE (mapping));
+        -:  824:
+    #####:  825:  TEST_ASSERT (!jerry_value_is_error (is_ok));
+    #####:  826:  TEST_ASSERT (!strcmp (buf, expect_utf8_buf));
+        -:  827:
+    #####:  828:  jerry_release_value (str);
+    #####:  829:} /* test_utf8_string */
+        -:  830:
+        -:  831:static jerry_value_t
+    #####:  832:create_object_a_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  833:                         const jerry_value_t args_p[], /**< arguments list */
+        -:  834:                         const jerry_length_t args_cnt) /**< arguments length */
+        -:  835:{
+        -:  836:  JERRY_UNUSED (args_p);
+        -:  837:  JERRY_UNUSED (args_cnt);
+        -:  838:
+    #####:  839:  TEST_ASSERT (jerry_value_is_object (call_info_p->this_value));
+        -:  840:
+    #####:  841:  my_thing_a.x = 1;
+    #####:  842:  jerry_set_object_native_pointer (call_info_p->this_value,
+        -:  843:                                   &my_thing_a,
+        -:  844:                                   &thing_a_info);
+        -:  845:
+    #####:  846:  return jerry_create_boolean (true);
+        -:  847:} /* create_object_a_handler */
+        -:  848:
+        -:  849:static jerry_value_t
+    #####:  850:create_object_b_handler (const jerry_call_info_t *call_info_p, /**< call information */
+        -:  851:                         const jerry_value_t args_p[], /**< arguments list */
+        -:  852:                         const jerry_length_t args_cnt) /**< arguments length */
+        -:  853:{
+        -:  854:  JERRY_UNUSED (args_p);
+        -:  855:  JERRY_UNUSED (args_cnt);
+        -:  856:
+    #####:  857:  TEST_ASSERT (jerry_value_is_object (call_info_p->this_value));
+        -:  858:
+    #####:  859:  my_thing_b.x = false;
+    #####:  860:  jerry_set_object_native_pointer (call_info_p->this_value,
+        -:  861:                                   &my_thing_b,
+        -:  862:                                   &thing_b_info);
+        -:  863:
+    #####:  864:  return jerry_create_boolean (true);
+        -:  865:} /* create_object_b_handler */
+        -:  866:
+        -:  867:/**
+        -:  868: * Register a JavaScript function in the global object.
+        -:  869: */
+        -:  870:static void
+    #####:  871:register_js_function (const char *name_p, /**< name of the function */
+        -:  872:                      jerry_external_handler_t handler_p) /**< function callback */
+        -:  873:{
+    #####:  874:  jerry_value_t global_obj_val = jerry_get_global_object ();
+        -:  875:
+    #####:  876:  jerry_value_t function_val = jerry_create_external_function (handler_p);
+    #####:  877:  jerry_value_t function_name_val = jerry_create_string ((const jerry_char_t *) name_p);
+    #####:  878:  jerry_value_t result_val = jerry_set_property (global_obj_val, function_name_val, function_val);
+        -:  879:
+    #####:  880:  jerry_release_value (function_name_val);
+    #####:  881:  jerry_release_value (function_val);
+    #####:  882:  jerry_release_value (global_obj_val);
+        -:  883:
+    #####:  884:  jerry_release_value (result_val);
+    #####:  885:} /* register_js_function */
+        -:  886:
+        -:  887:int
+    #####:  888:main (void)
+        -:  889:{
+    #####:  890:  jerry_init (JERRY_INIT_EMPTY);
+        -:  891:
+    #####:  892:  test_utf8_string ();
+        -:  893:
+    #####:  894:  register_js_function ("test_validator1", test_validator1_handler);
+    #####:  895:  register_js_function ("test_validator2", test_validator2_handler);
+    #####:  896:  register_js_function ("test_validator3", test_validator3_handler);
+    #####:  897:  register_js_function ("test_validator_int1", test_validator_int1_handler);
+    #####:  898:  register_js_function ("test_validator_int2", test_validator_int2_handler);
+    #####:  899:  register_js_function ("test_validator_int3", test_validator_int3_handler);
+    #####:  900:  register_js_function ("MyObjectA", create_object_a_handler);
+    #####:  901:  register_js_function ("MyObjectB", create_object_b_handler);
+    #####:  902:  register_js_function ("test_validator_prop1", test_validator_prop1_handler);
+    #####:  903:  register_js_function ("test_validator_prop2", test_validator_prop2_handler);
+    #####:  904:  register_js_function ("test_validator_prop3", test_validator_prop3_handler);
+    #####:  905:  register_js_function ("test_validator_array1", test_validator_array1_handler);
+    #####:  906:  register_js_function ("test_validator_array2", test_validator_array2_handler);
+    #####:  907:  register_js_function ("test_validator_restore", test_validator_restore_handler);
+        -:  908:
+    #####:  909:  jerry_value_t parsed_code_val = jerry_parse (test_source,
+        -:  910:                                               sizeof (test_source) - 1,
+        -:  911:                                               NULL);
+    #####:  912:  TEST_ASSERT (!jerry_value_is_error (parsed_code_val));
+        -:  913:
+    #####:  914:  jerry_value_t res = jerry_run (parsed_code_val);
+    #####:  915:  TEST_ASSERT (!jerry_value_is_error (res));
+    #####:  916:  TEST_ASSERT (validator1_count == 5);
+    #####:  917:  TEST_ASSERT (validator2_count == 3);
+    #####:  918:  TEST_ASSERT (validator_prop_count == 4);
+    #####:  919:  TEST_ASSERT (validator_int_count == 3);
+    #####:  920:  TEST_ASSERT (validator_array_count == 3);
+    #####:  921:  TEST_ASSERT (validator_restore_count == 4);
+        -:  922:
+    #####:  923:  jerry_release_value (res);
+    #####:  924:  jerry_release_value (parsed_code_val);
+        -:  925:
+    #####:  926:  jerry_cleanup ();
+        -:  927:} /* main */

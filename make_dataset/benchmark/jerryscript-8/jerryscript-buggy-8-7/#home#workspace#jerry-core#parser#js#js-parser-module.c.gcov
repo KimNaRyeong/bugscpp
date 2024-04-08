@@ -1,0 +1,531 @@
+        -:    0:Source:/home/workspace/jerry-core/parser/js/js-parser-module.c
+        -:    0:Programs:299
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "js-parser-internal.h"
+        -:   17:
+        -:   18:#if JERRY_MODULE_SYSTEM
+        -:   19:#include "ecma-function-object.h"
+        -:   20:#include "ecma-gc.h"
+        -:   21:#include "ecma-globals.h"
+        -:   22:#include "ecma-helpers.h"
+        -:   23:#include "ecma-lex-env.h"
+        -:   24:#include "ecma-module.h"
+        -:   25:
+        -:   26:#include "jcontext.h"
+        -:   27:
+        -:   28:/**
+        -:   29: * Description of "*default*" literal string.
+        -:   30: */
+        -:   31:const lexer_lit_location_t lexer_default_literal = { (const uint8_t *) "*default*",
+        -:   32:                                                     9,
+        -:   33:                                                     LEXER_IDENT_LITERAL,
+        -:   34:                                                     LEXER_LIT_LOCATION_IS_ASCII };
+        -:   35:
+        -:   36:/**
+        -:   37: * Check for duplicated imported binding names.
+        -:   38: *
+        -:   39: * @return true - if the given name is a duplicate
+        -:   40: *         false - otherwise
+        -:   41: */
+        -:   42:bool
+    #####:   43:parser_module_check_duplicate_import (parser_context_t *context_p, /**< parser context */
+        -:   44:                                      ecma_string_t *local_name_p) /**< newly imported name */
+        -:   45:{
+    #####:   46:  ecma_module_names_t *module_names_p = context_p->module_names_p;
+        -:   47:
+    #####:   48:  while (module_names_p != NULL)
+        -:   49:  {
+    #####:   50:    if (ecma_compare_ecma_strings (module_names_p->local_name_p, local_name_p))
+        -:   51:    {
+    #####:   52:      return true;
+        -:   53:    }
+        -:   54:
+    #####:   55:    module_names_p = module_names_p->next_p;
+        -:   56:  }
+        -:   57:
+    #####:   58:  ecma_module_node_t *module_node_p = JERRY_CONTEXT (module_current_p)->imports_p;
+        -:   59:
+    #####:   60:  while (module_node_p != NULL)
+        -:   61:  {
+    #####:   62:    module_names_p = module_node_p->module_names_p;
+        -:   63:
+    #####:   64:    while (module_names_p != NULL)
+        -:   65:    {
+    #####:   66:      if (ecma_compare_ecma_strings (module_names_p->local_name_p, local_name_p))
+        -:   67:      {
+    #####:   68:        return true;
+        -:   69:      }
+        -:   70:
+    #####:   71:      module_names_p = module_names_p->next_p;
+        -:   72:    }
+        -:   73:
+    #####:   74:    module_node_p = module_node_p->next_p;
+        -:   75:  }
+        -:   76:
+    #####:   77:  return false;
+        -:   78:} /* parser_module_check_duplicate_import */
+        -:   79:
+        -:   80:/**
+        -:   81: * Append an identifier to the exported bindings.
+        -:   82: */
+        -:   83:void
+        5:   84:parser_module_append_export_name (parser_context_t *context_p) /**< parser context */
+        -:   85:{
+        5:   86:  if (!(context_p->status_flags & PARSER_MODULE_STORE_IDENT))
+        -:   87:  {
+        5:   88:    return;
+        -:   89:  }
+        -:   90:
+    #####:   91:  context_p->module_identifier_lit_p = context_p->lit_object.literal_p;
+    #####:   92:  ecma_string_t *name_p = parser_new_ecma_string_from_literal (context_p->lit_object.literal_p);
+        -:   93:
+    #####:   94:  if (parser_module_check_duplicate_export (context_p, name_p))
+        -:   95:  {
+    #####:   96:    ecma_deref_ecma_string (name_p);
+    #####:   97:    parser_raise_error (context_p, PARSER_ERR_DUPLICATED_EXPORT_IDENTIFIER);
+        -:   98:  }
+        -:   99:
+    #####:  100:  parser_module_add_names_to_node (context_p, name_p, name_p);
+    #####:  101:  ecma_deref_ecma_string (name_p);
+        -:  102:} /* parser_module_append_export_name */
+        -:  103:
+        -:  104:/**
+        -:  105: * Check for duplicated exported bindings.
+        -:  106: * @return - true - if the exported name is a duplicate
+        -:  107: *           false - otherwise
+        -:  108: */
+        -:  109:bool
+    #####:  110:parser_module_check_duplicate_export (parser_context_t *context_p, /**< parser context */
+        -:  111:                                      ecma_string_t *export_name_p) /**< exported identifier */
+        -:  112:{
+        -:  113:  /* We have to check in the currently constructed node, as well as all of the already added nodes. */
+    #####:  114:  ecma_module_names_t *current_names_p = context_p->module_names_p;
+        -:  115:
+    #####:  116:  while (current_names_p != NULL)
+        -:  117:  {
+    #####:  118:    if (ecma_compare_ecma_strings (current_names_p->imex_name_p, export_name_p))
+        -:  119:    {
+    #####:  120:      return true;
+        -:  121:    }
+    #####:  122:    current_names_p = current_names_p->next_p;
+        -:  123:  }
+        -:  124:
+    #####:  125:  ecma_module_names_t *name_p = JERRY_CONTEXT (module_current_p)->local_exports_p;
+        -:  126:
+    #####:  127:  while (name_p != NULL)
+        -:  128:  {
+    #####:  129:    if (ecma_compare_ecma_strings (name_p->imex_name_p, export_name_p))
+        -:  130:    {
+    #####:  131:      return true;
+        -:  132:    }
+        -:  133:
+    #####:  134:    name_p = name_p->next_p;
+        -:  135:  }
+        -:  136:
+    #####:  137:  ecma_module_node_t *export_node_p = JERRY_CONTEXT (module_current_p)->indirect_exports_p;
+        -:  138:
+    #####:  139:  while (export_node_p != NULL)
+        -:  140:  {
+    #####:  141:    name_p = export_node_p->module_names_p;
+        -:  142:
+    #####:  143:    while (name_p != NULL)
+        -:  144:    {
+    #####:  145:      if (ecma_compare_ecma_strings (name_p->imex_name_p, export_name_p))
+        -:  146:      {
+    #####:  147:        return true;
+        -:  148:      }
+        -:  149:
+    #####:  150:      name_p = name_p->next_p;
+        -:  151:    }
+        -:  152:
+    #####:  153:    export_node_p = export_node_p->next_p;
+        -:  154:  }
+        -:  155:
+        -:  156:  /* Star exports don't have any names associated with them, so no need to check those. */
+    #####:  157:  return false;
+        -:  158:} /* parser_module_check_duplicate_export */
+        -:  159:
+        -:  160:/**
+        -:  161: * Add module names to current module node.
+        -:  162: */
+        -:  163:void
+    #####:  164:parser_module_add_names_to_node (parser_context_t *context_p, /**< parser context */
+        -:  165:                                 ecma_string_t *imex_name_p, /**< import/export name */
+        -:  166:                                 ecma_string_t *local_name_p) /**< local name */
+        -:  167:{
+    #####:  168:  ecma_module_names_t *new_name_p = (ecma_module_names_t *) parser_malloc (context_p, sizeof (ecma_module_names_t));
+        -:  169:
+    #####:  170:  new_name_p->next_p = context_p->module_names_p;
+    #####:  171:  context_p->module_names_p = new_name_p;
+        -:  172:
+    #####:  173:  JERRY_ASSERT (imex_name_p != NULL);
+    #####:  174:  ecma_ref_ecma_string (imex_name_p);
+    #####:  175:  new_name_p->imex_name_p = imex_name_p;
+        -:  176:
+    #####:  177:  JERRY_ASSERT (local_name_p != NULL);
+    #####:  178:  ecma_ref_ecma_string (local_name_p);
+    #####:  179:  new_name_p->local_name_p = local_name_p;
+    #####:  180:} /* parser_module_add_names_to_node */
+        -:  181:
+        -:  182:/**
+        -:  183: * Parse an ExportClause.
+        -:  184: */
+        -:  185:void
+    #####:  186:parser_module_parse_export_clause (parser_context_t *context_p) /**< parser context */
+        -:  187:{
+    #####:  188:  bool has_module_specifier = false;
+        -:  189:
+    #####:  190:  if (context_p->source_p == context_p->next_scanner_info_p->source_p)
+        -:  191:  {
+    #####:  192:    has_module_specifier = true;
+    #####:  193:    JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_EXPORT_MODULE_SPECIFIER);
+    #####:  194:    scanner_release_next (context_p, sizeof (scanner_info_t));
+        -:  195:  }
+        -:  196:
+    #####:  197:  JERRY_ASSERT (context_p->token.type == LEXER_LEFT_BRACE);
+    #####:  198:  lexer_next_token (context_p);
+        -:  199:
+        -:  200:  while (true)
+    #####:  201:  {
+    #####:  202:    if (context_p->token.type == LEXER_RIGHT_BRACE)
+        -:  203:    {
+    #####:  204:      lexer_next_token (context_p);
+    #####:  205:      break;
+        -:  206:    }
+        -:  207:
+        -:  208:    /* 15.2.3.1 The referenced binding cannot be a reserved word. */
+    #####:  209:    if (context_p->token.type != LEXER_LITERAL || context_p->token.lit_location.type != LEXER_IDENT_LITERAL
+    #####:  210:        || context_p->token.keyword_type >= LEXER_FIRST_FUTURE_STRICT_RESERVED_WORD)
+        -:  211:    {
+    #####:  212:      parser_raise_error (context_p, PARSER_ERR_IDENTIFIER_EXPECTED);
+        -:  213:    }
+        -:  214:
+    #####:  215:    ecma_string_t *export_name_p = NULL;
+    #####:  216:    ecma_string_t *local_name_p = NULL;
+        -:  217:
+    #####:  218:    lexer_construct_literal_object (context_p, &context_p->token.lit_location, LEXER_NEW_IDENT_LITERAL);
+        -:  219:
+    #####:  220:    if (!has_module_specifier && !scanner_literal_exists (context_p, context_p->lit_object.index))
+        -:  221:    {
+    #####:  222:      parser_raise_error (context_p, PARSER_ERR_EXPORT_NOT_DEFINED);
+        -:  223:    }
+        -:  224:
+    #####:  225:    uint16_t local_name_index = context_p->lit_object.index;
+    #####:  226:    uint16_t export_name_index = PARSER_MAXIMUM_NUMBER_OF_LITERALS;
+        -:  227:
+    #####:  228:    lexer_next_token (context_p);
+    #####:  229:    if (lexer_token_is_identifier (context_p, "as", 2))
+        -:  230:    {
+    #####:  231:      lexer_next_token (context_p);
+        -:  232:
+    #####:  233:      if (context_p->token.type != LEXER_LITERAL || context_p->token.lit_location.type != LEXER_IDENT_LITERAL)
+        -:  234:      {
+    #####:  235:        parser_raise_error (context_p, PARSER_ERR_IDENTIFIER_EXPECTED);
+        -:  236:      }
+        -:  237:
+    #####:  238:      lexer_construct_literal_object (context_p, &context_p->token.lit_location, LEXER_NEW_IDENT_LITERAL);
+        -:  239:
+    #####:  240:      export_name_index = context_p->lit_object.index;
+        -:  241:
+    #####:  242:      lexer_next_token (context_p);
+        -:  243:    }
+        -:  244:
+    #####:  245:    local_name_p = parser_new_ecma_string_from_literal (PARSER_GET_LITERAL (local_name_index));
+        -:  246:
+    #####:  247:    if (export_name_index != PARSER_MAXIMUM_NUMBER_OF_LITERALS)
+        -:  248:    {
+    #####:  249:      export_name_p = parser_new_ecma_string_from_literal (PARSER_GET_LITERAL (export_name_index));
+        -:  250:    }
+        -:  251:    else
+        -:  252:    {
+    #####:  253:      export_name_p = local_name_p;
+    #####:  254:      ecma_ref_ecma_string (local_name_p);
+        -:  255:    }
+        -:  256:
+    #####:  257:    if (parser_module_check_duplicate_export (context_p, export_name_p))
+        -:  258:    {
+    #####:  259:      ecma_deref_ecma_string (local_name_p);
+    #####:  260:      ecma_deref_ecma_string (export_name_p);
+    #####:  261:      parser_raise_error (context_p, PARSER_ERR_DUPLICATED_EXPORT_IDENTIFIER);
+        -:  262:    }
+        -:  263:
+    #####:  264:    parser_module_add_names_to_node (context_p, export_name_p, local_name_p);
+    #####:  265:    ecma_deref_ecma_string (local_name_p);
+    #####:  266:    ecma_deref_ecma_string (export_name_p);
+        -:  267:
+    #####:  268:    if (context_p->token.type != LEXER_COMMA && context_p->token.type != LEXER_RIGHT_BRACE)
+        -:  269:    {
+    #####:  270:      parser_raise_error (context_p, PARSER_ERR_RIGHT_BRACE_COMMA_EXPECTED);
+        -:  271:    }
+    #####:  272:    else if (context_p->token.type == LEXER_COMMA)
+        -:  273:    {
+    #####:  274:      lexer_next_token (context_p);
+        -:  275:    }
+        -:  276:
+    #####:  277:    if (lexer_token_is_identifier (context_p, "from", 4))
+        -:  278:    {
+    #####:  279:      parser_raise_error (context_p, PARSER_ERR_RIGHT_BRACE_EXPECTED);
+        -:  280:    }
+        -:  281:  }
+    #####:  282:} /* parser_module_parse_export_clause */
+        -:  283:
+        -:  284:/**
+        -:  285: * Parse an ImportClause
+        -:  286: */
+        -:  287:void
+    #####:  288:parser_module_parse_import_clause (parser_context_t *context_p) /**< parser context */
+        -:  289:{
+    #####:  290:  JERRY_ASSERT (context_p->token.type == LEXER_LEFT_BRACE);
+    #####:  291:  lexer_next_token (context_p);
+        -:  292:
+        -:  293:  while (true)
+    #####:  294:  {
+    #####:  295:    if (context_p->token.type == LEXER_RIGHT_BRACE)
+        -:  296:    {
+    #####:  297:      lexer_next_token (context_p);
+    #####:  298:      break;
+        -:  299:    }
+        -:  300:
+    #####:  301:    if (context_p->token.type != LEXER_LITERAL || context_p->token.lit_location.type != LEXER_IDENT_LITERAL)
+        -:  302:    {
+    #####:  303:      parser_raise_error (context_p, PARSER_ERR_IDENTIFIER_EXPECTED);
+        -:  304:    }
+        -:  305:
+    #####:  306:    if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -:  307:    {
+    #####:  308:      JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_ERR_REDECLARED);
+    #####:  309:      parser_raise_error (context_p, PARSER_ERR_VARIABLE_REDECLARED);
+        -:  310:    }
+        -:  311:
+    #####:  312:    ecma_string_t *import_name_p = NULL;
+    #####:  313:    ecma_string_t *local_name_p = NULL;
+        -:  314:
+    #####:  315:    lexer_construct_literal_object (context_p, &context_p->token.lit_location, LEXER_NEW_IDENT_LITERAL);
+        -:  316:
+    #####:  317:    uint16_t import_name_index = context_p->lit_object.index;
+    #####:  318:    uint16_t local_name_index = PARSER_MAXIMUM_NUMBER_OF_LITERALS;
+        -:  319:
+    #####:  320:    lexer_next_token (context_p);
+    #####:  321:    if (lexer_token_is_identifier (context_p, "as", 2))
+        -:  322:    {
+    #####:  323:      lexer_next_token (context_p);
+        -:  324:
+    #####:  325:      if (context_p->token.type != LEXER_LITERAL || context_p->token.lit_location.type != LEXER_IDENT_LITERAL)
+        -:  326:      {
+    #####:  327:        parser_raise_error (context_p, PARSER_ERR_IDENTIFIER_EXPECTED);
+        -:  328:      }
+        -:  329:
+    #####:  330:      if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -:  331:      {
+    #####:  332:        JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_ERR_REDECLARED);
+    #####:  333:        parser_raise_error (context_p, PARSER_ERR_VARIABLE_REDECLARED);
+        -:  334:      }
+        -:  335:
+    #####:  336:      lexer_construct_literal_object (context_p, &context_p->token.lit_location, LEXER_NEW_IDENT_LITERAL);
+        -:  337:
+    #####:  338:      local_name_index = context_p->lit_object.index;
+        -:  339:
+    #####:  340:      lexer_next_token (context_p);
+        -:  341:    }
+        -:  342:
+    #####:  343:    import_name_p = parser_new_ecma_string_from_literal (PARSER_GET_LITERAL (import_name_index));
+        -:  344:
+    #####:  345:    if (local_name_index != PARSER_MAXIMUM_NUMBER_OF_LITERALS)
+        -:  346:    {
+    #####:  347:      local_name_p = parser_new_ecma_string_from_literal (PARSER_GET_LITERAL (local_name_index));
+        -:  348:    }
+        -:  349:    else
+        -:  350:    {
+    #####:  351:      local_name_p = import_name_p;
+    #####:  352:      ecma_ref_ecma_string (local_name_p);
+        -:  353:    }
+        -:  354:
+    #####:  355:    if (parser_module_check_duplicate_import (context_p, local_name_p))
+        -:  356:    {
+    #####:  357:      ecma_deref_ecma_string (local_name_p);
+    #####:  358:      ecma_deref_ecma_string (import_name_p);
+    #####:  359:      parser_raise_error (context_p, PARSER_ERR_DUPLICATED_IMPORT_BINDING);
+        -:  360:    }
+        -:  361:
+    #####:  362:    parser_module_add_names_to_node (context_p, import_name_p, local_name_p);
+    #####:  363:    ecma_deref_ecma_string (local_name_p);
+    #####:  364:    ecma_deref_ecma_string (import_name_p);
+        -:  365:
+    #####:  366:    if (context_p->token.type != LEXER_COMMA && (context_p->token.type != LEXER_RIGHT_BRACE))
+        -:  367:    {
+    #####:  368:      parser_raise_error (context_p, PARSER_ERR_RIGHT_BRACE_COMMA_EXPECTED);
+        -:  369:    }
+    #####:  370:    else if (context_p->token.type == LEXER_COMMA)
+        -:  371:    {
+    #####:  372:      lexer_next_token (context_p);
+        -:  373:    }
+        -:  374:
+    #####:  375:    if (lexer_token_is_identifier (context_p, "from", 4))
+        -:  376:    {
+    #####:  377:      parser_raise_error (context_p, PARSER_ERR_RIGHT_BRACE_EXPECTED);
+        -:  378:    }
+        -:  379:  }
+    #####:  380:} /* parser_module_parse_import_clause */
+        -:  381:
+        -:  382:/**
+        -:  383: * Raises parser error if the import or export statement is not in the global scope.
+        -:  384: */
+        -:  385:void
+    #####:  386:parser_module_check_request_place (parser_context_t *context_p) /**< parser context */
+        -:  387:{
+    #####:  388:  if (context_p->last_context_p != NULL || context_p->stack_top_uint8 != 0
+    #####:  389:      || (context_p->status_flags & PARSER_IS_FUNCTION) || (context_p->global_status_flags & ECMA_PARSE_EVAL)
+    #####:  390:      || (context_p->global_status_flags & ECMA_PARSE_MODULE) == 0)
+        -:  391:  {
+    #####:  392:    parser_raise_error (context_p, PARSER_ERR_MODULE_UNEXPECTED);
+        -:  393:  }
+    #####:  394:} /* parser_module_check_request_place */
+        -:  395:
+        -:  396:/**
+        -:  397: * Append names to the names list.
+        -:  398: */
+        -:  399:void
+    #####:  400:parser_module_append_names (parser_context_t *context_p, /**< parser context */
+        -:  401:                            ecma_module_names_t **module_names_p) /**< target names */
+        -:  402:{
+    #####:  403:  ecma_module_names_t *last_name_p = context_p->module_names_p;
+        -:  404:
+    #####:  405:  if (last_name_p == NULL)
+        -:  406:  {
+    #####:  407:    return;
+        -:  408:  }
+        -:  409:
+    #####:  410:  if (*module_names_p != NULL)
+        -:  411:  {
+    #####:  412:    while (last_name_p->next_p != NULL)
+        -:  413:    {
+    #####:  414:      last_name_p = last_name_p->next_p;
+        -:  415:    }
+        -:  416:
+    #####:  417:    last_name_p->next_p = *module_names_p;
+        -:  418:  }
+        -:  419:
+    #####:  420:  *module_names_p = context_p->module_names_p;
+    #####:  421:  context_p->module_names_p = NULL;
+        -:  422:} /* parser_module_append_names */
+        -:  423:
+        -:  424:/**
+        -:  425: * Handle module specifier at the end of the import / export statement.
+        -:  426: */
+        -:  427:void
+    #####:  428:parser_module_handle_module_specifier (parser_context_t *context_p, /**< parser context */
+        -:  429:                                       ecma_module_node_t **node_list_p) /**< target node list */
+        -:  430:{
+    #####:  431:  if (context_p->token.type != LEXER_LITERAL || context_p->token.lit_location.type != LEXER_STRING_LITERAL
+    #####:  432:      || context_p->token.lit_location.length == 0)
+        -:  433:  {
+    #####:  434:    parser_raise_error (context_p, PARSER_ERR_STRING_EXPECTED);
+        -:  435:  }
+        -:  436:
+    #####:  437:  lexer_construct_literal_object (context_p, &context_p->token.lit_location, LEXER_STRING_LITERAL);
+        -:  438:
+    #####:  439:  lexer_literal_t *path_p = context_p->lit_object.literal_p;
+        -:  440:
+    #####:  441:  lexer_next_token (context_p);
+        -:  442:
+        -:  443:  /* The lexer_next_token may throw an error, so the path is constructed after its call. */
+    #####:  444:  ecma_string_t *path_string_p = parser_new_ecma_string_from_literal (path_p);
+        -:  445:
+    #####:  446:  ecma_module_node_t *node_p = JERRY_CONTEXT (module_current_p)->imports_p;
+    #####:  447:  ecma_module_node_t *last_node_p = NULL;
+        -:  448:
+        -:  449:  /* Check if we have an import node with the same module request. */
+        -:  450:
+    #####:  451:  while (node_p != NULL)
+        -:  452:  {
+    #####:  453:    if (ecma_compare_ecma_strings (ecma_get_string_from_value (node_p->u.path_or_module), path_string_p))
+        -:  454:    {
+    #####:  455:      ecma_deref_ecma_string (path_string_p);
+    #####:  456:      break;
+        -:  457:    }
+        -:  458:
+    #####:  459:    last_node_p = node_p;
+    #####:  460:    node_p = node_p->next_p;
+        -:  461:  }
+        -:  462:
+    #####:  463:  if (node_p == NULL)
+        -:  464:  {
+    #####:  465:    node_p = (ecma_module_node_t *) jmem_heap_alloc_block_null_on_error (sizeof (ecma_module_node_t));
+        -:  466:
+    #####:  467:    if (node_p == NULL)
+        -:  468:    {
+    #####:  469:      ecma_deref_ecma_string (path_string_p);
+    #####:  470:      parser_raise_error (context_p, PARSER_ERR_OUT_OF_MEMORY);
+        -:  471:    }
+        -:  472:
+    #####:  473:    if (last_node_p == NULL)
+        -:  474:    {
+    #####:  475:      JERRY_CONTEXT (module_current_p)->imports_p = node_p;
+        -:  476:    }
+        -:  477:    else
+        -:  478:    {
+    #####:  479:      last_node_p->next_p = node_p;
+        -:  480:    }
+        -:  481:
+    #####:  482:    node_p->next_p = NULL;
+    #####:  483:    node_p->module_names_p = NULL;
+    #####:  484:    node_p->u.path_or_module = ecma_make_string_value (path_string_p);
+        -:  485:  }
+        -:  486:
+        -:  487:  /* Append to imports. */
+    #####:  488:  if (node_list_p == NULL)
+        -:  489:  {
+    #####:  490:    parser_module_append_names (context_p, &node_p->module_names_p);
+    #####:  491:    return;
+        -:  492:  }
+        -:  493:
+    #####:  494:  ecma_value_t *module_object_p = &node_p->u.path_or_module;
+        -:  495:
+    #####:  496:  node_p = *node_list_p;
+    #####:  497:  last_node_p = NULL;
+        -:  498:
+    #####:  499:  while (node_p != NULL)
+        -:  500:  {
+    #####:  501:    if (node_p->u.module_object_p == module_object_p)
+        -:  502:    {
+    #####:  503:      parser_module_append_names (context_p, &node_p->module_names_p);
+    #####:  504:      return;
+        -:  505:    }
+        -:  506:
+    #####:  507:    last_node_p = node_p;
+    #####:  508:    node_p = node_p->next_p;
+        -:  509:  }
+        -:  510:
+    #####:  511:  node_p = (ecma_module_node_t *) parser_malloc (context_p, sizeof (ecma_module_node_t));
+        -:  512:
+    #####:  513:  if (last_node_p == NULL)
+        -:  514:  {
+    #####:  515:    *node_list_p = node_p;
+        -:  516:  }
+        -:  517:  else
+        -:  518:  {
+    #####:  519:    last_node_p->next_p = node_p;
+        -:  520:  }
+        -:  521:
+    #####:  522:  node_p->next_p = NULL;
+    #####:  523:  node_p->module_names_p = context_p->module_names_p;
+    #####:  524:  node_p->u.module_object_p = module_object_p;
+        -:  525:
+    #####:  526:  context_p->module_names_p = NULL;
+        -:  527:} /* parser_module_handle_module_specifier */
+        -:  528:
+        -:  529:#endif /* JERRY_MODULE_SYSTEM */

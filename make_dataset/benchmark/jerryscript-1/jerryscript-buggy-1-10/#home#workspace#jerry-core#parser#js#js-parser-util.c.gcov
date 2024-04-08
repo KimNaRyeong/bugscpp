@@ -1,0 +1,1279 @@
+        -:    0:Source:/home/workspace/jerry-core/parser/js/js-parser-util.c
+        -:    0:Programs:274
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "js-parser-internal.h"
+        -:   17:
+        -:   18:#if ENABLED (JERRY_PARSER)
+        -:   19:
+        -:   20:#if ENABLED (JERRY_LINE_INFO)
+        -:   21:#include "jcontext.h"
+        -:   22:#endif /* ENABLED (JERRY_LINE_INFO) */
+        -:   23:
+        -:   24:/** \addtogroup parser Parser
+        -:   25: * @{
+        -:   26: *
+        -:   27: * \addtogroup jsparser JavaScript
+        -:   28: * @{
+        -:   29: *
+        -:   30: * \addtogroup jsparser_utils Utility
+        -:   31: * @{
+        -:   32: */
+        -:   33:
+        -:   34:/**********************************************************************/
+        -:   35:/* Emitting byte codes                                                */
+        -:   36:/**********************************************************************/
+        -:   37:
+        -:   38:/**
+        -:   39: * Append two bytes to the cbc stream.
+        -:   40: */
+        -:   41:static void
+     1375:   42:parser_emit_two_bytes (parser_context_t *context_p, /**< context */
+        -:   43:                       uint8_t first_byte, /**< first byte */
+        -:   44:                       uint8_t second_byte) /**< second byte */
+        -:   45:{
+     1375:   46:  uint32_t last_position = context_p->byte_code.last_position;
+        -:   47:
+     1375:   48:  if (last_position + 2 <= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:   49:  {
+       76:   50:    parser_mem_page_t *page_p = context_p->byte_code.last_p;
+        -:   51:
+       76:   52:    page_p->bytes[last_position] = first_byte;
+       76:   53:    page_p->bytes[last_position + 1] = second_byte;
+       76:   54:    context_p->byte_code.last_position = last_position + 2;
+        -:   55:  }
+     1299:   56:  else if (last_position >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:   57:  {
+        -:   58:    parser_mem_page_t *page_p;
+        -:   59:
+     1298:   60:    parser_cbc_stream_alloc_page (context_p, &context_p->byte_code);
+     1298:   61:    page_p = context_p->byte_code.last_p;
+     1298:   62:    page_p->bytes[0] = first_byte;
+     1298:   63:    page_p->bytes[1] = second_byte;
+     1298:   64:    context_p->byte_code.last_position = 2;
+        -:   65:  }
+        -:   66:  else
+        -:   67:  {
+        1:   68:    context_p->byte_code.last_p->bytes[PARSER_CBC_STREAM_PAGE_SIZE - 1] = first_byte;
+        1:   69:    parser_cbc_stream_alloc_page (context_p, &context_p->byte_code);
+        1:   70:    context_p->byte_code.last_p->bytes[0] = second_byte;
+        1:   71:    context_p->byte_code.last_position = 1;
+        -:   72:  }
+     1375:   73:} /* parser_emit_two_bytes */
+        -:   74:
+        -:   75:/**
+        -:   76: * Append byte to the end of the current byte code stream.
+        -:   77: *
+        -:   78: * @param context_p parser context
+        -:   79: * @param byte byte
+        -:   80: */
+        -:   81:#define PARSER_APPEND_TO_BYTE_CODE(context_p, byte) \
+        -:   82:  if ((context_p)->byte_code.last_position >= PARSER_CBC_STREAM_PAGE_SIZE) \
+        -:   83:  { \
+        -:   84:    parser_cbc_stream_alloc_page ((context_p), &(context_p)->byte_code); \
+        -:   85:  } \
+        -:   86:  (context_p)->byte_code.last_p->bytes[(context_p)->byte_code.last_position++] = (uint8_t) (byte)
+        -:   87:
+        -:   88:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:   89:
+        -:   90:/**
+        -:   91: * Print literal corresponding to the current index
+        -:   92: */
+        -:   93:static void
+        -:   94:parser_print_literal (parser_context_t *context_p, /**< context */
+        -:   95:                      uint16_t literal_index) /**< index of literal */
+        -:   96:{
+        -:   97:  parser_scope_stack_t *scope_stack_p = context_p->scope_stack_p;
+        -:   98:  parser_scope_stack_t *scope_stack_end_p = scope_stack_p + context_p->scope_stack_top;
+        -:   99:  bool in_scope_literal = false;
+        -:  100:
+        -:  101:  while (scope_stack_p < scope_stack_end_p)
+        -:  102:  {
+        -:  103:    scope_stack_end_p--;
+        -:  104:
+        -:  105:    if (scope_stack_end_p->map_from == PARSER_SCOPE_STACK_FUNC)
+        -:  106:    {
+        -:  107:      if (literal_index == scope_stack_end_p->map_to)
+        -:  108:      {
+        -:  109:        in_scope_literal = true;
+        -:  110:        break;
+        -:  111:      }
+        -:  112:    }
+        -:  113:    else if (literal_index == scanner_decode_map_to (scope_stack_end_p))
+        -:  114:    {
+        -:  115:      in_scope_literal = true;
+        -:  116:      break;
+        -:  117:    }
+        -:  118:  }
+        -:  119:
+        -:  120:  if (literal_index < PARSER_REGISTER_START)
+        -:  121:  {
+        -:  122:    JERRY_DEBUG_MSG (in_scope_literal ? " IDX:%d->" : " idx:%d->", literal_index);
+        -:  123:    lexer_literal_t *literal_p = PARSER_GET_LITERAL (literal_index);
+        -:  124:    util_print_literal (literal_p);
+        -:  125:    return;
+        -:  126:  }
+        -:  127:
+        -:  128:  if (!in_scope_literal)
+        -:  129:  {
+        -:  130:    JERRY_DEBUG_MSG (" reg:%d", (int) (literal_index - PARSER_REGISTER_START));
+        -:  131:    return;
+        -:  132:  }
+        -:  133:
+        -:  134:  JERRY_DEBUG_MSG (" REG:%d->", (int) (literal_index - PARSER_REGISTER_START));
+        -:  135:
+        -:  136:  lexer_literal_t *literal_p = PARSER_GET_LITERAL (scope_stack_end_p->map_from);
+        -:  137:  util_print_literal (literal_p);
+        -:  138:} /* parser_print_literal */
+        -:  139:
+        -:  140:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  141:
+        -:  142:/**
+        -:  143: * Append the current byte code to the stream
+        -:  144: */
+        -:  145:void
+     2666:  146:parser_flush_cbc (parser_context_t *context_p) /**< context */
+        -:  147:{
+        -:  148:  uint8_t flags;
+     2666:  149:  uint16_t last_opcode = context_p->last_cbc_opcode;
+        -:  150:
+     2666:  151:  if (last_opcode == PARSER_CBC_UNAVAILABLE)
+        -:  152:  {
+     1302:  153:    return;
+        -:  154:  }
+        -:  155:
+     1364:  156:  JERRY_ASSERT (last_opcode != PARSER_TO_EXT_OPCODE (CBC_EXT_PUSH_SUPER));
+        -:  157:
+     1364:  158:  context_p->status_flags |= PARSER_NO_END_LABEL;
+        -:  159:
+     1364:  160:  if (PARSER_IS_BASIC_OPCODE (last_opcode))
+        -:  161:  {
+       63:  162:    cbc_opcode_t opcode = (cbc_opcode_t) last_opcode;
+        -:  163:
+       63:  164:    JERRY_ASSERT (opcode < CBC_END);
+       63:  165:    flags = cbc_flags[opcode];
+        -:  166:
+       63:  167:    PARSER_APPEND_TO_BYTE_CODE (context_p, opcode);
+       63:  168:    context_p->byte_code_size++;
+        -:  169:  }
+        -:  170:  else
+        -:  171:  {
+     1301:  172:    cbc_ext_opcode_t opcode = (cbc_ext_opcode_t) PARSER_GET_EXT_OPCODE (last_opcode);
+        -:  173:
+     1301:  174:    JERRY_ASSERT (opcode < CBC_EXT_END);
+     1301:  175:    flags = cbc_ext_flags[opcode];
+     1301:  176:    parser_emit_two_bytes (context_p, CBC_EXT_OPCODE, (uint8_t) opcode);
+     1301:  177:    context_p->byte_code_size += 2;
+        -:  178:  }
+        -:  179:
+     1364:  180:  JERRY_ASSERT ((flags >> CBC_STACK_ADJUST_SHIFT) >= CBC_STACK_ADJUST_BASE
+        -:  181:                 || (CBC_STACK_ADJUST_BASE - (flags >> CBC_STACK_ADJUST_SHIFT)) <= context_p->stack_depth);
+     1364:  182:  PARSER_PLUS_EQUAL_U16 (context_p->stack_depth, CBC_STACK_ADJUST_VALUE (flags));
+        -:  183:
+     1364:  184:  if (flags & (CBC_HAS_LITERAL_ARG | CBC_HAS_LITERAL_ARG2))
+        -:  185:  {
+       49:  186:    uint16_t literal_index = context_p->last_cbc.literal_index;
+        -:  187:
+       98:  188:    parser_emit_two_bytes (context_p,
+       49:  189:                           (uint8_t) (literal_index & 0xff),
+       49:  190:                           (uint8_t) (literal_index >> 8));
+       49:  191:    context_p->byte_code_size += 2;
+        -:  192:  }
+        -:  193:
+     1364:  194:  if (flags & CBC_HAS_LITERAL_ARG2)
+        -:  195:  {
+       20:  196:    uint16_t literal_index = context_p->last_cbc.value;
+        -:  197:
+       40:  198:    parser_emit_two_bytes (context_p,
+       20:  199:                           (uint8_t) (literal_index & 0xff),
+       20:  200:                           (uint8_t) (literal_index >> 8));
+       20:  201:    context_p->byte_code_size += 2;
+        -:  202:
+       20:  203:    if (!(flags & CBC_HAS_LITERAL_ARG))
+        -:  204:    {
+        3:  205:      literal_index = context_p->last_cbc.third_literal_index;
+        -:  206:
+        6:  207:      parser_emit_two_bytes (context_p,
+        3:  208:                             (uint8_t) (literal_index & 0xff),
+        3:  209:                             (uint8_t) (literal_index >> 8));
+        3:  210:      context_p->byte_code_size += 2;
+        -:  211:    }
+        -:  212:  }
+        -:  213:
+     1364:  214:  if (flags & CBC_HAS_BYTE_ARG)
+        -:  215:  {
+        2:  216:    uint8_t byte_argument = (uint8_t) context_p->last_cbc.value;
+        -:  217:
+        2:  218:    JERRY_ASSERT (context_p->last_cbc.value <= CBC_MAXIMUM_BYTE_VALUE);
+        -:  219:
+        2:  220:    if (flags & CBC_POP_STACK_BYTE_ARG)
+        -:  221:    {
+        1:  222:      JERRY_ASSERT (context_p->stack_depth >= byte_argument);
+        1:  223:      PARSER_MINUS_EQUAL_U16 (context_p->stack_depth, byte_argument);
+        -:  224:    }
+        -:  225:
+        2:  226:    PARSER_APPEND_TO_BYTE_CODE (context_p, byte_argument);
+        2:  227:    context_p->byte_code_size++;
+        -:  228:  }
+        -:  229:
+        -:  230:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  231:  if (context_p->is_show_opcodes)
+        -:  232:  {
+        -:  233:    JERRY_DEBUG_MSG ("  [%3d] %s",
+        -:  234:                     (int) context_p->stack_depth,
+        -:  235:                     PARSER_IS_BASIC_OPCODE (last_opcode) ? cbc_names[last_opcode]
+        -:  236:                                                          : cbc_ext_names[PARSER_GET_EXT_OPCODE (last_opcode)]);
+        -:  237:
+        -:  238:    if (flags & (CBC_HAS_LITERAL_ARG | CBC_HAS_LITERAL_ARG2))
+        -:  239:    {
+        -:  240:      parser_print_literal (context_p, context_p->last_cbc.literal_index);
+        -:  241:    }
+        -:  242:
+        -:  243:    if (flags & CBC_HAS_LITERAL_ARG2)
+        -:  244:    {
+        -:  245:      parser_print_literal (context_p, context_p->last_cbc.value);
+        -:  246:
+        -:  247:      if (!(flags & CBC_HAS_LITERAL_ARG))
+        -:  248:      {
+        -:  249:        parser_print_literal (context_p, context_p->last_cbc.third_literal_index);
+        -:  250:      }
+        -:  251:    }
+        -:  252:
+        -:  253:    if (flags & CBC_HAS_BYTE_ARG)
+        -:  254:    {
+        -:  255:      if ((last_opcode == CBC_PUSH_NUMBER_POS_BYTE)
+        -:  256:          || (last_opcode == PARSER_TO_EXT_OPCODE (CBC_EXT_PUSH_LITERAL_PUSH_NUMBER_POS_BYTE)))
+        -:  257:      {
+        -:  258:        JERRY_DEBUG_MSG (" number:%d", (int) context_p->last_cbc.value + 1);
+        -:  259:      }
+        -:  260:      else if ((last_opcode == CBC_PUSH_NUMBER_NEG_BYTE)
+        -:  261:               || (last_opcode == PARSER_TO_EXT_OPCODE (CBC_EXT_PUSH_LITERAL_PUSH_NUMBER_NEG_BYTE)))
+        -:  262:      {
+        -:  263:        JERRY_DEBUG_MSG (" number:%d", -((int) context_p->last_cbc.value + 1));
+        -:  264:      }
+        -:  265:      else
+        -:  266:      {
+        -:  267:        JERRY_DEBUG_MSG (" byte_arg:%d", (int) context_p->last_cbc.value);
+        -:  268:      }
+        -:  269:    }
+        -:  270:
+        -:  271:    JERRY_DEBUG_MSG ("\n");
+        -:  272:  }
+        -:  273:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  274:
+     1364:  275:  if (context_p->stack_depth > context_p->stack_limit)
+        -:  276:  {
+        5:  277:    context_p->stack_limit = context_p->stack_depth;
+        5:  278:    if (context_p->stack_limit > PARSER_MAXIMUM_STACK_LIMIT)
+        -:  279:    {
+    #####:  280:      parser_raise_error (context_p, PARSER_ERR_STACK_LIMIT_REACHED);
+        -:  281:    }
+        -:  282:  }
+        -:  283:
+     1364:  284:  context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+        -:  285:} /* parser_flush_cbc */
+        -:  286:
+        -:  287:/**
+        -:  288: * Append a byte code
+        -:  289: */
+        -:  290:void
+     1312:  291:parser_emit_cbc (parser_context_t *context_p, /**< context */
+        -:  292:                 uint16_t opcode) /**< opcode */
+        -:  293:{
+     1312:  294:  JERRY_ASSERT (PARSER_ARGS_EQ (opcode, 0));
+        -:  295:
+     1312:  296:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  297:  {
+        8:  298:    parser_flush_cbc (context_p);
+        -:  299:  }
+        -:  300:
+     1312:  301:  context_p->last_cbc_opcode = opcode;
+     1312:  302:} /* parser_emit_cbc */
+        -:  303:
+        -:  304:/**
+        -:  305: * Append a byte code with a literal argument
+        -:  306: */
+        -:  307:void
+       26:  308:parser_emit_cbc_literal (parser_context_t *context_p, /**< context */
+        -:  309:                         uint16_t opcode, /**< opcode */
+        -:  310:                         uint16_t literal_index) /**< literal index */
+        -:  311:{
+       26:  312:  JERRY_ASSERT (PARSER_ARGS_EQ (opcode, CBC_HAS_LITERAL_ARG));
+        -:  313:
+       26:  314:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  315:  {
+       22:  316:    parser_flush_cbc (context_p);
+        -:  317:  }
+        -:  318:
+       26:  319:  context_p->last_cbc_opcode = opcode;
+       26:  320:  context_p->last_cbc.literal_index = literal_index;
+       26:  321:  context_p->last_cbc.literal_type = LEXER_UNUSED_LITERAL;
+       26:  322:  context_p->last_cbc.literal_keyword_type = LEXER_EOS;
+       26:  323:} /* parser_emit_cbc_literal */
+        -:  324:
+        -:  325:/**
+        -:  326: * Append a byte code with a literal and value argument
+        -:  327: */
+        -:  328:void
+        6:  329:parser_emit_cbc_literal_value (parser_context_t *context_p, /**< context */
+        -:  330:                               uint16_t opcode, /**< opcode */
+        -:  331:                               uint16_t literal_index, /**< literal index */
+        -:  332:                               uint16_t value) /**< value */
+        -:  333:{
+        6:  334:  JERRY_ASSERT (PARSER_ARGS_EQ (opcode, CBC_HAS_LITERAL_ARG | CBC_HAS_LITERAL_ARG2));
+        -:  335:
+        6:  336:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  337:  {
+        2:  338:    parser_flush_cbc (context_p);
+        -:  339:  }
+        -:  340:
+        6:  341:  context_p->last_cbc_opcode = opcode;
+        6:  342:  context_p->last_cbc.literal_index = literal_index;
+        6:  343:  context_p->last_cbc.literal_type = LEXER_UNUSED_LITERAL;
+        6:  344:  context_p->last_cbc.literal_keyword_type = LEXER_EOS;
+        6:  345:  context_p->last_cbc.value = value;
+        6:  346:} /* parser_emit_cbc_literal_value */
+        -:  347:
+        -:  348:/**
+        -:  349: * Append a byte code with the current literal argument
+        -:  350: */
+        -:  351:void
+       18:  352:parser_emit_cbc_literal_from_token (parser_context_t *context_p, /**< context */
+        -:  353:                                    uint16_t opcode) /**< opcode */
+        -:  354:{
+       18:  355:  JERRY_ASSERT (PARSER_ARGS_EQ (opcode, CBC_HAS_LITERAL_ARG));
+        -:  356:
+       18:  357:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  358:  {
+        4:  359:    parser_flush_cbc (context_p);
+        -:  360:  }
+        -:  361:
+       18:  362:  context_p->last_cbc_opcode = opcode;
+       18:  363:  context_p->last_cbc.literal_index = context_p->lit_object.index;
+       18:  364:  context_p->last_cbc.literal_type = context_p->token.lit_location.type;
+       18:  365:  context_p->last_cbc.literal_keyword_type = context_p->token.keyword_type;
+       18:  366:} /* parser_emit_cbc_literal_from_token */
+        -:  367:
+        -:  368:/**
+        -:  369: * Append a byte code with a call argument
+        -:  370: */
+        -:  371:void
+        2:  372:parser_emit_cbc_call (parser_context_t *context_p, /**< context */
+        -:  373:                      uint16_t opcode, /**< opcode */
+        -:  374:                      size_t call_arguments) /**< number of arguments */
+        -:  375:{
+        2:  376:  JERRY_ASSERT (PARSER_ARGS_EQ (opcode, CBC_HAS_BYTE_ARG));
+        2:  377:  JERRY_ASSERT (call_arguments <= CBC_MAXIMUM_BYTE_VALUE);
+        -:  378:
+        2:  379:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  380:  {
+        2:  381:    parser_flush_cbc (context_p);
+        -:  382:  }
+        -:  383:
+        2:  384:  context_p->last_cbc_opcode = opcode;
+        2:  385:  context_p->last_cbc.value = (uint16_t) call_arguments;
+        2:  386:} /* parser_emit_cbc_call */
+        -:  387:
+        -:  388:/**
+        -:  389: * Append a push number 1/2 byte code
+        -:  390: */
+        -:  391:void
+        2:  392:parser_emit_cbc_push_number (parser_context_t *context_p, /**< context */
+        -:  393:                             bool is_negative_number) /**< sign is negative */
+        -:  394:{
+        2:  395:  uint16_t value = context_p->lit_object.index;
+        2:  396:  uint16_t lit_value = UINT16_MAX;
+        -:  397:
+        2:  398:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  399:  {
+        1:  400:    if (context_p->last_cbc_opcode == CBC_PUSH_LITERAL)
+        -:  401:    {
+        1:  402:      lit_value = context_p->last_cbc.literal_index;
+        -:  403:    }
+        -:  404:    else
+        -:  405:    {
+    #####:  406:      if (context_p->last_cbc_opcode == CBC_PUSH_TWO_LITERALS)
+        -:  407:      {
+    #####:  408:        context_p->last_cbc_opcode = CBC_PUSH_LITERAL;
+    #####:  409:        lit_value = context_p->last_cbc.value;
+        -:  410:      }
+    #####:  411:      else if (context_p->last_cbc_opcode == CBC_PUSH_THREE_LITERALS)
+        -:  412:      {
+    #####:  413:        context_p->last_cbc_opcode = CBC_PUSH_TWO_LITERALS;
+    #####:  414:        lit_value = context_p->last_cbc.third_literal_index;
+        -:  415:      }
+        -:  416:
+    #####:  417:      parser_flush_cbc (context_p);
+        -:  418:    }
+        -:  419:  }
+        -:  420:
+        2:  421:  if (value == 0)
+        -:  422:  {
+        1:  423:    if (lit_value == UINT16_MAX)
+        -:  424:    {
+        1:  425:      context_p->last_cbc_opcode = CBC_PUSH_NUMBER_0;
+        1:  426:      return;
+        -:  427:    }
+        -:  428:
+    #####:  429:    context_p->last_cbc_opcode = PARSER_TO_EXT_OPCODE (CBC_EXT_PUSH_LITERAL_PUSH_NUMBER_0);
+    #####:  430:    context_p->last_cbc.literal_index = lit_value;
+    #####:  431:    return;
+        -:  432:  }
+        -:  433:
+        -:  434:  uint16_t opcode;
+        -:  435:
+        1:  436:  if (lit_value == UINT16_MAX)
+        -:  437:  {
+    #####:  438:    opcode = (is_negative_number ? CBC_PUSH_NUMBER_NEG_BYTE
+        -:  439:                                 : CBC_PUSH_NUMBER_POS_BYTE);
+        -:  440:
+    #####:  441:    JERRY_ASSERT (CBC_STACK_ADJUST_VALUE (PARSER_GET_FLAGS (opcode)) == 1);
+        -:  442:  }
+        -:  443:  else
+        -:  444:  {
+        1:  445:    opcode = PARSER_TO_EXT_OPCODE (is_negative_number ? CBC_EXT_PUSH_LITERAL_PUSH_NUMBER_NEG_BYTE
+        -:  446:                                                      : CBC_EXT_PUSH_LITERAL_PUSH_NUMBER_POS_BYTE);
+        1:  447:    JERRY_ASSERT (CBC_STACK_ADJUST_VALUE (PARSER_GET_FLAGS (opcode)) == 2);
+        -:  448:
+        1:  449:    context_p->last_cbc.literal_index = lit_value;
+        -:  450:  }
+        -:  451:
+        1:  452:  JERRY_ASSERT (value > 0 && value <= CBC_PUSH_NUMBER_BYTE_RANGE_END);
+        -:  453:
+        1:  454:  context_p->last_cbc_opcode = opcode;
+        1:  455:  context_p->last_cbc.value = (uint16_t) (value - 1);
+        -:  456:} /* parser_emit_cbc_push_number */
+        -:  457:
+        -:  458:#if ENABLED (JERRY_LINE_INFO)
+        -:  459:
+        -:  460:/**
+        -:  461: * Append a line info data
+        -:  462: */
+        -:  463:void
+    #####:  464:parser_emit_line_info (parser_context_t *context_p, /**< context */
+        -:  465:                       uint32_t line, /**< current line */
+        -:  466:                       bool flush_cbc) /**< flush last byte code */
+        -:  467:{
+    #####:  468:  if (JERRY_CONTEXT (resource_name) == ECMA_VALUE_UNDEFINED)
+        -:  469:  {
+    #####:  470:    return;
+        -:  471:  }
+        -:  472:
+    #####:  473:  if (flush_cbc && context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  474:  {
+    #####:  475:    parser_flush_cbc (context_p);
+        -:  476:  }
+        -:  477:
+        -:  478:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  479:  if (context_p->is_show_opcodes)
+        -:  480:  {
+        -:  481:    JERRY_DEBUG_MSG ("  [%3d] CBC_EXT_LINE %d\n", (int) context_p->stack_depth, line);
+        -:  482:  }
+        -:  483:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  484:
+    #####:  485:  parser_emit_two_bytes (context_p, CBC_EXT_OPCODE, CBC_EXT_LINE);
+    #####:  486:  context_p->byte_code_size += 2;
+        -:  487:
+    #####:  488:  context_p->last_line_info_line = line;
+        -:  489:
+    #####:  490:  const uint32_t max_shift_plus_7 = 7 * 5;
+    #####:  491:  uint32_t shift = 7;
+        -:  492:
+    #####:  493:  while (shift < max_shift_plus_7 && (line >> shift) > 0)
+        -:  494:  {
+    #####:  495:    shift += 7;
+        -:  496:  }
+        -:  497:
+        -:  498:  do
+        -:  499:  {
+    #####:  500:    shift -= 7;
+        -:  501:
+    #####:  502:    uint8_t byte = (uint8_t) ((line >> shift) & CBC_LOWER_SEVEN_BIT_MASK);
+        -:  503:
+    #####:  504:    if (shift > 0)
+        -:  505:    {
+    #####:  506:      byte = (uint8_t) (byte | CBC_HIGHEST_BIT_MASK);
+        -:  507:    }
+        -:  508:
+    #####:  509:    PARSER_APPEND_TO_BYTE_CODE (context_p, byte);
+    #####:  510:    context_p->byte_code_size++;
+        -:  511:  }
+    #####:  512:  while (shift > 0);
+        -:  513:} /* parser_emit_line_info */
+        -:  514:
+        -:  515:#endif /* ENABLED (JERRY_LINE_INFO) */
+        -:  516:
+        -:  517:/**
+        -:  518: * Append a byte code with a branch argument
+        -:  519: */
+        -:  520:void
+        1:  521:parser_emit_cbc_forward_branch (parser_context_t *context_p, /**< context */
+        -:  522:                                uint16_t opcode, /**< opcode */
+        -:  523:                                parser_branch_t *branch_p) /**< branch result */
+        -:  524:{
+        -:  525:  uint8_t flags;
+        -:  526:  uint32_t extra_byte_code_increase;
+        -:  527:
+        1:  528:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  529:  {
+    #####:  530:    parser_flush_cbc (context_p);
+        -:  531:  }
+        -:  532:
+        1:  533:  context_p->status_flags |= PARSER_NO_END_LABEL;
+        -:  534:
+        1:  535:  if (PARSER_IS_BASIC_OPCODE (opcode))
+        -:  536:  {
+        1:  537:    JERRY_ASSERT (opcode < CBC_END);
+        1:  538:    flags = cbc_flags[opcode];
+        1:  539:    extra_byte_code_increase = 0;
+        -:  540:  }
+        -:  541:  else
+        -:  542:  {
+    #####:  543:    PARSER_APPEND_TO_BYTE_CODE (context_p, CBC_EXT_OPCODE);
+    #####:  544:    opcode = (uint16_t) PARSER_GET_EXT_OPCODE (opcode);
+        -:  545:
+    #####:  546:    JERRY_ASSERT (opcode < CBC_EXT_END);
+    #####:  547:    flags = cbc_ext_flags[opcode];
+    #####:  548:    extra_byte_code_increase = 1;
+        -:  549:  }
+        -:  550:
+        1:  551:  JERRY_ASSERT (flags & CBC_HAS_BRANCH_ARG);
+        1:  552:  JERRY_ASSERT (CBC_BRANCH_IS_FORWARD (flags));
+        1:  553:  JERRY_ASSERT (CBC_BRANCH_OFFSET_LENGTH (opcode) == 1);
+        -:  554:
+        -:  555:  /* Branch opcodes never push anything onto the stack. */
+        1:  556:  JERRY_ASSERT ((flags >> CBC_STACK_ADJUST_SHIFT) >= CBC_STACK_ADJUST_BASE
+        -:  557:                 || (CBC_STACK_ADJUST_BASE - (flags >> CBC_STACK_ADJUST_SHIFT)) <= context_p->stack_depth);
+        1:  558:  PARSER_PLUS_EQUAL_U16 (context_p->stack_depth, CBC_STACK_ADJUST_VALUE (flags));
+        -:  559:
+        -:  560:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  561:  if (context_p->is_show_opcodes)
+        -:  562:  {
+        -:  563:    JERRY_DEBUG_MSG ("  [%3d] %s\n",
+        -:  564:                     (int) context_p->stack_depth,
+        -:  565:                     extra_byte_code_increase == 0 ? cbc_names[opcode] : cbc_ext_names[opcode]);
+        -:  566:  }
+        -:  567:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  568:
+        1:  569:  PARSER_PLUS_EQUAL_U16 (opcode, PARSER_MAX_BRANCH_LENGTH - 1);
+        -:  570:
+        1:  571:  parser_emit_two_bytes (context_p, (uint8_t) opcode, 0);
+        1:  572:  branch_p->page_p = context_p->byte_code.last_p;
+        1:  573:  branch_p->offset = (context_p->byte_code.last_position - 1) | (context_p->byte_code_size << 8);
+        -:  574:
+        1:  575:  context_p->byte_code_size += extra_byte_code_increase;
+        -:  576:
+        -:  577:#if PARSER_MAXIMUM_CODE_SIZE <= UINT16_MAX
+        -:  578:  PARSER_APPEND_TO_BYTE_CODE (context_p, 0);
+        -:  579:#else /* PARSER_MAXIMUM_CODE_SIZE > UINT16_MAX */
+        1:  580:  parser_emit_two_bytes (context_p, 0, 0);
+        -:  581:#endif /* PARSER_MAXIMUM_CODE_SIZE <= UINT16_MAX */
+        -:  582:
+        1:  583:  context_p->byte_code_size += PARSER_MAX_BRANCH_LENGTH + 1;
+        -:  584:
+        1:  585:  if (context_p->stack_depth > context_p->stack_limit)
+        -:  586:  {
+    #####:  587:    context_p->stack_limit = context_p->stack_depth;
+    #####:  588:    if (context_p->stack_limit > PARSER_MAXIMUM_STACK_LIMIT)
+        -:  589:    {
+    #####:  590:      parser_raise_error (context_p, PARSER_ERR_STACK_LIMIT_REACHED);
+        -:  591:    }
+        -:  592:  }
+        1:  593:} /* parser_emit_cbc_forward_branch */
+        -:  594:
+        -:  595:/**
+        -:  596: * Append a branch byte code and create an item.
+        -:  597: *
+        -:  598: * @return newly created parser branch node
+        -:  599: */
+        -:  600:parser_branch_node_t *
+    #####:  601:parser_emit_cbc_forward_branch_item (parser_context_t *context_p, /**< context */
+        -:  602:                                     uint16_t opcode, /**< opcode */
+        -:  603:                                     parser_branch_node_t *next_p) /**< next branch */
+        -:  604:{
+    #####:  605:  parser_branch_t branch;
+        -:  606:  parser_branch_node_t *new_item;
+        -:  607:
+        -:  608:  /* Since byte code insertion may throw an out-of-memory error,
+        -:  609:   * the branch is constructed locally, and copied later. */
+    #####:  610:  parser_emit_cbc_forward_branch (context_p, opcode, &branch);
+        -:  611:
+    #####:  612:  new_item = (parser_branch_node_t *) parser_malloc (context_p, sizeof (parser_branch_node_t));
+    #####:  613:  new_item->branch = branch;
+    #####:  614:  new_item->next_p = next_p;
+    #####:  615:  return new_item;
+        -:  616:} /* parser_emit_cbc_forward_branch_item */
+        -:  617:
+        -:  618:/**
+        -:  619: * Append a byte code with a branch argument
+        -:  620: */
+        -:  621:void
+        1:  622:parser_emit_cbc_backward_branch (parser_context_t *context_p, /**< context */
+        -:  623:                                 uint16_t opcode, /**< opcode */
+        -:  624:                                 uint32_t offset) /**< destination offset */
+        -:  625:{
+        -:  626:  uint8_t flags;
+        -:  627:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  628:  const char *name;
+        -:  629:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  630:
+        1:  631:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  632:  {
+        1:  633:    parser_flush_cbc (context_p);
+        -:  634:  }
+        -:  635:
+        1:  636:  context_p->status_flags |= PARSER_NO_END_LABEL;
+        1:  637:  offset = context_p->byte_code_size - offset;
+        -:  638:
+        1:  639:  if (PARSER_IS_BASIC_OPCODE (opcode))
+        -:  640:  {
+        1:  641:    JERRY_ASSERT (opcode < CBC_END);
+        1:  642:    flags = cbc_flags[opcode];
+        -:  643:
+        -:  644:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  645:    name = cbc_names[opcode];
+        -:  646:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  647:  }
+        -:  648:  else
+        -:  649:  {
+    #####:  650:    PARSER_APPEND_TO_BYTE_CODE (context_p, CBC_EXT_OPCODE);
+    #####:  651:    opcode = (uint16_t) PARSER_GET_EXT_OPCODE (opcode);
+        -:  652:
+    #####:  653:    JERRY_ASSERT (opcode < CBC_EXT_END);
+    #####:  654:    flags = cbc_ext_flags[opcode];
+    #####:  655:    context_p->byte_code_size++;
+        -:  656:
+        -:  657:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  658:    name = cbc_ext_names[opcode];
+        -:  659:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  660:  }
+        -:  661:
+        1:  662:  JERRY_ASSERT (flags & CBC_HAS_BRANCH_ARG);
+        1:  663:  JERRY_ASSERT (CBC_BRANCH_IS_BACKWARD (flags));
+        1:  664:  JERRY_ASSERT (CBC_BRANCH_OFFSET_LENGTH (opcode) == 1);
+        1:  665:  JERRY_ASSERT (offset <= context_p->byte_code_size);
+        -:  666:
+        -:  667:  /* Branch opcodes never push anything onto the stack. */
+        1:  668:  JERRY_ASSERT ((flags >> CBC_STACK_ADJUST_SHIFT) >= CBC_STACK_ADJUST_BASE
+        -:  669:                 || (CBC_STACK_ADJUST_BASE - (flags >> CBC_STACK_ADJUST_SHIFT)) <= context_p->stack_depth);
+        1:  670:  PARSER_PLUS_EQUAL_U16 (context_p->stack_depth, CBC_STACK_ADJUST_VALUE (flags));
+        -:  671:
+        -:  672:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  673:  if (context_p->is_show_opcodes)
+        -:  674:  {
+        -:  675:    JERRY_DEBUG_MSG ("  [%3d] %s\n", (int) context_p->stack_depth, name);
+        -:  676:  }
+        -:  677:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  678:
+        1:  679:  context_p->byte_code_size += 2;
+        -:  680:#if PARSER_MAXIMUM_CODE_SIZE > UINT16_MAX
+        1:  681:  if (offset > UINT16_MAX)
+        -:  682:  {
+    #####:  683:    opcode++;
+    #####:  684:    context_p->byte_code_size++;
+        -:  685:  }
+        -:  686:#endif /* PARSER_MAXIMUM_CODE_SIZE > UINT16_MAX */
+        -:  687:
+        1:  688:  if (offset > UINT8_MAX)
+        -:  689:  {
+    #####:  690:    opcode++;
+    #####:  691:    context_p->byte_code_size++;
+        -:  692:  }
+        -:  693:
+        1:  694:  PARSER_APPEND_TO_BYTE_CODE (context_p, (uint8_t) opcode);
+        -:  695:
+        -:  696:#if PARSER_MAXIMUM_CODE_SIZE > UINT16_MAX
+        1:  697:  if (offset > UINT16_MAX)
+        -:  698:  {
+    #####:  699:    PARSER_APPEND_TO_BYTE_CODE (context_p, offset >> 16);
+        -:  700:  }
+        -:  701:#endif /* PARSER_MAXIMUM_CODE_SIZE > UINT16_MAX */
+        -:  702:
+        1:  703:  if (offset > UINT8_MAX)
+        -:  704:  {
+    #####:  705:    PARSER_APPEND_TO_BYTE_CODE (context_p, (offset >> 8) & 0xff);
+        -:  706:  }
+        -:  707:
+        1:  708:  PARSER_APPEND_TO_BYTE_CODE (context_p, offset & 0xff);
+        1:  709:} /* parser_emit_cbc_backward_branch */
+        -:  710:
+        -:  711:#undef PARSER_CHECK_LAST_POSITION
+        -:  712:#undef PARSER_APPEND_TO_BYTE_CODE
+        -:  713:
+        -:  714:/**
+        -:  715: * Set a branch to the current byte code position
+        -:  716: */
+        -:  717:void
+        1:  718:parser_set_branch_to_current_position (parser_context_t *context_p, /**< context */
+        -:  719:                                       parser_branch_t *branch_p) /**< branch result */
+        -:  720:{
+        -:  721:  uint32_t delta;
+        -:  722:  size_t offset;
+        1:  723:  parser_mem_page_t *page_p = branch_p->page_p;
+        -:  724:
+        1:  725:  if (context_p->last_cbc_opcode != PARSER_CBC_UNAVAILABLE)
+        -:  726:  {
+        1:  727:    parser_flush_cbc (context_p);
+        -:  728:  }
+        -:  729:
+        1:  730:  context_p->status_flags &= (uint32_t) ~PARSER_NO_END_LABEL;
+        -:  731:
+        1:  732:  JERRY_ASSERT (context_p->byte_code_size > (branch_p->offset >> 8));
+        -:  733:
+        1:  734:  delta = context_p->byte_code_size - (branch_p->offset >> 8);
+        1:  735:  offset = (branch_p->offset & CBC_LOWER_SEVEN_BIT_MASK);
+        -:  736:
+        1:  737:  JERRY_ASSERT (delta <= PARSER_MAXIMUM_CODE_SIZE);
+        -:  738:
+        -:  739:#if PARSER_MAXIMUM_CODE_SIZE <= UINT16_MAX
+        -:  740:  page_p->bytes[offset++] = (uint8_t) (delta >> 8);
+        -:  741:  if (offset >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  742:  {
+        -:  743:    page_p = page_p->next_p;
+        -:  744:    offset = 0;
+        -:  745:  }
+        -:  746:#else /* PARSER_MAXIMUM_CODE_SIZE > UINT16_MAX */
+        1:  747:  page_p->bytes[offset++] = (uint8_t) (delta >> 16);
+        1:  748:  if (offset >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  749:  {
+    #####:  750:    page_p = page_p->next_p;
+    #####:  751:    offset = 0;
+        -:  752:  }
+        1:  753:  page_p->bytes[offset++] = (uint8_t) ((delta >> 8) & 0xff);
+        1:  754:  if (offset >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  755:  {
+    #####:  756:    page_p = page_p->next_p;
+    #####:  757:    offset = 0;
+        -:  758:  }
+        -:  759:#endif /* PARSER_MAXIMUM_CODE_SIZE <= UINT16_MAX */
+        1:  760:  page_p->bytes[offset] = delta & 0xff;
+        1:  761:} /* parser_set_branch_to_current_position */
+        -:  762:
+        -:  763:/**
+        -:  764: * Set breaks to the current byte code position
+        -:  765: */
+        -:  766:void
+        1:  767:parser_set_breaks_to_current_position (parser_context_t *context_p, /**< context */
+        -:  768:                                       parser_branch_node_t *current_p) /**< branch list */
+        -:  769:{
+        2:  770:  while (current_p != NULL)
+        -:  771:  {
+    #####:  772:    parser_branch_node_t *next_p = current_p->next_p;
+        -:  773:
+    #####:  774:    if (!(current_p->branch.offset & CBC_HIGHEST_BIT_MASK))
+        -:  775:    {
+    #####:  776:      parser_set_branch_to_current_position (context_p, &current_p->branch);
+        -:  777:    }
+    #####:  778:    parser_free (current_p, sizeof (parser_branch_node_t));
+    #####:  779:    current_p = next_p;
+        -:  780:  }
+        1:  781:} /* parser_set_breaks_to_current_position */
+        -:  782:
+        -:  783:/**
+        -:  784: * Set continues to the current byte code position
+        -:  785: */
+        -:  786:void
+        1:  787:parser_set_continues_to_current_position (parser_context_t *context_p, /**< context */
+        -:  788:                                          parser_branch_node_t *current_p) /**< branch list */
+        -:  789:{
+        2:  790:  while (current_p != NULL)
+        -:  791:  {
+    #####:  792:    if (current_p->branch.offset & CBC_HIGHEST_BIT_MASK)
+        -:  793:    {
+    #####:  794:      parser_set_branch_to_current_position (context_p, &current_p->branch);
+        -:  795:    }
+    #####:  796:    current_p = current_p->next_p;
+        -:  797:  }
+        1:  798:} /* parser_set_continues_to_current_position */
+        -:  799:
+        -:  800:#if ENABLED (JERRY_ERROR_MESSAGES)
+        -:  801:/**
+        -:  802: * Returns with the string representation of the error
+        -:  803: */
+        -:  804:const char *
+     1297:  805:parser_error_to_string (parser_error_t error) /**< error code */
+        -:  806:{
+     1297:  807:  switch (error)
+        -:  808:  {
+    #####:  809:    case PARSER_ERR_OUT_OF_MEMORY:
+        -:  810:    {
+    #####:  811:      return "Out of memory.";
+        -:  812:    }
+    #####:  813:    case PARSER_ERR_LITERAL_LIMIT_REACHED:
+        -:  814:    {
+    #####:  815:      return "Maximum number of literals reached.";
+        -:  816:    }
+    #####:  817:    case PARSER_ERR_SCOPE_STACK_LIMIT_REACHED:
+        -:  818:    {
+    #####:  819:      return "Maximum depth of scope stack reached.";
+        -:  820:    }
+    #####:  821:    case PARSER_ERR_ARGUMENT_LIMIT_REACHED:
+        -:  822:    {
+    #####:  823:      return "Maximum number of function arguments reached.";
+        -:  824:    }
+    #####:  825:    case PARSER_ERR_STACK_LIMIT_REACHED:
+        -:  826:    {
+    #####:  827:      return "Maximum function stack size reached.";
+        -:  828:    }
+    #####:  829:    case PARSER_ERR_INVALID_CHARACTER:
+        -:  830:    {
+    #####:  831:      return "Invalid (unexpected) character.";
+        -:  832:    }
+    #####:  833:    case PARSER_ERR_INVALID_OCTAL_DIGIT:
+        -:  834:    {
+    #####:  835:      return "Invalid octal digit.";
+        -:  836:    }
+    #####:  837:    case PARSER_ERR_INVALID_HEX_DIGIT:
+        -:  838:    {
+    #####:  839:      return "Invalid hexadecimal digit.";
+        -:  840:    }
+        -:  841:#if ENABLED (JERRY_ES2015)
+    #####:  842:    case PARSER_ERR_INVALID_BIN_DIGIT:
+        -:  843:    {
+    #####:  844:      return "Invalid binary digit.";
+        -:  845:    }
+        -:  846:#endif /* ENABLED (JERRY_ES2015) */
+    #####:  847:    case PARSER_ERR_INVALID_ESCAPE_SEQUENCE:
+        -:  848:    {
+    #####:  849:      return "Invalid escape sequence.";
+        -:  850:    }
+    #####:  851:    case PARSER_ERR_INVALID_UNICODE_ESCAPE_SEQUENCE:
+        -:  852:    {
+    #####:  853:      return "Invalid unicode escape sequence.";
+        -:  854:    }
+    #####:  855:    case PARSER_ERR_INVALID_IDENTIFIER_START:
+        -:  856:    {
+    #####:  857:      return "Character cannot be start of an identifier.";
+        -:  858:    }
+    #####:  859:    case PARSER_ERR_INVALID_IDENTIFIER_PART:
+        -:  860:    {
+    #####:  861:      return "Character cannot be part of an identifier.";
+        -:  862:    }
+    #####:  863:    case PARSER_ERR_INVALID_KEYWORD:
+        -:  864:    {
+    #####:  865:      return "Escape sequences are not allowed in keywords.";
+        -:  866:    }
+    #####:  867:    case PARSER_ERR_INVALID_NUMBER:
+        -:  868:    {
+    #####:  869:      return "Invalid number.";
+        -:  870:    }
+    #####:  871:    case PARSER_ERR_MISSING_EXPONENT:
+        -:  872:    {
+    #####:  873:      return "Missing exponent part.";
+        -:  874:    }
+    #####:  875:    case PARSER_ERR_IDENTIFIER_AFTER_NUMBER:
+        -:  876:    {
+    #####:  877:      return "Identifier cannot start after a number.";
+        -:  878:    }
+    #####:  879:    case PARSER_ERR_INVALID_REGEXP:
+        -:  880:    {
+    #####:  881:      return "Invalid regular expression.";
+        -:  882:    }
+    #####:  883:    case PARSER_ERR_UNKNOWN_REGEXP_FLAG:
+        -:  884:    {
+    #####:  885:      return "Unknown regexp flag.";
+        -:  886:    }
+    #####:  887:    case PARSER_ERR_DUPLICATED_REGEXP_FLAG:
+        -:  888:    {
+    #####:  889:      return "Duplicated regexp flag.";
+        -:  890:    }
+    #####:  891:    case PARSER_ERR_UNSUPPORTED_REGEXP:
+        -:  892:    {
+    #####:  893:      return "Regexp is not supported in the selected profile.";
+        -:  894:    }
+    #####:  895:    case PARSER_ERR_IDENTIFIER_TOO_LONG:
+        -:  896:    {
+    #####:  897:      return "Identifier is too long.";
+        -:  898:    }
+    #####:  899:    case PARSER_ERR_STRING_TOO_LONG:
+        -:  900:    {
+    #####:  901:      return "String is too long.";
+        -:  902:    }
+    #####:  903:    case PARSER_ERR_NUMBER_TOO_LONG:
+        -:  904:    {
+    #####:  905:      return "Number is too long.";
+        -:  906:    }
+    #####:  907:    case PARSER_ERR_REGEXP_TOO_LONG:
+        -:  908:    {
+    #####:  909:      return "Regexp is too long.";
+        -:  910:    }
+    #####:  911:    case PARSER_ERR_UNTERMINATED_MULTILINE_COMMENT:
+        -:  912:    {
+    #####:  913:      return "Unterminated multiline comment.";
+        -:  914:    }
+    #####:  915:    case PARSER_ERR_UNTERMINATED_STRING:
+        -:  916:    {
+    #####:  917:      return "Unterminated string literal.";
+        -:  918:    }
+    #####:  919:    case PARSER_ERR_UNTERMINATED_REGEXP:
+        -:  920:    {
+    #####:  921:      return "Unterminated regexp literal.";
+        -:  922:    }
+    #####:  923:    case PARSER_ERR_NEWLINE_NOT_ALLOWED:
+        -:  924:    {
+    #####:  925:      return "Newline is not allowed in strings or regexps.";
+        -:  926:    }
+    #####:  927:    case PARSER_ERR_OCTAL_NUMBER_NOT_ALLOWED:
+        -:  928:    {
+    #####:  929:      return "Octal numbers are not allowed in strict mode.";
+        -:  930:    }
+    #####:  931:    case PARSER_ERR_OCTAL_ESCAPE_NOT_ALLOWED:
+        -:  932:    {
+    #####:  933:      return "Octal escape sequences are not allowed in strict mode.";
+        -:  934:    }
+    #####:  935:    case PARSER_ERR_STRICT_IDENT_NOT_ALLOWED:
+        -:  936:    {
+    #####:  937:      return "Identifier name is reserved in strict mode.";
+        -:  938:    }
+    #####:  939:    case PARSER_ERR_EVAL_NOT_ALLOWED:
+        -:  940:    {
+    #####:  941:      return "Eval is not allowed to be used here in strict mode.";
+        -:  942:    }
+    #####:  943:    case PARSER_ERR_ARGUMENTS_NOT_ALLOWED:
+        -:  944:    {
+    #####:  945:      return "Arguments is not allowed to be used here in strict mode.";
+        -:  946:    }
+        -:  947:#if ENABLED (JERRY_ES2015)
+    #####:  948:    case PARSER_ERR_USE_STRICT_NOT_ALLOWED:
+        -:  949:    {
+    #####:  950:      return "The 'use strict' directive is not allowed for functions with non-simple arguments.";
+        -:  951:    }
+    #####:  952:    case PARSER_ERR_YIELD_NOT_ALLOWED:
+        -:  953:    {
+    #####:  954:      return "Yield expression is not allowed here.";
+        -:  955:    }
+    #####:  956:    case PARSER_ERR_AWAIT_NOT_ALLOWED:
+        -:  957:    {
+    #####:  958:      return "Await expression is not allowed here.";
+        -:  959:    }
+    #####:  960:    case PARSER_ERR_FOR_IN_OF_DECLARATION:
+        -:  961:    {
+    #####:  962:      return "for in-of loop variable declaration may not have an initializer.";
+        -:  963:    }
+    #####:  964:    case PARSER_ERR_DUPLICATED_PROTO:
+        -:  965:    {
+    #####:  966:      return "Duplicate __proto__ fields are not allowed in object literals.";
+        -:  967:    }
+        -:  968:#endif /* ENABLED (JERRY_ES2015) */
+    #####:  969:    case PARSER_ERR_DELETE_IDENT_NOT_ALLOWED:
+        -:  970:    {
+    #####:  971:      return "Deleting identifier is not allowed in strict mode.";
+        -:  972:    }
+    #####:  973:    case PARSER_ERR_EVAL_CANNOT_ASSIGNED:
+        -:  974:    {
+    #####:  975:      return "Eval cannot be assigned to in strict mode.";
+        -:  976:    }
+    #####:  977:    case PARSER_ERR_ARGUMENTS_CANNOT_ASSIGNED:
+        -:  978:    {
+    #####:  979:      return "Arguments cannot be assigned to in strict mode.";
+        -:  980:    }
+    #####:  981:    case PARSER_ERR_WITH_NOT_ALLOWED:
+        -:  982:    {
+    #####:  983:      return "With statement not allowed in strict mode.";
+        -:  984:    }
+    #####:  985:    case PARSER_ERR_MULTIPLE_DEFAULTS_NOT_ALLOWED:
+        -:  986:    {
+    #####:  987:      return "Multiple default cases are not allowed.";
+        -:  988:    }
+    #####:  989:    case PARSER_ERR_DEFAULT_NOT_IN_SWITCH:
+        -:  990:    {
+    #####:  991:      return "Default statement must be in a switch block.";
+        -:  992:    }
+    #####:  993:    case PARSER_ERR_CASE_NOT_IN_SWITCH:
+        -:  994:    {
+    #####:  995:      return "Case statement must be in a switch block.";
+        -:  996:    }
+    #####:  997:    case PARSER_ERR_LEFT_PAREN_EXPECTED:
+        -:  998:    {
+    #####:  999:      return "Expected '(' token.";
+        -: 1000:    }
+    #####: 1001:    case PARSER_ERR_LEFT_BRACE_EXPECTED:
+        -: 1002:    {
+    #####: 1003:      return "Expected '{' token.";
+        -: 1004:    }
+    #####: 1005:    case PARSER_ERR_RIGHT_PAREN_EXPECTED:
+        -: 1006:    {
+    #####: 1007:      return "Expected ')' token.";
+        -: 1008:    }
+    #####: 1009:    case PARSER_ERR_RIGHT_SQUARE_EXPECTED:
+        -: 1010:    {
+    #####: 1011:      return "Expected ']' token.";
+        -: 1012:    }
+    #####: 1013:    case PARSER_ERR_COLON_EXPECTED:
+        -: 1014:    {
+    #####: 1015:      return "Expected ':' token.";
+        -: 1016:    }
+    #####: 1017:    case PARSER_ERR_COLON_FOR_CONDITIONAL_EXPECTED:
+        -: 1018:    {
+    #####: 1019:      return "Expected ':' token for ?: conditional expression.";
+        -: 1020:    }
+    #####: 1021:    case PARSER_ERR_SEMICOLON_EXPECTED:
+        -: 1022:    {
+    #####: 1023:      return "Expected ';' token.";
+        -: 1024:    }
+    #####: 1025:    case PARSER_ERR_IN_EXPECTED:
+        -: 1026:    {
+    #####: 1027:      return "Expected 'in' token.";
+        -: 1028:    }
+    #####: 1029:    case PARSER_ERR_WHILE_EXPECTED:
+        -: 1030:    {
+    #####: 1031:      return "While expected for do-while loop.";
+        -: 1032:    }
+    #####: 1033:    case PARSER_ERR_CATCH_FINALLY_EXPECTED:
+        -: 1034:    {
+    #####: 1035:      return "Catch or finally block expected.";
+        -: 1036:    }
+    #####: 1037:    case PARSER_ERR_ARRAY_ITEM_SEPARATOR_EXPECTED:
+        -: 1038:    {
+    #####: 1039:      return "Expected ',' or ']' after an array item.";
+        -: 1040:    }
+    #####: 1041:    case PARSER_ERR_OBJECT_ITEM_SEPARATOR_EXPECTED:
+        -: 1042:    {
+    #####: 1043:      return "Expected ',' or '}' after a property definition.";
+        -: 1044:    }
+     1297: 1045:    case PARSER_ERR_IDENTIFIER_EXPECTED:
+        -: 1046:    {
+     1297: 1047:      return "Identifier expected.";
+        -: 1048:    }
+    #####: 1049:    case PARSER_ERR_EXPRESSION_EXPECTED:
+        -: 1050:    {
+    #####: 1051:      return "Expression expected.";
+        -: 1052:    }
+    #####: 1053:    case PARSER_ERR_PRIMARY_EXP_EXPECTED:
+        -: 1054:    {
+    #####: 1055:      return "Primary expression expected.";
+        -: 1056:    }
+    #####: 1057:    case PARSER_ERR_LEFT_HAND_SIDE_EXP_EXPECTED:
+        -: 1058:    {
+    #####: 1059:      return "Left-hand-side expression expected.";
+        -: 1060:    }
+    #####: 1061:    case PARSER_ERR_STATEMENT_EXPECTED:
+        -: 1062:    {
+    #####: 1063:      return "Statement expected.";
+        -: 1064:    }
+    #####: 1065:    case PARSER_ERR_PROPERTY_IDENTIFIER_EXPECTED:
+        -: 1066:    {
+    #####: 1067:      return "Property identifier expected.";
+        -: 1068:    }
+    #####: 1069:    case PARSER_ERR_ARGUMENT_LIST_EXPECTED:
+        -: 1070:    {
+    #####: 1071:      return "Expected argument list.";
+        -: 1072:    }
+    #####: 1073:    case PARSER_ERR_NO_ARGUMENTS_EXPECTED:
+        -: 1074:    {
+    #####: 1075:      return "Property getters must have no arguments.";
+        -: 1076:    }
+    #####: 1077:    case PARSER_ERR_ONE_ARGUMENT_EXPECTED:
+        -: 1078:    {
+    #####: 1079:      return "Property setters must have one argument.";
+        -: 1080:    }
+    #####: 1081:    case PARSER_ERR_INVALID_EXPRESSION:
+        -: 1082:    {
+    #####: 1083:      return "Invalid expression.";
+        -: 1084:    }
+    #####: 1085:    case PARSER_ERR_INVALID_SWITCH:
+        -: 1086:    {
+    #####: 1087:      return "Invalid switch body.";
+        -: 1088:    }
+    #####: 1089:    case PARSER_ERR_INVALID_BREAK:
+        -: 1090:    {
+    #####: 1091:      return "Break statement must be inside a loop or switch.";
+        -: 1092:    }
+    #####: 1093:    case PARSER_ERR_INVALID_BREAK_LABEL:
+        -: 1094:    {
+    #####: 1095:      return "Labeled statement targeted by a break not found.";
+        -: 1096:    }
+    #####: 1097:    case PARSER_ERR_INVALID_CONTINUE:
+        -: 1098:    {
+    #####: 1099:      return "Continue statement must be inside a loop.";
+        -: 1100:    }
+    #####: 1101:    case PARSER_ERR_INVALID_CONTINUE_LABEL:
+        -: 1102:    {
+    #####: 1103:      return "Labeled statement targeted by a continue not found.";
+        -: 1104:    }
+    #####: 1105:    case PARSER_ERR_INVALID_RETURN:
+        -: 1106:    {
+    #####: 1107:      return "Return statement must be inside a function body.";
+        -: 1108:    }
+    #####: 1109:    case PARSER_ERR_INVALID_RIGHT_SQUARE:
+        -: 1110:    {
+    #####: 1111:      return "Unexpected '}' token.";
+        -: 1112:    }
+    #####: 1113:    case PARSER_ERR_DUPLICATED_LABEL:
+        -: 1114:    {
+    #####: 1115:      return "Duplicated label.";
+        -: 1116:    }
+    #####: 1117:    case PARSER_ERR_OBJECT_PROPERTY_REDEFINED:
+        -: 1118:    {
+    #####: 1119:      return "Property of object literal redefined.";
+        -: 1120:    }
+    #####: 1121:    case PARSER_ERR_NON_STRICT_ARG_DEFINITION:
+        -: 1122:    {
+    #####: 1123:      return "Non-strict argument definition.";
+        -: 1124:    }
+        -: 1125:#if ENABLED (JERRY_ES2015)
+    #####: 1126:    case PARSER_ERR_VARIABLE_REDECLARED:
+        -: 1127:    {
+    #####: 1128:      return "Local variable is redeclared.";
+        -: 1129:    }
+    #####: 1130:    case PARSER_ERR_LEXICAL_SINGLE_STATEMENT:
+        -: 1131:    {
+    #####: 1132:      return "Lexical declaration cannot appear in a single-statement context.";
+        -: 1133:    }
+    #####: 1134:    case PARSER_ERR_LABELLED_FUNC_NOT_IN_BLOCK:
+        -: 1135:    {
+    #####: 1136:      return "Labelled functions are only allowed inside blocks.";
+        -: 1137:    }
+    #####: 1138:    case PARSER_ERR_LEXICAL_LET_BINDING:
+        -: 1139:    {
+    #####: 1140:      return "Let binding cannot appear in let/const declarations.";
+        -: 1141:    }
+    #####: 1142:    case PARSER_ERR_MISSING_ASSIGN_AFTER_CONST:
+        -: 1143:    {
+    #####: 1144:      return "Value assignment is expected after a const declaration.";
+        -: 1145:    }
+    #####: 1146:    case PARSER_ERR_MULTIPLE_CLASS_CONSTRUCTORS:
+        -: 1147:    {
+    #####: 1148:      return "Multiple constructors are not allowed.";
+        -: 1149:    }
+    #####: 1150:    case PARSER_ERR_CLASS_CONSTRUCTOR_AS_ACCESSOR:
+        -: 1151:    {
+    #####: 1152:      return "Class constructor may not be an accessor.";
+        -: 1153:    }
+    #####: 1154:    case PARSER_ERR_CLASS_CONSTRUCTOR_AS_GENERATOR:
+        -: 1155:    {
+    #####: 1156:      return "Class constructor may not be a generator.";
+        -: 1157:    }
+    #####: 1158:    case PARSER_ERR_CLASS_STATIC_PROTOTYPE:
+        -: 1159:    {
+    #####: 1160:      return "Classes may not have a static property called 'prototype'.";
+        -: 1161:    }
+    #####: 1162:    case PARSER_ERR_UNEXPECTED_SUPER_KEYWORD:
+        -: 1163:    {
+    #####: 1164:      return "Super is not allowed to be used here.";
+        -: 1165:    }
+    #####: 1166:    case PARSER_ERR_RIGHT_BRACE_EXPECTED:
+        -: 1167:    {
+    #####: 1168:      return "Expected '}' token.";
+        -: 1169:    }
+    #####: 1170:    case PARSER_ERR_OF_EXPECTED:
+        -: 1171:    {
+    #####: 1172:      return "Expected 'of' token.";
+        -: 1173:    }
+    #####: 1174:    case PARSER_ERR_ASSIGNMENT_EXPECTED:
+        -: 1175:    {
+    #####: 1176:      return "Unexpected arrow function or yield expression (parentheses around the expression may help).";
+        -: 1177:    }
+    #####: 1178:    case PARSER_ERR_DUPLICATED_ARGUMENT_NAMES:
+        -: 1179:    {
+    #####: 1180:      return "Duplicated function argument names are not allowed here.";
+        -: 1181:    }
+    #####: 1182:    case PARSER_ERR_INVALID_DESTRUCTURING_PATTERN:
+        -: 1183:    {
+    #####: 1184:      return "Invalid destructuring assignment target.";
+        -: 1185:    }
+    #####: 1186:    case PARSER_ERR_ILLEGAL_PROPERTY_IN_DECLARATION:
+        -: 1187:    {
+    #####: 1188:      return "Illegal property in declaration context.";
+        -: 1189:    }
+    #####: 1190:    case PARSER_ERR_INVALID_EXPONENTIATION:
+        -: 1191:    {
+    #####: 1192:      return "Left operand of ** operator cannot be unary expression.";
+        -: 1193:    }
+    #####: 1194:    case PARSER_ERR_FORMAL_PARAM_AFTER_REST_PARAMETER:
+        -: 1195:    {
+    #####: 1196:      return "Rest parameter must be the last formal parameter.";
+        -: 1197:    }
+    #####: 1198:    case PARSER_ERR_SETTER_REST_PARAMETER:
+        -: 1199:    {
+    #####: 1200:      return "Setter function argument must not be a rest parameter.";
+        -: 1201:    }
+    #####: 1202:    case PARSER_ERR_REST_PARAMETER_DEFAULT_INITIALIZER:
+        -: 1203:    {
+    #####: 1204:      return "Rest parameter may not have a default initializer.";
+        -: 1205:    }
+    #####: 1206:    case PARSER_ERR_NEW_TARGET_EXPECTED:
+        -: 1207:    {
+    #####: 1208:      return "Expected new.target expression.";
+        -: 1209:    }
+    #####: 1210:    case PARSER_ERR_NEW_TARGET_NOT_ALLOWED:
+        -: 1211:    {
+    #####: 1212:      return "new.target expression is not allowed here.";
+        -: 1213:    }
+        -: 1214:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1215:#if ENABLED (JERRY_ES2015_MODULE_SYSTEM)
+    #####: 1216:    case PARSER_ERR_FILE_NOT_FOUND:
+        -: 1217:    {
+    #####: 1218:      return "Requested module not found.";
+        -: 1219:    }
+    #####: 1220:    case PARSER_ERR_FROM_EXPECTED:
+        -: 1221:    {
+    #####: 1222:      return "Expected 'from' token.";
+        -: 1223:    }
+    #####: 1224:    case PARSER_ERR_FROM_COMMA_EXPECTED:
+        -: 1225:    {
+    #####: 1226:      return "Expected 'from' or ',' token.";
+        -: 1227:    }
+    #####: 1228:    case PARSER_ERR_AS_EXPECTED:
+        -: 1229:    {
+    #####: 1230:      return "Expected 'as' token.";
+        -: 1231:    }
+    #####: 1232:    case PARSER_ERR_STRING_EXPECTED:
+        -: 1233:    {
+    #####: 1234:      return "Expected a string literal.";
+        -: 1235:    }
+    #####: 1236:    case PARSER_ERR_MODULE_UNEXPECTED:
+        -: 1237:    {
+    #####: 1238:      return "Import and export statements must be in the global context.";
+        -: 1239:    }
+    #####: 1240:    case PARSER_ERR_LEFT_BRACE_MULTIPLY_EXPECTED:
+        -: 1241:    {
+    #####: 1242:      return "Expected '{' or '*' token.";
+        -: 1243:    }
+    #####: 1244:    case PARSER_ERR_LEFT_BRACE_MULTIPLY_LITERAL_EXPECTED:
+        -: 1245:    {
+    #####: 1246:      return "Expected '{' or '*' or literal token.";
+        -: 1247:    }
+    #####: 1248:    case PARSER_ERR_RIGHT_BRACE_COMMA_EXPECTED:
+        -: 1249:    {
+    #####: 1250:      return "Expected '}' or ',' token.";
+        -: 1251:    }
+    #####: 1252:    case PARSER_ERR_DUPLICATED_EXPORT_IDENTIFIER:
+        -: 1253:    {
+    #####: 1254:      return "Duplicate exported identifier.";
+        -: 1255:    }
+    #####: 1256:    case PARSER_ERR_DUPLICATED_IMPORT_BINDING:
+        -: 1257:    {
+    #####: 1258:      return "Duplicated imported binding name.";
+        -: 1259:    }
+        -: 1260:#endif /* ENABLED (JERRY_ES2015_MODULE_SYSTEM) */
+        -: 1261:
+    #####: 1262:    default:
+        -: 1263:    {
+    #####: 1264:      JERRY_ASSERT (error == PARSER_ERR_NO_ERROR);
+    #####: 1265:      return "No error.";
+        -: 1266:    }
+        -: 1267:  }
+        -: 1268:} /* parser_error_to_string */
+        -: 1269:#endif /* ENABLED (JERRY_ERROR_MESSAGES) */
+        -: 1270:
+        -: 1271:/**
+        -: 1272: * @}
+        -: 1273: * @}
+        -: 1274: * @}
+        -: 1275: */
+        -: 1276:
+        -: 1277:#endif /* ENABLED (JERRY_PARSER) */

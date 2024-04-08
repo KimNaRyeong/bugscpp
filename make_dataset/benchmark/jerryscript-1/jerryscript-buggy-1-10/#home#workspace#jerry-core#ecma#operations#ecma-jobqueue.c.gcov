@@ -1,0 +1,389 @@
+        -:    0:Source:/home/workspace/jerry-core/ecma/operations/ecma-jobqueue.c
+        -:    0:Programs:274
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "ecma-function-object.h"
+        -:   17:#include "ecma-globals.h"
+        -:   18:#include "ecma-helpers.h"
+        -:   19:#include "ecma-jobqueue.h"
+        -:   20:#include "ecma-objects.h"
+        -:   21:#include "ecma-promise-object.h"
+        -:   22:#include "jcontext.h"
+        -:   23:
+        -:   24:#if ENABLED (JERRY_ES2015_BUILTIN_PROMISE)
+        -:   25:
+        -:   26:/**
+        -:   27: * Mask for job queue type.
+        -:   28: */
+        -:   29:#define ECMA_JOB_QUEURE_TYPE_MASK ((uintptr_t) 0x07)
+        -:   30:
+        -:   31:/** \addtogroup ecma ECMA
+        -:   32: * @{
+        -:   33: *
+        -:   34: * \addtogroup ecmajobqueue ECMA Job Queue related routines
+        -:   35: * @{
+        -:   36: */
+        -:   37:
+        -:   38:/**
+        -:   39: * Description of the PromiseReactionJob
+        -:   40: */
+        -:   41:typedef struct
+        -:   42:{
+        -:   43:  ecma_job_queue_item_t header; /**< job queue item header */
+        -:   44:  ecma_value_t capability; /**< capability object */
+        -:   45:  ecma_value_t handler; /**< handler function */
+        -:   46:  ecma_value_t argument; /**< argument for the reaction */
+        -:   47:} ecma_job_promise_reaction_t;
+        -:   48:
+        -:   49:/**
+        -:   50: * Description of the PromiseResolveThenableJob
+        -:   51: */
+        -:   52:typedef struct
+        -:   53:{
+        -:   54:  ecma_job_queue_item_t header; /**< job queue item header */
+        -:   55:  ecma_value_t promise; /**< promise to be resolved */
+        -:   56:  ecma_value_t thenable; /**< thenable object */
+        -:   57:  ecma_value_t then; /**< 'then' function */
+        -:   58:} ecma_job_promise_resolve_thenable_t;
+        -:   59:
+        -:   60:/**
+        -:   61: * Initialize the jobqueue.
+        -:   62: */
+        1:   63:void ecma_job_queue_init (void)
+        -:   64:{
+        1:   65:  JERRY_CONTEXT (job_queue_head_p) = NULL;
+        1:   66:  JERRY_CONTEXT (job_queue_tail_p) = NULL;
+        1:   67:} /* ecma_job_queue_init */
+        -:   68:
+        -:   69:/**
+        -:   70: * Get the type of the job.
+        -:   71: *
+        -:   72: * @return type of the job
+        -:   73: */
+        -:   74:static inline ecma_job_queue_item_type_t JERRY_ATTR_ALWAYS_INLINE
+        -:   75:ecma_job_queue_get_type (ecma_job_queue_item_t *job_p) /**< the job */
+        -:   76:{
+    #####:   77:  return (ecma_job_queue_item_type_t) (job_p->next_and_type & ECMA_JOB_QUEURE_TYPE_MASK);
+        -:   78:} /* ecma_job_queue_get_type */
+        -:   79:
+        -:   80:/**
+        -:   81: * Get the next job of the job queue.
+        -:   82: *
+        -:   83: * @return next job
+        -:   84: */
+        -:   85:static inline ecma_job_queue_item_t *JERRY_ATTR_ALWAYS_INLINE
+        -:   86:ecma_job_queue_get_next (ecma_job_queue_item_t *job_p) /**< the job */
+        -:   87:{
+    #####:   88:  return (ecma_job_queue_item_t *) (job_p->next_and_type & ~ECMA_JOB_QUEURE_TYPE_MASK);
+        -:   89:} /* ecma_job_queue_get_next */
+        -:   90:
+        -:   91:/**
+        -:   92: * Free the heap and the member of the PromiseReactionJob.
+        -:   93: */
+        -:   94:static void
+    #####:   95:ecma_free_promise_reaction_job (ecma_job_promise_reaction_t *job_p) /**< points to the PromiseReactionJob */
+        -:   96:{
+    #####:   97:  JERRY_ASSERT (job_p != NULL);
+        -:   98:
+    #####:   99:  ecma_free_value (job_p->capability);
+    #####:  100:  ecma_free_value (job_p->handler);
+    #####:  101:  ecma_free_value (job_p->argument);
+        -:  102:
+    #####:  103:  jmem_heap_free_block (job_p, sizeof (ecma_job_promise_reaction_t));
+    #####:  104:} /* ecma_free_promise_reaction_job */
+        -:  105:
+        -:  106:/**
+        -:  107: * Free the heap and the member of the PromiseResolveThenableJob.
+        -:  108: */
+        -:  109:static void
+    #####:  110:ecma_free_promise_resolve_thenable_job (ecma_job_promise_resolve_thenable_t *job_p) /**< points to the
+        -:  111:                                                                                     *   PromiseResolveThenableJob */
+        -:  112:{
+    #####:  113:  JERRY_ASSERT (job_p != NULL);
+        -:  114:
+    #####:  115:  ecma_free_value (job_p->promise);
+    #####:  116:  ecma_free_value (job_p->thenable);
+    #####:  117:  ecma_free_value (job_p->then);
+        -:  118:
+    #####:  119:  jmem_heap_free_block (job_p, sizeof (ecma_job_promise_resolve_thenable_t));
+    #####:  120:} /* ecma_free_promise_resolve_thenable_job */
+        -:  121:
+        -:  122:/**
+        -:  123: * The processor for PromiseReactionJob.
+        -:  124: *
+        -:  125: * See also: ES2015 25.4.2.1
+        -:  126: *
+        -:  127: * @return ecma value
+        -:  128: *         Returned value must be freed with ecma_free_value
+        -:  129: */
+        -:  130:static ecma_value_t
+    #####:  131:ecma_process_promise_reaction_job (ecma_job_promise_reaction_t *job_p) /**< the job to be operated */
+        -:  132:{
+    #####:  133:  ecma_string_t *resolve_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_RESOLVE);
+    #####:  134:  ecma_string_t *reject_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_REJECT);
+        -:  135:
+        -:  136:  /* 2. */
+    #####:  137:  ecma_value_t capability = job_p->capability;
+        -:  138:  /* 3. */
+    #####:  139:  ecma_value_t handler = job_p->handler;
+        -:  140:
+    #####:  141:  JERRY_ASSERT (ecma_is_value_boolean (handler) || ecma_op_is_callable (handler));
+        -:  142:
+    #####:  143:  ecma_value_t handler_result;
+        -:  144:
+    #####:  145:  if (ecma_is_value_boolean (handler))
+        -:  146:  {
+        -:  147:    /* 4-5. True indicates "identity" and false indicates "thrower" */
+    #####:  148:    handler_result = ecma_copy_value (job_p->argument);
+        -:  149:  }
+        -:  150:  else
+        -:  151:  {
+        -:  152:    /* 6. */
+    #####:  153:    handler_result = ecma_op_function_call (ecma_get_object_from_value (handler),
+        -:  154:                                            ECMA_VALUE_UNDEFINED,
+    #####:  155:                                            &(job_p->argument),
+        -:  156:                                            1);
+        -:  157:  }
+        -:  158:
+        -:  159:  ecma_value_t status;
+        -:  160:
+    #####:  161:  if (ecma_is_value_false (handler) || ECMA_IS_VALUE_ERROR (handler_result))
+    #####:  162:  {
+    #####:  163:    if (ECMA_IS_VALUE_ERROR (handler_result))
+        -:  164:    {
+    #####:  165:      handler_result = jcontext_take_exception ();
+        -:  166:    }
+        -:  167:
+        -:  168:    /* 7. */
+    #####:  169:    ecma_value_t reject = ecma_op_object_get (ecma_get_object_from_value (capability), reject_str_p);
+        -:  170:
+    #####:  171:    JERRY_ASSERT (ecma_op_is_callable (reject));
+        -:  172:
+    #####:  173:    status = ecma_op_function_call (ecma_get_object_from_value (reject),
+        -:  174:                                    ECMA_VALUE_UNDEFINED,
+        -:  175:                                    &handler_result,
+        -:  176:                                    1);
+    #####:  177:    ecma_free_value (reject);
+        -:  178:  }
+        -:  179:  else
+        -:  180:  {
+        -:  181:    /* 8. */
+    #####:  182:    ecma_value_t resolve = ecma_op_object_get (ecma_get_object_from_value (capability), resolve_str_p);
+        -:  183:
+    #####:  184:    JERRY_ASSERT (ecma_op_is_callable (resolve));
+        -:  185:
+    #####:  186:    status = ecma_op_function_call (ecma_get_object_from_value (resolve),
+        -:  187:                                    ECMA_VALUE_UNDEFINED,
+        -:  188:                                    &handler_result,
+        -:  189:                                    1);
+    #####:  190:    ecma_free_value (resolve);
+        -:  191:  }
+        -:  192:
+    #####:  193:  ecma_free_value (handler_result);
+    #####:  194:  ecma_free_promise_reaction_job (job_p);
+        -:  195:
+    #####:  196:  return status;
+        -:  197:} /* ecma_process_promise_reaction_job */
+        -:  198:
+        -:  199:/**
+        -:  200: * Process the PromiseResolveThenableJob.
+        -:  201: *
+        -:  202: * See also: ES2015 25.4.2.2
+        -:  203: *
+        -:  204: * @return ecma value
+        -:  205: *         Returned value must be freed with ecma_free_value
+        -:  206: */
+        -:  207:static ecma_value_t
+    #####:  208:ecma_process_promise_resolve_thenable_job (ecma_job_promise_resolve_thenable_t *job_p) /**< the job to be operated */
+        -:  209:{
+    #####:  210:  ecma_object_t *promise_p = ecma_get_object_from_value (job_p->promise);
+    #####:  211:  ecma_promise_resolving_functions_t funcs;
+    #####:  212:  ecma_promise_create_resolving_functions (promise_p, &funcs);
+        -:  213:
+    #####:  214:  ecma_string_t *str_resolve_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_RESOLVE_FUNCTION);
+    #####:  215:  ecma_string_t *str_reject_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_REJECT_FUNCTION);
+        -:  216:
+    #####:  217:  ecma_op_object_put (promise_p,
+        -:  218:                      str_resolve_p,
+        -:  219:                      funcs.resolve,
+        -:  220:                      false);
+    #####:  221:  ecma_op_object_put (promise_p,
+        -:  222:                      str_reject_p,
+        -:  223:                      funcs.reject,
+        -:  224:                      false);
+        -:  225:
+    #####:  226:  ecma_value_t argv[] = { funcs.resolve, funcs.reject };
+        -:  227:  ecma_value_t ret;
+    #####:  228:  ecma_value_t then_call_result = ecma_op_function_call (ecma_get_object_from_value (job_p->then),
+        -:  229:                                                         job_p->thenable,
+        -:  230:                                                         argv,
+        -:  231:                                                         2);
+        -:  232:
+    #####:  233:  ret = then_call_result;
+        -:  234:
+    #####:  235:  if (ECMA_IS_VALUE_ERROR (then_call_result))
+        -:  236:  {
+    #####:  237:    then_call_result = jcontext_take_exception ();
+        -:  238:
+    #####:  239:    ret = ecma_op_function_call (ecma_get_object_from_value (funcs.reject),
+        -:  240:                                 ECMA_VALUE_UNDEFINED,
+        -:  241:                                 &then_call_result,
+        -:  242:                                 1);
+        -:  243:
+    #####:  244:    ecma_free_value (then_call_result);
+        -:  245:  }
+        -:  246:
+    #####:  247:  ecma_promise_free_resolving_functions (&funcs);
+    #####:  248:  ecma_free_promise_resolve_thenable_job (job_p);
+        -:  249:
+    #####:  250:  return ret;
+        -:  251:} /* ecma_process_promise_resolve_thenable_job */
+        -:  252:
+        -:  253:/**
+        -:  254: * Enqueue a Promise job into the jobqueue.
+        -:  255: */
+        -:  256:static void
+    #####:  257:ecma_enqueue_job (ecma_job_queue_item_t *job_p) /**< the job */
+        -:  258:{
+    #####:  259:  JERRY_ASSERT (job_p->next_and_type <= ECMA_JOB_QUEURE_TYPE_MASK);
+        -:  260:
+    #####:  261:  if (JERRY_CONTEXT (job_queue_head_p) == NULL)
+        -:  262:  {
+    #####:  263:    JERRY_CONTEXT (job_queue_head_p) = job_p;
+    #####:  264:    JERRY_CONTEXT (job_queue_tail_p) = job_p;
+        -:  265:  }
+        -:  266:  else
+        -:  267:  {
+    #####:  268:    JERRY_ASSERT ((JERRY_CONTEXT (job_queue_tail_p)->next_and_type & ~ECMA_JOB_QUEURE_TYPE_MASK) == 0);
+        -:  269:
+    #####:  270:    JERRY_CONTEXT (job_queue_tail_p)->next_and_type |= (uintptr_t) job_p;
+    #####:  271:    JERRY_CONTEXT (job_queue_tail_p) = job_p;
+        -:  272:  }
+    #####:  273:} /* ecma_enqueue_job */
+        -:  274:
+        -:  275:/**
+        -:  276: * Enqueue a PromiseReactionJob into the jobqueue.
+        -:  277: */
+        -:  278:void
+    #####:  279:ecma_enqueue_promise_reaction_job (ecma_value_t capability, /**< capability object */
+        -:  280:                                   ecma_value_t handler, /**< handler function */
+        -:  281:                                   ecma_value_t argument) /**< argument for the reaction */
+        -:  282:{
+        -:  283:  ecma_job_promise_reaction_t *job_p;
+    #####:  284:  job_p = (ecma_job_promise_reaction_t *) jmem_heap_alloc_block (sizeof (ecma_job_promise_reaction_t));
+    #####:  285:  job_p->header.next_and_type = ECMA_JOB_PROMISE_REACTION;
+    #####:  286:  job_p->capability = ecma_copy_value (capability);
+    #####:  287:  job_p->handler = ecma_copy_value (handler);
+    #####:  288:  job_p->argument = ecma_copy_value (argument);
+        -:  289:
+    #####:  290:  ecma_enqueue_job (&job_p->header);
+    #####:  291:} /* ecma_enqueue_promise_reaction_job */
+        -:  292:
+        -:  293:/**
+        -:  294: * Enqueue a PromiseResolveThenableJob into the jobqueue.
+        -:  295: */
+        -:  296:void
+    #####:  297:ecma_enqueue_promise_resolve_thenable_job (ecma_value_t promise, /**< promise to be resolved */
+        -:  298:                                           ecma_value_t thenable, /**< thenable object */
+        -:  299:                                           ecma_value_t then) /**< 'then' function */
+        -:  300:{
+    #####:  301:  JERRY_ASSERT (ecma_is_promise (ecma_get_object_from_value (promise)));
+    #####:  302:  JERRY_ASSERT (ecma_is_value_object (thenable));
+    #####:  303:  JERRY_ASSERT (ecma_op_is_callable (then));
+        -:  304:
+        -:  305:  ecma_job_promise_resolve_thenable_t *job_p;
+    #####:  306:  job_p = (ecma_job_promise_resolve_thenable_t *) jmem_heap_alloc_block (sizeof (ecma_job_promise_resolve_thenable_t));
+    #####:  307:  job_p->header.next_and_type = ECMA_JOB_PROMISE_THENABLE;
+    #####:  308:  job_p->promise = ecma_copy_value (promise);
+    #####:  309:  job_p->thenable = ecma_copy_value (thenable);
+    #####:  310:  job_p->then = ecma_copy_value (then);
+        -:  311:
+    #####:  312:  ecma_enqueue_job (&job_p->header);
+    #####:  313:} /* ecma_enqueue_promise_resolve_thenable_job */
+        -:  314:
+        -:  315:/**
+        -:  316: * Process enqueued Promise jobs until the first thrown error or until the
+        -:  317: * jobqueue becomes empty.
+        -:  318: *
+        -:  319: * @return result of the last processed job - if the jobqueue was non-empty,
+        -:  320: *         undefined - otherwise.
+        -:  321: */
+        -:  322:ecma_value_t
+    #####:  323:ecma_process_all_enqueued_jobs (void)
+        -:  324:{
+    #####:  325:  ecma_value_t ret = ECMA_VALUE_UNDEFINED;
+        -:  326:
+    #####:  327:  while (JERRY_CONTEXT (job_queue_head_p) != NULL && !ECMA_IS_VALUE_ERROR (ret))
+        -:  328:  {
+    #####:  329:    ecma_job_queue_item_t *job_p = JERRY_CONTEXT (job_queue_head_p);
+    #####:  330:    JERRY_CONTEXT (job_queue_head_p) = ecma_job_queue_get_next (job_p);
+        -:  331:
+    #####:  332:    ecma_fast_free_value (ret);
+        -:  333:
+    #####:  334:    switch (ecma_job_queue_get_type (job_p))
+        -:  335:    {
+    #####:  336:      case ECMA_JOB_PROMISE_REACTION:
+        -:  337:      {
+    #####:  338:        ret = ecma_process_promise_reaction_job ((ecma_job_promise_reaction_t *) job_p);
+    #####:  339:        break;
+        -:  340:      }
+    #####:  341:      default:
+        -:  342:      {
+    #####:  343:        JERRY_ASSERT (ecma_job_queue_get_type (job_p) == ECMA_JOB_PROMISE_THENABLE);
+        -:  344:
+    #####:  345:        ret = ecma_process_promise_resolve_thenable_job ((ecma_job_promise_resolve_thenable_t *) job_p);
+    #####:  346:        break;
+        -:  347:      }
+        -:  348:    }
+        -:  349:  }
+        -:  350:
+    #####:  351:  return ret;
+        -:  352:} /* ecma_process_all_enqueued_jobs */
+        -:  353:
+        -:  354:/**
+        -:  355: * Release enqueued Promise jobs.
+        -:  356: */
+        -:  357:void
+    #####:  358:ecma_free_all_enqueued_jobs (void)
+        -:  359:{
+    #####:  360:  while (JERRY_CONTEXT (job_queue_head_p) != NULL)
+        -:  361:  {
+    #####:  362:    ecma_job_queue_item_t *job_p = JERRY_CONTEXT (job_queue_head_p);
+    #####:  363:    JERRY_CONTEXT (job_queue_head_p) = ecma_job_queue_get_next (job_p);
+        -:  364:
+    #####:  365:    switch (ecma_job_queue_get_type (job_p))
+        -:  366:    {
+    #####:  367:      case ECMA_JOB_PROMISE_REACTION:
+        -:  368:      {
+    #####:  369:        ecma_free_promise_reaction_job ((ecma_job_promise_reaction_t *) job_p);
+    #####:  370:        break;
+        -:  371:      }
+    #####:  372:      default:
+        -:  373:      {
+    #####:  374:        JERRY_ASSERT (ecma_job_queue_get_type (job_p) == ECMA_JOB_PROMISE_THENABLE);
+        -:  375:
+    #####:  376:        ecma_free_promise_resolve_thenable_job ((ecma_job_promise_resolve_thenable_t *) job_p);
+    #####:  377:        break;
+        -:  378:      }
+        -:  379:    }
+        -:  380:  }
+    #####:  381:} /* ecma_free_all_enqueued_jobs */
+        -:  382:
+        -:  383:/**
+        -:  384: * @}
+        -:  385: * @}
+        -:  386: */
+        -:  387:#endif /* ENABLED (JERRY_ES2015_BUILTIN_PROMISE) */
