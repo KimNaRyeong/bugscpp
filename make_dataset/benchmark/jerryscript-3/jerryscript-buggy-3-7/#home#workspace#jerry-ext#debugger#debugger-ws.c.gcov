@@ -1,0 +1,468 @@
+        -:    0:Source:/home/workspace/jerry-ext/debugger/debugger-ws.c
+        -:    0:Programs:291
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "debugger-sha1.h"
+        -:   17:#include "jerryscript-ext/debugger.h"
+        -:   18:#include "jext-common.h"
+        -:   19:
+        -:   20:#if defined (JERRY_DEBUGGER) && (JERRY_DEBUGGER == 1)
+        -:   21:
+        -:   22:/* JerryScript debugger protocol is a simplified version of RFC-6455 (WebSockets). */
+        -:   23:
+        -:   24:/**
+        -:   25: * Last fragment of a Websocket package.
+        -:   26: */
+        -:   27:#define JERRYX_DEBUGGER_WEBSOCKET_FIN_BIT 0x80
+        -:   28:
+        -:   29:/**
+        -:   30: * Masking-key is available.
+        -:   31: */
+        -:   32:#define JERRYX_DEBUGGER_WEBSOCKET_MASK_BIT 0x80
+        -:   33:
+        -:   34:/**
+        -:   35: * Opcode type mask.
+        -:   36: */
+        -:   37:#define JERRYX_DEBUGGER_WEBSOCKET_OPCODE_MASK 0x0fu
+        -:   38:
+        -:   39:/**
+        -:   40: * Packet length mask.
+        -:   41: */
+        -:   42:#define JERRYX_DEBUGGER_WEBSOCKET_LENGTH_MASK 0x7fu
+        -:   43:
+        -:   44:/**
+        -:   45: * Size of websocket header size.
+        -:   46: */
+        -:   47:#define JERRYX_DEBUGGER_WEBSOCKET_HEADER_SIZE 2
+        -:   48:
+        -:   49:/**
+        -:   50: * Payload mask size in bytes of a websocket package.
+        -:   51: */
+        -:   52:#define JERRYX_DEBUGGER_WEBSOCKET_MASK_SIZE 4
+        -:   53:
+        -:   54:/**
+        -:   55: * Maximum message size with 1 byte size field.
+        -:   56: */
+        -:   57:#define JERRYX_DEBUGGER_WEBSOCKET_ONE_BYTE_LEN_MAX 125
+        -:   58:
+        -:   59:/**
+        -:   60: * WebSocket opcode types.
+        -:   61: */
+        -:   62:typedef enum
+        -:   63:{
+        -:   64:  JERRYX_DEBUGGER_WEBSOCKET_TEXT_FRAME = 1, /**< text frame */
+        -:   65:  JERRYX_DEBUGGER_WEBSOCKET_BINARY_FRAME = 2, /**< binary frame */
+        -:   66:  JERRYX_DEBUGGER_WEBSOCKET_CLOSE_CONNECTION = 8, /**< close connection */
+        -:   67:  JERRYX_DEBUGGER_WEBSOCKET_PING = 9, /**< ping (keep alive) frame */
+        -:   68:  JERRYX_DEBUGGER_WEBSOCKET_PONG = 10, /**< reply to ping frame */
+        -:   69:} jerryx_websocket_opcode_type_t;
+        -:   70:
+        -:   71:/**
+        -:   72: * Header for incoming packets.
+        -:   73: */
+        -:   74:typedef struct
+        -:   75:{
+        -:   76:  uint8_t ws_opcode; /**< websocket opcode */
+        -:   77:  uint8_t size; /**< size of the message */
+        -:   78:  uint8_t mask[4]; /**< mask bytes */
+        -:   79:} jerryx_websocket_receive_header_t;
+        -:   80:
+        -:   81:/**
+        -:   82: * Convert a 6-bit value to a Base64 character.
+        -:   83: *
+        -:   84: * @return Base64 character
+        -:   85: */
+        -:   86:static uint8_t
+        -:   87:jerryx_to_base64_character (uint8_t value) /**< 6-bit value */
+        -:   88:{
+        -:   89:  if (value < 26)
+        -:   90:  {
+        -:   91:    return (uint8_t) (value + 'A');
+        -:   92:  }
+        -:   93:
+        -:   94:  if (value < 52)
+        -:   95:  {
+        -:   96:    return (uint8_t) (value - 26 + 'a');
+        -:   97:  }
+        -:   98:
+        -:   99:  if (value < 62)
+        -:  100:  {
+        -:  101:    return (uint8_t) (value - 52 + '0');
+        -:  102:  }
+        -:  103:
+        -:  104:  if (value == 62)
+        -:  105:  {
+        -:  106:    return (uint8_t) '+';
+        -:  107:  }
+        -:  108:
+        -:  109:  return (uint8_t) '/';
+        -:  110:} /* jerryx_to_base64_character */
+        -:  111:
+        -:  112:/**
+        -:  113: * Encode a byte sequence into Base64 string.
+        -:  114: */
+        -:  115:static void
+        -:  116:jerryx_to_base64 (const uint8_t *source_p, /**< source data */
+        -:  117:                 uint8_t *destination_p, /**< destination buffer */
+        -:  118:                 size_t length) /**< length of source, must be divisible by 3 */
+        -:  119:{
+        -:  120:  while (length >= 3)
+        -:  121:  {
+        -:  122:    uint8_t value = (source_p[0] >> 2);
+        -:  123:    destination_p[0] = jerryx_to_base64_character (value);
+        -:  124:
+        -:  125:    value = (uint8_t) (((source_p[0] << 4) | (source_p[1] >> 4)) & 0x3f);
+        -:  126:    destination_p[1] = jerryx_to_base64_character (value);
+        -:  127:
+        -:  128:    value = (uint8_t) (((source_p[1] << 2) | (source_p[2] >> 6)) & 0x3f);
+        -:  129:    destination_p[2] = jerryx_to_base64_character (value);
+        -:  130:
+        -:  131:    value = (uint8_t) (source_p[2] & 0x3f);
+        -:  132:    destination_p[3] = jerryx_to_base64_character (value);
+        -:  133:
+        -:  134:    source_p += 3;
+        -:  135:    destination_p += 4;
+        -:  136:    length -= 3;
+        -:  137:  }
+        -:  138:} /* jerryx_to_base64 */
+        -:  139:
+        -:  140:/**
+        -:  141: * Process WebSocket handshake.
+        -:  142: *
+        -:  143: * @return true - if the handshake was completed successfully
+        -:  144: *         false - otherwise
+        -:  145: */
+        -:  146:static bool
+        -:  147:jerryx_process_handshake (uint8_t *request_buffer_p) /**< temporary buffer */
+        -:  148:{
+        -:  149:  size_t request_buffer_size = 1024;
+        -:  150:  uint8_t *request_end_p = request_buffer_p;
+        -:  151:
+        -:  152:  /* Buffer request text until the double newlines are received. */
+        -:  153:  while (true)
+        -:  154:  {
+        -:  155:    jerry_debugger_transport_receive_context_t context;
+        -:  156:    if (!jerry_debugger_transport_receive (&context))
+        -:  157:    {
+        -:  158:      JERRYX_ASSERT (!jerry_debugger_transport_is_connected ());
+        -:  159:      return false;
+        -:  160:    }
+        -:  161:
+        -:  162:    if (context.message_p == NULL)
+        -:  163:    {
+        -:  164:      jerry_debugger_transport_sleep ();
+        -:  165:      continue;
+        -:  166:    }
+        -:  167:
+        -:  168:    size_t length = request_buffer_size - 1u - (size_t) (request_end_p - request_buffer_p);
+        -:  169:
+        -:  170:    if (length < context.message_length)
+        -:  171:    {
+        -:  172:      JERRYX_ERROR_MSG ("Handshake buffer too small.\n");
+        -:  173:      return false;
+        -:  174:    }
+        -:  175:
+        -:  176:    /* Both stream and datagram packets are supported. */
+        -:  177:    memcpy (request_end_p, context.message_p, context.message_length);
+        -:  178:
+        -:  179:    jerry_debugger_transport_receive_completed (&context);
+        -:  180:
+        -:  181:    request_end_p += (size_t) context.message_length;
+        -:  182:    *request_end_p = 0;
+        -:  183:
+        -:  184:    if (request_end_p > request_buffer_p + 4
+        -:  185:        && memcmp (request_end_p - 4, "\r\n\r\n", 4) == 0)
+        -:  186:    {
+        -:  187:      break;
+        -:  188:    }
+        -:  189:  }
+        -:  190:
+        -:  191:  /* Check protocol. */
+        -:  192:  const char get_text[] = "GET /jerry-debugger";
+        -:  193:  size_t text_len = sizeof (get_text) - 1;
+        -:  194:
+        -:  195:  if ((size_t) (request_end_p - request_buffer_p) < text_len
+        -:  196:      || memcmp (request_buffer_p, get_text, text_len) != 0)
+        -:  197:  {
+        -:  198:    JERRYX_ERROR_MSG ("Invalid handshake format.\n");
+        -:  199:    return false;
+        -:  200:  }
+        -:  201:
+        -:  202:  uint8_t *websocket_key_p = request_buffer_p + text_len;
+        -:  203:
+        -:  204:  const char key_text[] = "Sec-WebSocket-Key:";
+        -:  205:  text_len = sizeof (key_text) - 1;
+        -:  206:
+        -:  207:  while (true)
+        -:  208:  {
+        -:  209:    if ((size_t) (request_end_p - websocket_key_p) < text_len)
+        -:  210:    {
+        -:  211:      JERRYX_ERROR_MSG ("Sec-WebSocket-Key not found.\n");
+        -:  212:      return false;
+        -:  213:    }
+        -:  214:
+        -:  215:    if (websocket_key_p[0] == 'S'
+        -:  216:        && websocket_key_p[-1] == '\n'
+        -:  217:        && websocket_key_p[-2] == '\r'
+        -:  218:        && memcmp (websocket_key_p, key_text, text_len) == 0)
+        -:  219:    {
+        -:  220:      websocket_key_p += text_len;
+        -:  221:      break;
+        -:  222:    }
+        -:  223:
+        -:  224:    websocket_key_p++;
+        -:  225:  }
+        -:  226:
+        -:  227:  /* String terminated by double newlines. */
+        -:  228:
+        -:  229:  while (*websocket_key_p == ' ')
+        -:  230:  {
+        -:  231:    websocket_key_p++;
+        -:  232:  }
+        -:  233:
+        -:  234:  uint8_t *websocket_key_end_p = websocket_key_p;
+        -:  235:
+        -:  236:  while (*websocket_key_end_p > ' ')
+        -:  237:  {
+        -:  238:    websocket_key_end_p++;
+        -:  239:  }
+        -:  240:
+        -:  241:  /* Since the request_buffer_p is not needed anymore it can
+        -:  242:   * be reused for storing the SHA-1 key and Base64 string. */
+        -:  243:
+        -:  244:  const size_t sha1_length = 20;
+        -:  245:
+        -:  246:  jerryx_debugger_compute_sha1 (websocket_key_p,
+        -:  247:                               (size_t) (websocket_key_end_p - websocket_key_p),
+        -:  248:                               (const uint8_t *) "258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
+        -:  249:                               36,
+        -:  250:                               request_buffer_p);
+        -:  251:
+        -:  252:  /* The SHA-1 key is 20 bytes long but jerryx_to_base64 expects
+        -:  253:   * a length divisible by 3 so an extra 0 is appended at the end. */
+        -:  254:  request_buffer_p[sha1_length] = 0;
+        -:  255:
+        -:  256:  jerryx_to_base64 (request_buffer_p, request_buffer_p + sha1_length + 1, sha1_length + 1);
+        -:  257:
+        -:  258:  /* Last value must be replaced by equal sign. */
+        -:  259:
+        -:  260:  const uint8_t response_prefix[] =
+        -:  261:  "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";
+        -:  262:
+        -:  263:  if (!jerry_debugger_transport_send (response_prefix, sizeof (response_prefix) - 1)
+        -:  264:      || !jerry_debugger_transport_send (request_buffer_p + sha1_length + 1, 27))
+        -:  265:  {
+        -:  266:    return false;
+        -:  267:  }
+        -:  268:
+        -:  269:  const uint8_t response_suffix[] = "=\r\n\r\n";
+        -:  270:  return jerry_debugger_transport_send (response_suffix, sizeof (response_suffix) - 1);
+        -:  271:} /* jerryx_process_handshake */
+        -:  272:
+        -:  273:/**
+        -:  274: * Close a tcp connection.
+        -:  275: */
+        -:  276:static void
+        -:  277:jerryx_debugger_ws_close (jerry_debugger_transport_header_t *header_p) /**< tcp implementation */
+        -:  278:{
+        -:  279:  JERRYX_ASSERT (!jerry_debugger_transport_is_connected ());
+        -:  280:
+        -:  281:  jerry_heap_free ((void *) header_p, sizeof (jerry_debugger_transport_header_t));
+        -:  282:} /* jerryx_debugger_ws_close */
+        -:  283:
+        -:  284:/**
+        -:  285: * Send data over a websocket connection.
+        -:  286: *
+        -:  287: * @return true - if the data has been sent successfully
+        -:  288: *         false - otherwise
+        -:  289: */
+        -:  290:static bool
+        -:  291:jerryx_debugger_ws_send (jerry_debugger_transport_header_t *header_p, /**< tcp implementation */
+        -:  292:                         uint8_t *message_p, /**< message to be sent */
+        -:  293:                         size_t message_length) /**< message length in bytes */
+        -:  294:{
+        -:  295:  JERRYX_ASSERT (message_length <= JERRYX_DEBUGGER_WEBSOCKET_ONE_BYTE_LEN_MAX);
+        -:  296:
+        -:  297:  message_p[-2] = JERRYX_DEBUGGER_WEBSOCKET_FIN_BIT | JERRYX_DEBUGGER_WEBSOCKET_BINARY_FRAME;
+        -:  298:  message_p[-1] = (uint8_t) message_length;
+        -:  299:
+        -:  300:  return header_p->next_p->send (header_p->next_p, message_p - 2, message_length + 2);
+        -:  301:} /* jerryx_debugger_ws_send */
+        -:  302:
+        -:  303:/**
+        -:  304: * Receive data from a websocket connection.
+        -:  305: */
+        -:  306:static bool
+        -:  307:jerryx_debugger_ws_receive (jerry_debugger_transport_header_t *header_p, /**< tcp implementation */
+        -:  308:                            jerry_debugger_transport_receive_context_t *receive_context_p) /**< receive context */
+        -:  309:{
+        -:  310:  if (!header_p->next_p->receive (header_p->next_p, receive_context_p))
+        -:  311:  {
+        -:  312:    return false;
+        -:  313:  }
+        -:  314:
+        -:  315:  if (receive_context_p->message_p == NULL)
+        -:  316:  {
+        -:  317:    return true;
+        -:  318:  }
+        -:  319:
+        -:  320:  size_t message_total_length = receive_context_p->message_total_length;
+        -:  321:
+        -:  322:  if (message_total_length == 0)
+        -:  323:  {
+        -:  324:    /* Byte stream. */
+        -:  325:    if (receive_context_p->message_length < sizeof (jerryx_websocket_receive_header_t))
+        -:  326:    {
+        -:  327:      receive_context_p->message_p = NULL;
+        -:  328:      return true;
+        -:  329:    }
+        -:  330:  }
+        -:  331:  else
+        -:  332:  {
+        -:  333:    /* Datagram packet. */
+        -:  334:    JERRYX_ASSERT (receive_context_p->message_length >= sizeof (jerryx_websocket_receive_header_t));
+        -:  335:  }
+        -:  336:
+        -:  337:  uint8_t *message_p = receive_context_p->message_p;
+        -:  338:
+        -:  339:  if ((message_p[0] & ~JERRYX_DEBUGGER_WEBSOCKET_OPCODE_MASK) != JERRYX_DEBUGGER_WEBSOCKET_FIN_BIT
+        -:  340:      || (message_p[1] & JERRYX_DEBUGGER_WEBSOCKET_LENGTH_MASK) > JERRYX_DEBUGGER_WEBSOCKET_ONE_BYTE_LEN_MAX
+        -:  341:      || !(message_p[1] & JERRYX_DEBUGGER_WEBSOCKET_MASK_BIT))
+        -:  342:  {
+        -:  343:    JERRYX_ERROR_MSG ("Unsupported Websocket message.\n");
+        -:  344:    jerry_debugger_transport_close ();
+        -:  345:    return false;
+        -:  346:  }
+        -:  347:
+        -:  348:  if ((message_p[0] & JERRYX_DEBUGGER_WEBSOCKET_OPCODE_MASK) != JERRYX_DEBUGGER_WEBSOCKET_BINARY_FRAME)
+        -:  349:  {
+        -:  350:    JERRYX_ERROR_MSG ("Unsupported Websocket opcode.\n");
+        -:  351:    jerry_debugger_transport_close ();
+        -:  352:    return false;
+        -:  353:  }
+        -:  354:
+        -:  355:  size_t message_length = (size_t) (message_p[1] & JERRYX_DEBUGGER_WEBSOCKET_LENGTH_MASK);
+        -:  356:
+        -:  357:  if (message_total_length == 0)
+        -:  358:  {
+        -:  359:    size_t new_total_length = message_length + sizeof (jerryx_websocket_receive_header_t);
+        -:  360:
+        -:  361:    /* Byte stream. */
+        -:  362:    if (receive_context_p->message_length < new_total_length)
+        -:  363:    {
+        -:  364:      receive_context_p->message_p = NULL;
+        -:  365:      return true;
+        -:  366:    }
+        -:  367:
+        -:  368:    receive_context_p->message_total_length = new_total_length;
+        -:  369:  }
+        -:  370:  else
+        -:  371:  {
+        -:  372:    /* Datagram packet. */
+        -:  373:    JERRYX_ASSERT (receive_context_p->message_length == (message_length + sizeof (jerryx_websocket_receive_header_t)));
+        -:  374:  }
+        -:  375:
+        -:  376:  message_p += sizeof (jerryx_websocket_receive_header_t);
+        -:  377:
+        -:  378:  receive_context_p->message_p = message_p;
+        -:  379:  receive_context_p->message_length = message_length;
+        -:  380:
+        -:  381:  /* Unmask data bytes. */
+        -:  382:  const uint8_t *mask_p = message_p - JERRYX_DEBUGGER_WEBSOCKET_MASK_SIZE;
+        -:  383:  const uint8_t *mask_end_p = message_p;
+        -:  384:  const uint8_t *message_end_p = message_p + message_length;
+        -:  385:
+        -:  386:  while (message_p < message_end_p)
+        -:  387:  {
+        -:  388:    /* Invert certain bits with xor operation. */
+        -:  389:    *message_p = *message_p ^ *mask_p;
+        -:  390:
+        -:  391:    message_p++;
+        -:  392:    mask_p++;
+        -:  393:
+        -:  394:    if (JERRY_UNLIKELY (mask_p >= mask_end_p))
+        -:  395:    {
+        -:  396:      mask_p -= JERRYX_DEBUGGER_WEBSOCKET_MASK_SIZE;
+        -:  397:    }
+        -:  398:  }
+        -:  399:
+        -:  400:  return true;
+        -:  401:} /* jerryx_debugger_ws_receive */
+        -:  402:
+        -:  403:/**
+        -:  404: * Initialize the websocket transportation layer.
+        -:  405: *
+        -:  406: * @return true - if the connection succeeded
+        -:  407: *         false - otherwise
+        -:  408: */
+        -:  409:bool
+        -:  410:jerryx_debugger_ws_create (void)
+        -:  411:{
+        -:  412:  bool is_handshake_ok = false;
+        -:  413:
+        -:  414:  const size_t buffer_size = 1024;
+        -:  415:  uint8_t *request_buffer_p = (uint8_t *) jerry_heap_alloc (buffer_size);
+        -:  416:
+        -:  417:  if (!request_buffer_p)
+        -:  418:  {
+        -:  419:    return false;
+        -:  420:  }
+        -:  421:
+        -:  422:  is_handshake_ok = jerryx_process_handshake (request_buffer_p);
+        -:  423:
+        -:  424:  jerry_heap_free ((void *) request_buffer_p, buffer_size);
+        -:  425:
+        -:  426:  if (!is_handshake_ok && jerry_debugger_transport_is_connected ())
+        -:  427:  {
+        -:  428:    return false;
+        -:  429:  }
+        -:  430:
+        -:  431:  const size_t interface_size = sizeof (jerry_debugger_transport_header_t);
+        -:  432:  jerry_debugger_transport_header_t *header_p;
+        -:  433:  header_p = (jerry_debugger_transport_header_t *) jerry_heap_alloc (interface_size);
+        -:  434:
+        -:  435:  if (!header_p)
+        -:  436:  {
+        -:  437:    return false;
+        -:  438:  }
+        -:  439:
+        -:  440:  header_p->close = jerryx_debugger_ws_close;
+        -:  441:  header_p->send = jerryx_debugger_ws_send;
+        -:  442:  header_p->receive = jerryx_debugger_ws_receive;
+        -:  443:
+        -:  444:  jerry_debugger_transport_add (header_p,
+        -:  445:                                JERRYX_DEBUGGER_WEBSOCKET_HEADER_SIZE,
+        -:  446:                                JERRYX_DEBUGGER_WEBSOCKET_ONE_BYTE_LEN_MAX,
+        -:  447:                                JERRYX_DEBUGGER_WEBSOCKET_HEADER_SIZE + JERRYX_DEBUGGER_WEBSOCKET_MASK_SIZE,
+        -:  448:                                JERRYX_DEBUGGER_WEBSOCKET_ONE_BYTE_LEN_MAX);
+        -:  449:
+        -:  450:  return true;
+        -:  451:} /* jerryx_debugger_ws_create */
+        -:  452:
+        -:  453:#else /* !(defined (JERRY_DEBUGGER) && (JERRY_DEBUGGER == 1)) */
+        -:  454:
+        -:  455:/**
+        -:  456: * Dummy function when debugger is disabled.
+        -:  457: *
+        -:  458: * @return false
+        -:  459: */
+        -:  460:bool
+    #####:  461:jerryx_debugger_ws_create (void)
+        -:  462:{
+    #####:  463:  return false;
+        -:  464:} /* jerryx_debugger_ws_create */
+        -:  465:
+        -:  466:#endif /* defined (JERRY_DEBUGGER) && (JERRY_DEBUGGER == 1) */

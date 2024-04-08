@@ -1,0 +1,3571 @@
+        -:    0:Source:/home/workspace/jerry-core/parser/js/js-parser-statm.c
+        -:    0:Programs:299
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "js-parser-internal.h"
+        -:   17:
+        -:   18:#if JERRY_PARSER
+        -:   19:#include "ecma-helpers.h"
+        -:   20:
+        -:   21:#include "jcontext.h"
+        -:   22:#include "lit-char-helpers.h"
+        -:   23:
+        -:   24:/** \addtogroup parser Parser
+        -:   25: * @{
+        -:   26: *
+        -:   27: * \addtogroup jsparser JavaScript
+        -:   28: * @{
+        -:   29: *
+        -:   30: * \addtogroup jsparser_stmt Statement parser
+        -:   31: * @{
+        -:   32: */
+        -:   33:
+        -:   34:/**
+        -:   35: * Parser statement types.
+        -:   36: *
+        -:   37: * When a new statement is added, the following
+        -:   38: * arrays must be updated as well:
+        -:   39: *  - statement_lengths[]
+        -:   40: *  - parser_statement_flags[]
+        -:   41: */
+        -:   42:typedef enum
+        -:   43:{
+        -:   44:  PARSER_STATEMENT_START,
+        -:   45:  PARSER_STATEMENT_BLOCK,
+        -:   46:#if JERRY_ESNEXT
+        -:   47:  PARSER_STATEMENT_BLOCK_SCOPE,
+        -:   48:  PARSER_STATEMENT_PRIVATE_SCOPE,
+        -:   49:  PARSER_STATEMENT_BLOCK_CONTEXT,
+        -:   50:  PARSER_STATEMENT_PRIVATE_CONTEXT,
+        -:   51:#endif /* JERRY_ESNEXT */
+        -:   52:  PARSER_STATEMENT_LABEL,
+        -:   53:  PARSER_STATEMENT_IF,
+        -:   54:  PARSER_STATEMENT_ELSE,
+        -:   55:  PARSER_STATEMENT_SWITCH,
+        -:   56:  PARSER_STATEMENT_SWITCH_NO_DEFAULT,
+        -:   57:  PARSER_STATEMENT_DO_WHILE,
+        -:   58:  PARSER_STATEMENT_WHILE,
+        -:   59:  PARSER_STATEMENT_FOR,
+        -:   60:  PARSER_STATEMENT_FOR_IN,
+        -:   61:#if JERRY_ESNEXT
+        -:   62:  PARSER_STATEMENT_FOR_OF,
+        -:   63:  PARSER_STATEMENT_FOR_AWAIT_OF,
+        -:   64:#endif /* JERRY_ESNEXT */
+        -:   65:  PARSER_STATEMENT_WITH,
+        -:   66:  PARSER_STATEMENT_TRY,
+        -:   67:} parser_statement_type_t;
+        -:   68:
+        -:   69:/**
+        -:   70: * Parser statement type flags.
+        -:   71: */
+        -:   72:typedef enum
+        -:   73:{
+        -:   74:  PARSER_STATM_NO_OPTS = 0, /**< no options */
+        -:   75:  PARSER_STATM_SINGLE_STATM = (1 << 0), /**< statment can form single statement context */
+        -:   76:  PARSER_STATM_HAS_BLOCK = (1 << 1), /**< statement always has a code block */
+        -:   77:  PARSER_STATM_BREAK_TARGET = (1 << 2), /**< break target statement */
+        -:   78:  PARSER_STATM_CONTINUE_TARGET = (1 << 3), /**< continue target statement */
+        -:   79:  PARSER_STATM_CONTEXT_BREAK = (1 << 4), /**< uses another instruction form when crosses their borders */
+        -:   80:} parser_statement_flags_t;
+        -:   81:
+        -:   82:/**
+        -:   83: * Parser statement attributes.
+        -:   84: * Note: the order of the attributes must be keep in sync with parser_statement_type_t
+        -:   85: */
+        -:   86:static const uint8_t parser_statement_flags[] = {
+        -:   87:  /* PARSER_STATEMENT_START */
+        -:   88:  PARSER_STATM_HAS_BLOCK,
+        -:   89:  /* PARSER_STATEMENT_BLOCK, */
+        -:   90:  PARSER_STATM_HAS_BLOCK,
+        -:   91:#if JERRY_ESNEXT
+        -:   92:  /* PARSER_STATEMENT_BLOCK_SCOPE, */
+        -:   93:  PARSER_STATM_HAS_BLOCK,
+        -:   94:  /* PARSER_STATEMENT_PRIVATE_SCOPE, */
+        -:   95:  PARSER_STATM_NO_OPTS,
+        -:   96:  /* PARSER_STATEMENT_BLOCK_CONTEXT, */
+        -:   97:  PARSER_STATM_HAS_BLOCK | PARSER_STATM_CONTEXT_BREAK,
+        -:   98:  /* PARSER_STATEMENT_PRIVATE_CONTEXT, */
+        -:   99:  PARSER_STATM_CONTEXT_BREAK,
+        -:  100:#endif /* JERRY_ESNEXT */
+        -:  101:  /* PARSER_STATEMENT_LABEL */
+        -:  102:  PARSER_STATM_SINGLE_STATM,
+        -:  103:  /* PARSER_STATEMENT_IF */
+        -:  104:  PARSER_STATM_SINGLE_STATM,
+        -:  105:  /* PARSER_STATEMENT_ELSE */
+        -:  106:  PARSER_STATM_SINGLE_STATM,
+        -:  107:  /* PARSER_STATEMENT_SWITCH */
+        -:  108:  PARSER_STATM_HAS_BLOCK | PARSER_STATM_BREAK_TARGET,
+        -:  109:  /* PARSER_STATEMENT_SWITCH_NO_DEFAULT */
+        -:  110:  PARSER_STATM_HAS_BLOCK | PARSER_STATM_BREAK_TARGET,
+        -:  111:  /* PARSER_STATEMENT_DO_WHILE */
+        -:  112:  PARSER_STATM_BREAK_TARGET | PARSER_STATM_CONTINUE_TARGET | PARSER_STATM_SINGLE_STATM,
+        -:  113:  /* PARSER_STATEMENT_WHILE */
+        -:  114:  PARSER_STATM_BREAK_TARGET | PARSER_STATM_CONTINUE_TARGET | PARSER_STATM_SINGLE_STATM,
+        -:  115:  /* PARSER_STATEMENT_FOR */
+        -:  116:  PARSER_STATM_BREAK_TARGET | PARSER_STATM_CONTINUE_TARGET | PARSER_STATM_SINGLE_STATM,
+        -:  117:  /* PARSER_STATEMENT_FOR_IN */
+        -:  118:  PARSER_STATM_BREAK_TARGET | PARSER_STATM_CONTINUE_TARGET | PARSER_STATM_SINGLE_STATM | PARSER_STATM_CONTEXT_BREAK,
+        -:  119:#if JERRY_ESNEXT
+        -:  120:  /* PARSER_STATEMENT_FOR_OF */
+        -:  121:  PARSER_STATM_BREAK_TARGET | PARSER_STATM_CONTINUE_TARGET | PARSER_STATM_SINGLE_STATM | PARSER_STATM_CONTEXT_BREAK,
+        -:  122:  /* PARSER_STATEMENT_FOR_AWAIT_OF */
+        -:  123:  PARSER_STATM_BREAK_TARGET | PARSER_STATM_CONTINUE_TARGET | PARSER_STATM_SINGLE_STATM | PARSER_STATM_CONTEXT_BREAK,
+        -:  124:#endif /* JERRY_ESNEXT */
+        -:  125:  /* PARSER_STATEMENT_WITH */
+        -:  126:  PARSER_STATM_CONTEXT_BREAK | PARSER_STATM_SINGLE_STATM,
+        -:  127:  /* PARSER_STATEMENT_TRY */
+        -:  128:  PARSER_STATM_HAS_BLOCK | PARSER_STATM_CONTEXT_BREAK
+        -:  129:};
+        -:  130:
+        -:  131:#if JERRY_ESNEXT
+        -:  132:/**
+        -:  133: * Block statement.
+        -:  134: */
+        -:  135:typedef struct
+        -:  136:{
+        -:  137:  uint16_t scope_stack_top; /**< preserved top of scope stack */
+        -:  138:  uint16_t scope_stack_reg_top; /**< preserved top register of scope stack */
+        -:  139:} parser_block_statement_t;
+        -:  140:
+        -:  141:/**
+        -:  142: * Context of block statement.
+        -:  143: */
+        -:  144:typedef struct
+        -:  145:{
+        -:  146:  parser_branch_t branch; /**< branch to the end */
+        -:  147:} parser_block_context_t;
+        -:  148:
+        -:  149:#endif /* !JERRY_ESNEXT */
+        -:  150:
+        -:  151:/**
+        -:  152: * Loop statement.
+        -:  153: */
+        -:  154:typedef struct
+        -:  155:{
+        -:  156:  parser_branch_node_t *branch_list_p; /**< list of breaks and continues targeting this statement */
+        -:  157:} parser_loop_statement_t;
+        -:  158:
+        -:  159:/**
+        -:  160: * Label statement.
+        -:  161: */
+        -:  162:typedef struct
+        -:  163:{
+        -:  164:  lexer_lit_location_t label_ident; /**< name of the label */
+        -:  165:  parser_branch_node_t *break_list_p; /**< list of breaks targeting this label */
+        -:  166:} parser_label_statement_t;
+        -:  167:
+        -:  168:/**
+        -:  169: * If/else statement.
+        -:  170: */
+        -:  171:typedef struct
+        -:  172:{
+        -:  173:  parser_branch_t branch; /**< branch to the end */
+        -:  174:} parser_if_else_statement_t;
+        -:  175:
+        -:  176:/**
+        -:  177: * Switch statement.
+        -:  178: */
+        -:  179:typedef struct
+        -:  180:{
+        -:  181:  parser_branch_t default_branch; /**< branch to the default case */
+        -:  182:  parser_branch_node_t *branch_list_p; /**< branches of case statements */
+        -:  183:} parser_switch_statement_t;
+        -:  184:
+        -:  185:/**
+        -:  186: * Do-while statement.
+        -:  187: */
+        -:  188:typedef struct
+        -:  189:{
+        -:  190:  uint32_t start_offset; /**< start byte code offset */
+        -:  191:} parser_do_while_statement_t;
+        -:  192:
+        -:  193:/**
+        -:  194: * While statement.
+        -:  195: */
+        -:  196:typedef struct
+        -:  197:{
+        -:  198:  parser_branch_t branch; /**< branch to the end */
+        -:  199:  scanner_location_t condition_location; /**< condition part */
+        -:  200:  uint32_t start_offset; /**< start byte code offset */
+        -:  201:} parser_while_statement_t;
+        -:  202:
+        -:  203:/**
+        -:  204: * For statement.
+        -:  205: */
+        -:  206:typedef struct
+        -:  207:{
+        -:  208:  parser_branch_t branch; /**< branch to the end */
+        -:  209:  scanner_location_t condition_location; /**< condition part */
+        -:  210:  scanner_location_t expression_location; /**< expression part */
+        -:  211:  uint32_t start_offset; /**< start byte code offset */
+        -:  212:} parser_for_statement_t;
+        -:  213:
+        -:  214:/**
+        -:  215: * For-in statement.
+        -:  216: */
+        -:  217:typedef struct
+        -:  218:{
+        -:  219:  parser_branch_t branch; /**< branch to the end */
+        -:  220:  uint32_t start_offset; /**< start byte code offset */
+        -:  221:} parser_for_in_of_statement_t;
+        -:  222:
+        -:  223:/**
+        -:  224: * With statement.
+        -:  225: */
+        -:  226:typedef struct
+        -:  227:{
+        -:  228:  parser_branch_t branch; /**< branch to the end */
+        -:  229:} parser_with_statement_t;
+        -:  230:
+        -:  231:/**
+        -:  232: * Lexer token types.
+        -:  233: */
+        -:  234:typedef enum
+        -:  235:{
+        -:  236:  parser_try_block, /**< try block */
+        -:  237:  parser_catch_block, /**< catch block */
+        -:  238:  parser_finally_block, /**< finally block */
+        -:  239:} parser_try_block_type_t;
+        -:  240:
+        -:  241:/**
+        -:  242: * Try statement.
+        -:  243: */
+        -:  244:typedef struct
+        -:  245:{
+        -:  246:  parser_try_block_type_t type; /**< current block type */
+        -:  247:  uint16_t scope_stack_top; /**< current top of scope stack */
+        -:  248:  uint16_t scope_stack_reg_top; /**< current top register of scope stack */
+        -:  249:  parser_branch_t branch; /**< branch to the end of the current block */
+        -:  250:} parser_try_statement_t;
+        -:  251:
+        -:  252:/**
+        -:  253: * Returns the data consumed by a statement. It can be used
+        -:  254: * to skip undesired frames on the stack during frame search.
+        -:  255: *
+        -:  256: * @return size consumed by a statement.
+        -:  257: */
+        -:  258:static inline size_t
+    #####:  259:parser_statement_length (uint8_t type) /**< type of statement */
+        -:  260:{
+        -:  261:  static const uint8_t statement_lengths[] = {
+        -:  262:    /* PARSER_STATEMENT_BLOCK */
+        -:  263:    1,
+        -:  264:#if JERRY_ESNEXT
+        -:  265:    /* PARSER_STATEMENT_BLOCK_SCOPE */
+        -:  266:    (uint8_t) (sizeof (parser_block_statement_t) + 1),
+        -:  267:    /* PARSER_STATEMENT_PRIVATE_SCOPE */
+        -:  268:    (uint8_t) (sizeof (parser_block_statement_t) + 1),
+        -:  269:    /* PARSER_STATEMENT_BLOCK_CONTEXT */
+        -:  270:    (uint8_t) (sizeof (parser_block_statement_t) + sizeof (parser_block_context_t) + 1),
+        -:  271:    /* PARSER_STATEMENT_PRIVATE_CONTEXT */
+        -:  272:    (uint8_t) (sizeof (parser_block_statement_t) + sizeof (parser_block_context_t) + 1),
+        -:  273:#endif /* JERRY_ESNEXT */
+        -:  274:    /* PARSER_STATEMENT_LABEL */
+        -:  275:    (uint8_t) (sizeof (parser_label_statement_t) + 1),
+        -:  276:    /* PARSER_STATEMENT_IF */
+        -:  277:    (uint8_t) (sizeof (parser_if_else_statement_t) + 1),
+        -:  278:    /* PARSER_STATEMENT_ELSE */
+        -:  279:    (uint8_t) (sizeof (parser_if_else_statement_t) + 1),
+        -:  280:    /* PARSER_STATEMENT_SWITCH */
+        -:  281:    (uint8_t) (sizeof (parser_switch_statement_t) + sizeof (parser_loop_statement_t) + 1),
+        -:  282:    /* PARSER_STATEMENT_SWITCH_NO_DEFAULT */
+        -:  283:    (uint8_t) (sizeof (parser_switch_statement_t) + sizeof (parser_loop_statement_t) + 1),
+        -:  284:    /* PARSER_STATEMENT_DO_WHILE */
+        -:  285:    (uint8_t) (sizeof (parser_do_while_statement_t) + sizeof (parser_loop_statement_t) + 1),
+        -:  286:    /* PARSER_STATEMENT_WHILE */
+        -:  287:    (uint8_t) (sizeof (parser_while_statement_t) + sizeof (parser_loop_statement_t) + 1),
+        -:  288:    /* PARSER_STATEMENT_FOR */
+        -:  289:    (uint8_t) (sizeof (parser_for_statement_t) + sizeof (parser_loop_statement_t) + 1),
+        -:  290:    /* PARSER_STATEMENT_FOR_IN */
+        -:  291:    (uint8_t) (sizeof (parser_for_in_of_statement_t) + sizeof (parser_loop_statement_t) + 1),
+        -:  292:#if JERRY_ESNEXT
+        -:  293:    /* PARSER_STATEMENT_FOR_OF */
+        -:  294:    (uint8_t) (sizeof (parser_for_in_of_statement_t) + sizeof (parser_loop_statement_t) + 1),
+        -:  295:    /* PARSER_STATEMENT_FOR_AWAIT_OF */
+        -:  296:    (uint8_t) (sizeof (parser_for_in_of_statement_t) + sizeof (parser_loop_statement_t) + 1),
+        -:  297:#endif /* JERRY_ESNEXT */
+        -:  298:    /* PARSER_STATEMENT_WITH */
+        -:  299:    (uint8_t) (sizeof (parser_with_statement_t) + 1 + 1),
+        -:  300:    /* PARSER_STATEMENT_TRY */
+        -:  301:    (uint8_t) (sizeof (parser_try_statement_t) + 1),
+        -:  302:  };
+        -:  303:
+    #####:  304:  JERRY_ASSERT (type >= PARSER_STATEMENT_BLOCK && type <= PARSER_STATEMENT_TRY);
+        -:  305:
+    #####:  306:  return statement_lengths[type - PARSER_STATEMENT_BLOCK];
+        -:  307:} /* parser_statement_length */
+        -:  308:/**
+        -:  309: * Parse expression enclosed in parens.
+        -:  310: */
+        -:  311:static inline void
+    #####:  312:parser_parse_enclosed_expr (parser_context_t *context_p) /**< context */
+        -:  313:{
+    #####:  314:  lexer_next_token (context_p);
+        -:  315:
+    #####:  316:  if (context_p->token.type != LEXER_LEFT_PAREN)
+        -:  317:  {
+    #####:  318:    parser_raise_error (context_p, PARSER_ERR_LEFT_PAREN_EXPECTED);
+        -:  319:  }
+        -:  320:
+    #####:  321:  lexer_next_token (context_p);
+    #####:  322:  parser_parse_expression (context_p, PARSE_EXPR);
+        -:  323:
+    #####:  324:  if (context_p->token.type != LEXER_RIGHT_PAREN)
+        -:  325:  {
+    #####:  326:    parser_raise_error (context_p, PARSER_ERR_RIGHT_PAREN_EXPECTED);
+        -:  327:  }
+    #####:  328:  lexer_next_token (context_p);
+    #####:  329:} /* parser_parse_enclosed_expr */
+        -:  330:
+        -:  331:#if JERRY_ESNEXT
+        -:  332:
+        -:  333:/**
+        -:  334: * Create a block context.
+        -:  335: *
+        -:  336: * @return true - when a context is created, false - otherwise
+        -:  337: */
+        -:  338:static bool
+    #####:  339:parser_push_block_context (parser_context_t *context_p, /**< context */
+        -:  340:                           bool is_private) /**< is private (bound to a statement) context */
+        -:  341:{
+    #####:  342:  JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_BLOCK);
+        -:  343:
+    #####:  344:  parser_block_statement_t block_statement;
+    #####:  345:  block_statement.scope_stack_top = context_p->scope_stack_top;
+    #####:  346:  block_statement.scope_stack_reg_top = context_p->scope_stack_reg_top;
+        -:  347:
+    #####:  348:  bool is_context_needed = false;
+        -:  349:
+    #####:  350:  if (scanner_is_context_needed (context_p, PARSER_CHECK_BLOCK_CONTEXT))
+        -:  351:  {
+    #####:  352:    parser_block_context_t block_context;
+        -:  353:
+        -:  354:#ifndef JERRY_NDEBUG
+    #####:  355:    PARSER_PLUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_BLOCK_CONTEXT_STACK_ALLOCATION);
+        -:  356:#endif /* !JERRY_NDEBUG */
+        -:  357:
+    #####:  358:    parser_emit_cbc_forward_branch (context_p, CBC_BLOCK_CREATE_CONTEXT, &block_context.branch);
+    #####:  359:    parser_stack_push (context_p, &block_context, sizeof (parser_block_context_t));
+    #####:  360:    is_context_needed = true;
+        -:  361:  }
+        -:  362:
+    #####:  363:  scanner_create_variables (context_p, SCANNER_CREATE_VARS_NO_OPTS);
+    #####:  364:  parser_stack_push (context_p, &block_statement, sizeof (parser_block_statement_t));
+        -:  365:
+        -:  366:  uint8_t statement_type;
+        -:  367:
+    #####:  368:  if (is_private)
+        -:  369:  {
+    #####:  370:    statement_type = (is_context_needed ? PARSER_STATEMENT_PRIVATE_CONTEXT : PARSER_STATEMENT_PRIVATE_SCOPE);
+        -:  371:  }
+        -:  372:  else
+        -:  373:  {
+    #####:  374:    statement_type = (is_context_needed ? PARSER_STATEMENT_BLOCK_CONTEXT : PARSER_STATEMENT_BLOCK_SCOPE);
+        -:  375:  }
+        -:  376:
+    #####:  377:  parser_stack_push_uint8 (context_p, statement_type);
+        -:  378:
+    #####:  379:  return is_context_needed;
+        -:  380:} /* parser_push_block_context */
+        -:  381:
+        -:  382:/**
+        -:  383: * Pop block context.
+        -:  384: */
+        -:  385:static void
+    #####:  386:parser_pop_block_context (parser_context_t *context_p) /**< context */
+        -:  387:{
+    #####:  388:  JERRY_ASSERT (context_p->stack_top_uint8 == PARSER_STATEMENT_BLOCK_SCOPE
+        -:  389:                || context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_SCOPE
+        -:  390:                || context_p->stack_top_uint8 == PARSER_STATEMENT_BLOCK_CONTEXT
+        -:  391:                || context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_CONTEXT);
+        -:  392:
+    #####:  393:  uint8_t type = context_p->stack_top_uint8;
+        -:  394:
+    #####:  395:  parser_block_statement_t block_statement;
+        -:  396:
+    #####:  397:  parser_stack_pop_uint8 (context_p);
+    #####:  398:  parser_stack_pop (context_p, &block_statement, sizeof (parser_block_statement_t));
+        -:  399:
+    #####:  400:  context_p->scope_stack_top = block_statement.scope_stack_top;
+    #####:  401:  context_p->scope_stack_reg_top = block_statement.scope_stack_reg_top;
+        -:  402:
+    #####:  403:  if (type == PARSER_STATEMENT_BLOCK_CONTEXT || type == PARSER_STATEMENT_PRIVATE_CONTEXT)
+        -:  404:  {
+    #####:  405:    PARSER_MINUS_EQUAL_U16 (context_p->stack_depth, PARSER_BLOCK_CONTEXT_STACK_ALLOCATION);
+        -:  406:#ifndef JERRY_NDEBUG
+    #####:  407:    PARSER_MINUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_BLOCK_CONTEXT_STACK_ALLOCATION);
+        -:  408:#endif /* !JERRY_NDEBUG */
+        -:  409:
+    #####:  410:    parser_block_context_t block_context;
+    #####:  411:    parser_stack_pop (context_p, &block_context, sizeof (parser_block_context_t));
+        -:  412:
+    #####:  413:    parser_emit_cbc (context_p, CBC_CONTEXT_END);
+    #####:  414:    parser_set_branch_to_current_position (context_p, &block_context.branch);
+        -:  415:  }
+        -:  416:
+    #####:  417:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####:  418:} /* parser_pop_block_context */
+        -:  419:
+        -:  420:/**
+        -:  421: * Validate lexical context for a declaration.
+        -:  422: */
+        -:  423:static void
+    #####:  424:parser_validate_lexical_context (parser_context_t *context_p) /**< context */
+        -:  425:{
+    #####:  426:  JERRY_ASSERT (context_p->token.type == LEXER_KEYW_LET || context_p->token.type == LEXER_KEYW_CONST
+        -:  427:                || context_p->token.type == LEXER_KEYW_CLASS);
+        -:  428:
+    #####:  429:  if (parser_statement_flags[context_p->stack_top_uint8] & PARSER_STATM_SINGLE_STATM)
+        -:  430:  {
+    #####:  431:    parser_raise_error (context_p, PARSER_ERR_LEXICAL_SINGLE_STATEMENT);
+        -:  432:  }
+    #####:  433:} /* parser_validate_lexical_context */
+        -:  434:#endif /* JERRY_ESNEXT */
+        -:  435:
+        -:  436:/**
+        -:  437: * Parse var statement.
+        -:  438: */
+        -:  439:static void
+        1:  440:parser_parse_var_statement (parser_context_t *context_p) /**< context */
+        -:  441:{
+        1:  442:  JERRY_ASSERT (context_p->token.type == LEXER_KEYW_VAR || context_p->token.type == LEXER_KEYW_LET
+        -:  443:                || context_p->token.type == LEXER_KEYW_CONST);
+        -:  444:
+        -:  445:#if JERRY_ESNEXT
+        1:  446:  uint8_t declaration_type = context_p->token.type;
+        -:  447:
+        1:  448:  if (declaration_type != LEXER_KEYW_VAR)
+        -:  449:  {
+    #####:  450:    parser_validate_lexical_context (context_p);
+        -:  451:  }
+        -:  452:#endif /* JERRY_ESNEXT */
+        -:  453:
+        -:  454:  while (true)
+        -:  455:  {
+        -:  456:#if JERRY_ESNEXT
+        1:  457:    if (lexer_check_next_characters (context_p, LIT_CHAR_LEFT_SQUARE, LIT_CHAR_LEFT_BRACE))
+        -:  458:    {
+        1:  459:      parser_pattern_flags_t flags = PARSER_PATTERN_BINDING;
+        -:  460:
+        1:  461:      if (declaration_type == LEXER_KEYW_LET)
+        -:  462:      {
+    #####:  463:        flags |= PARSER_PATTERN_LET;
+        -:  464:      }
+        1:  465:      else if (declaration_type == LEXER_KEYW_CONST)
+        -:  466:      {
+    #####:  467:        flags |= PARSER_PATTERN_CONST;
+        -:  468:      }
+        -:  469:
+        1:  470:      parser_parse_initializer_by_next_char (context_p, flags);
+        -:  471:    }
+        -:  472:    else
+        -:  473:    {
+        -:  474:#endif /* JERRY_ESNEXT */
+    #####:  475:      lexer_expect_identifier (context_p, LEXER_IDENT_LITERAL);
+    #####:  476:      JERRY_ASSERT (context_p->token.type == LEXER_LITERAL
+        -:  477:                    && context_p->token.lit_location.type == LEXER_IDENT_LITERAL);
+        -:  478:
+        -:  479:#if JERRY_DEBUGGER || JERRY_LINE_INFO
+    #####:  480:      parser_line_counter_t ident_line_counter = context_p->token.line;
+        -:  481:#endif /* JERRY_DEBUGGER || JERRY_LINE_INFO */
+        -:  482:#if JERRY_LINE_INFO
+    #####:  483:      parser_line_counter_t ident_column_counter = context_p->token.column;
+        -:  484:#endif /* JERRY_LINE_INFO */
+        -:  485:
+        -:  486:#if JERRY_MODULE_SYSTEM
+    #####:  487:      parser_module_append_export_name (context_p);
+        -:  488:#endif /* JERRY_MODULE_SYSTEM */
+        -:  489:
+        -:  490:#if JERRY_ESNEXT
+    #####:  491:      if (declaration_type != LEXER_KEYW_VAR && context_p->token.keyword_type == LEXER_KEYW_LET)
+        -:  492:      {
+    #####:  493:        parser_raise_error (context_p, PARSER_ERR_LEXICAL_LET_BINDING);
+        -:  494:      }
+        -:  495:
+    #####:  496:      if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -:  497:      {
+    #####:  498:        JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_ERR_REDECLARED);
+    #####:  499:        parser_raise_error (context_p, PARSER_ERR_VARIABLE_REDECLARED);
+        -:  500:      }
+        -:  501:#endif /* JERRY_ESNEXT */
+        -:  502:
+    #####:  503:      lexer_next_token (context_p);
+        -:  504:
+    #####:  505:      if (context_p->token.type == LEXER_ASSIGN)
+        -:  506:      {
+        -:  507:#if JERRY_DEBUGGER
+        -:  508:        if ((JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -:  509:            && ident_line_counter != context_p->last_breakpoint_line)
+        -:  510:        {
+        -:  511:          parser_emit_cbc (context_p, CBC_BREAKPOINT_DISABLED);
+        -:  512:          parser_flush_cbc (context_p);
+        -:  513:
+        -:  514:          parser_append_breakpoint_info (context_p, JERRY_DEBUGGER_BREAKPOINT_LIST, ident_line_counter);
+        -:  515:
+        -:  516:          context_p->last_breakpoint_line = ident_line_counter;
+        -:  517:        }
+        -:  518:#endif /* JERRY_DEBUGGER */
+        -:  519:
+        -:  520:#if JERRY_LINE_INFO
+    #####:  521:        parser_line_info_append (context_p, ident_line_counter, ident_column_counter);
+        -:  522:#endif /* JERRY_LINE_INFO */
+        -:  523:
+    #####:  524:        uint16_t index = context_p->lit_object.index;
+        -:  525:
+    #####:  526:        lexer_next_token (context_p);
+    #####:  527:        parser_parse_expression (context_p, PARSE_EXPR_NO_COMMA);
+        -:  528:
+    #####:  529:        cbc_opcode_t opcode = CBC_ASSIGN_SET_IDENT;
+        -:  530:
+        -:  531:#if JERRY_ESNEXT
+    #####:  532:        uint16_t function_literal_index = parser_check_anonymous_function_declaration (context_p);
+        -:  533:
+    #####:  534:        if (function_literal_index == PARSER_ANONYMOUS_CLASS)
+        -:  535:        {
+    #####:  536:          uint16_t name_index = scanner_save_literal (context_p, index);
+    #####:  537:          parser_emit_cbc_ext_literal (context_p, CBC_EXT_SET_CLASS_NAME, name_index);
+        -:  538:        }
+    #####:  539:        else if (function_literal_index < PARSER_NAMED_FUNCTION)
+        -:  540:        {
+    #####:  541:          parser_set_function_name (context_p, function_literal_index, index, 0);
+        -:  542:        }
+        -:  543:
+    #####:  544:        if (declaration_type != LEXER_KEYW_VAR && (index < PARSER_REGISTER_START))
+        -:  545:        {
+    #####:  546:          opcode = CBC_INIT_LET;
+        -:  547:
+    #####:  548:          if (scanner_literal_is_created (context_p, index))
+        -:  549:          {
+    #####:  550:            opcode = CBC_ASSIGN_LET_CONST;
+        -:  551:          }
+    #####:  552:          else if (declaration_type == LEXER_KEYW_CONST)
+        -:  553:          {
+    #####:  554:            opcode = CBC_INIT_CONST;
+        -:  555:          }
+        -:  556:        }
+        -:  557:#endif /* JERRY_ESNEXT */
+        -:  558:
+    #####:  559:        parser_emit_cbc_literal (context_p, (uint16_t) opcode, index);
+        -:  560:      }
+        -:  561:#if JERRY_ESNEXT
+    #####:  562:      else if (declaration_type == LEXER_KEYW_LET)
+        -:  563:      {
+    #####:  564:        parser_emit_cbc (context_p, CBC_PUSH_UNDEFINED);
+        -:  565:
+    #####:  566:        uint16_t index = context_p->lit_object.index;
+    #####:  567:        cbc_opcode_t opcode = CBC_MOV_IDENT;
+        -:  568:
+    #####:  569:        if (index < PARSER_REGISTER_START)
+        -:  570:        {
+    #####:  571:          opcode = (scanner_literal_is_created (context_p, index) ? CBC_ASSIGN_LET_CONST : CBC_INIT_LET);
+        -:  572:        }
+        -:  573:
+    #####:  574:        parser_emit_cbc_literal (context_p, (uint16_t) opcode, index);
+        -:  575:      }
+    #####:  576:      else if (declaration_type == LEXER_KEYW_CONST)
+        -:  577:      {
+    #####:  578:        parser_raise_error (context_p, PARSER_ERR_MISSING_ASSIGN_AFTER_CONST);
+        -:  579:      }
+        -:  580:    }
+        -:  581:#endif /* JERRY_ESNEXT */
+        -:  582:
+    #####:  583:    if (context_p->token.type != LEXER_COMMA)
+        -:  584:    {
+    #####:  585:      break;
+        -:  586:    }
+        -:  587:  }
+        -:  588:
+        -:  589:#if JERRY_MODULE_SYSTEM
+    #####:  590:  context_p->status_flags &= (uint32_t) ~(PARSER_MODULE_STORE_IDENT);
+        -:  591:#endif /* JERRY_MODULE_SYSTEM */
+    #####:  592:} /* parser_parse_var_statement */
+        -:  593:
+        -:  594:/**
+        -:  595: * Parse function statement.
+        -:  596: */
+        -:  597:static void
+        1:  598:parser_parse_function_statement (parser_context_t *context_p) /**< context */
+        -:  599:{
+        1:  600:  JERRY_ASSERT (context_p->token.type == LEXER_KEYW_FUNCTION);
+        -:  601:
+        -:  602:#if JERRY_ESNEXT
+        1:  603:  bool is_single_statement = (parser_statement_flags[context_p->stack_top_uint8] & PARSER_STATM_SINGLE_STATM) != 0;
+        -:  604:
+        1:  605:  if (JERRY_UNLIKELY (is_single_statement))
+        -:  606:  {
+    #####:  607:    if (context_p->status_flags & PARSER_IS_STRICT)
+        -:  608:    {
+    #####:  609:      parser_raise_error (context_p, PARSER_ERR_LEXICAL_SINGLE_STATEMENT);
+        -:  610:    }
+        -:  611:
+    #####:  612:    if (context_p->stack_top_uint8 == PARSER_STATEMENT_IF || context_p->stack_top_uint8 == PARSER_STATEMENT_ELSE)
+        -:  613:    {
+        -:  614:      /* There must be a parser error later if this check fails. */
+    #####:  615:      if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -:  616:      {
+    #####:  617:        parser_push_block_context (context_p, true);
+        -:  618:      }
+        -:  619:    }
+    #####:  620:    else if (context_p->stack_top_uint8 == PARSER_STATEMENT_LABEL)
+        -:  621:    {
+    #####:  622:      parser_stack_iterator_t iterator;
+    #####:  623:      parser_stack_iterator_init (context_p, &iterator);
+    #####:  624:      parser_stack_iterator_skip (&iterator, sizeof (parser_label_statement_t) + 1);
+        -:  625:
+        -:  626:      while (true)
+    #####:  627:      {
+    #####:  628:        uint8_t type = parser_stack_iterator_read_uint8 (&iterator);
+        -:  629:
+    #####:  630:        if (type == PARSER_STATEMENT_LABEL)
+        -:  631:        {
+    #####:  632:          parser_stack_iterator_skip (&iterator, sizeof (parser_label_statement_t) + 1);
+    #####:  633:          continue;
+        -:  634:        }
+        -:  635:
+    #####:  636:        if (parser_statement_flags[type] & PARSER_STATM_HAS_BLOCK)
+        -:  637:        {
+    #####:  638:          break;
+        -:  639:        }
+        -:  640:
+    #####:  641:        parser_raise_error (context_p, PARSER_ERR_LABELLED_FUNC_NOT_IN_BLOCK);
+        -:  642:      }
+        -:  643:    }
+        -:  644:    else
+        -:  645:    {
+    #####:  646:      parser_raise_error (context_p, PARSER_ERR_LEXICAL_SINGLE_STATEMENT);
+        -:  647:    }
+        -:  648:  }
+        -:  649:#endif /* JERRY_ESNEXT */
+        -:  650:
+        -:  651:#if JERRY_FUNCTION_TO_STRING
+        -:  652:#if JERRY_ESNEXT
+    #####:  653:  if (!(context_p->next_scanner_info_p->u8_arg & SCANNER_FUNCTION_ASYNC))
+        -:  654:  {
+    #####:  655:    context_p->function_start_p = context_p->token.lit_location.char_p;
+        -:  656:  }
+        -:  657:#else /* !JERRY_ESNEXT */
+        -:  658:  context_p->function_start_p = context_p->token.lit_location.char_p;
+        -:  659:#endif /* JERRY_ESNEXT */
+        -:  660:#endif /* JERRY_FUNCTION_TO_STRING */
+        -:  661:
+        -:  662:#if JERRY_DEBUGGER
+        -:  663:  parser_line_counter_t debugger_line = context_p->token.line;
+        -:  664:  parser_line_counter_t debugger_column = context_p->token.column;
+        -:  665:#endif /* JERRY_DEBUGGER */
+        -:  666:
+        -:  667:#if JERRY_ESNEXT
+        1:  668:  bool is_generator_function = false;
+        -:  669:
+        1:  670:  if (lexer_consume_generator (context_p))
+        -:  671:  {
+    #####:  672:    if (is_single_statement)
+        -:  673:    {
+    #####:  674:      parser_raise_error (context_p, PARSER_ERR_GENERATOR_IN_SINGLE_STATEMENT_POS);
+        -:  675:    }
+    #####:  676:    is_generator_function = true;
+        -:  677:  }
+        -:  678:#endif /* JERRY_ESNEXT */
+        -:  679:
+        1:  680:  lexer_expect_identifier (context_p, LEXER_NEW_IDENT_LITERAL);
+        1:  681:  JERRY_ASSERT (context_p->token.type == LEXER_LITERAL && context_p->token.lit_location.type == LEXER_IDENT_LITERAL);
+        -:  682:
+        -:  683:#if JERRY_ESNEXT
+        1:  684:  if (context_p->next_scanner_info_p->source_p == context_p->source_p
+    #####:  685:      && context_p->next_scanner_info_p->type == SCANNER_TYPE_ERR_REDECLARED)
+        -:  686:  {
+    #####:  687:    parser_raise_error (context_p, PARSER_ERR_VARIABLE_REDECLARED);
+        -:  688:  }
+        -:  689:
+        1:  690:  uint16_t function_name_index = context_p->lit_object.index;
+        -:  691:#endif /* JERRY_ESNEXT */
+        -:  692:
+        -:  693:#if JERRY_MODULE_SYSTEM
+        1:  694:  parser_module_append_export_name (context_p);
+        1:  695:  context_p->status_flags &= (uint32_t) ~(PARSER_MODULE_STORE_IDENT);
+        -:  696:#endif /* JERRY_MODULE_SYSTEM */
+        -:  697:
+        1:  698:  uint32_t status_flags = PARSER_FUNCTION_CLOSURE;
+        -:  699:
+        1:  700:  if (context_p->token.keyword_type >= LEXER_FIRST_NON_STRICT_ARGUMENTS)
+        -:  701:  {
+    #####:  702:    status_flags |= PARSER_HAS_NON_STRICT_ARG;
+        -:  703:  }
+        -:  704:
+        -:  705:#if JERRY_ESNEXT
+        1:  706:  if (is_generator_function)
+        -:  707:  {
+    #####:  708:    status_flags |= PARSER_IS_GENERATOR_FUNCTION | PARSER_DISALLOW_AWAIT_YIELD;
+        -:  709:  }
+        -:  710:
+        1:  711:  if (context_p->next_scanner_info_p->u8_arg & SCANNER_FUNCTION_ASYNC)
+        -:  712:  {
+    #####:  713:    status_flags |= PARSER_IS_ASYNC_FUNCTION | PARSER_DISALLOW_AWAIT_YIELD;
+        -:  714:  }
+        -:  715:#endif /* JERRY_ESNEXT */
+        -:  716:
+        -:  717:#if JERRY_DEBUGGER
+        -:  718:  if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -:  719:  {
+        -:  720:    lexer_literal_t *name_p = context_p->lit_object.literal_p;
+        -:  721:    jerry_debugger_send_string (JERRY_DEBUGGER_FUNCTION_NAME,
+        -:  722:                                JERRY_DEBUGGER_NO_SUBTYPE,
+        -:  723:                                name_p->u.char_p,
+        -:  724:                                name_p->prop.length);
+        -:  725:
+        -:  726:    /* Reset token position for the function. */
+        -:  727:    context_p->token.line = debugger_line;
+        -:  728:    context_p->token.column = debugger_column;
+        -:  729:  }
+        -:  730:#endif /* JERRY_DEBUGGER */
+        -:  731:
+        1:  732:  JERRY_ASSERT (context_p->scope_stack_top >= 2);
+        1:  733:  parser_scope_stack_t *scope_stack_p = context_p->scope_stack_p + context_p->scope_stack_top - 2;
+        -:  734:
+        1:  735:  uint16_t literal_index = context_p->lit_object.index;
+        -:  736:
+        2:  737:  while (literal_index != scope_stack_p->map_from)
+        -:  738:  {
+    #####:  739:    scope_stack_p--;
+        -:  740:
+    #####:  741:    JERRY_ASSERT (scope_stack_p >= context_p->scope_stack_p);
+        -:  742:  }
+        -:  743:
+        1:  744:  JERRY_ASSERT (scope_stack_p[1].map_from == PARSER_SCOPE_STACK_FUNC);
+        -:  745:
+        -:  746:#if JERRY_ESNEXT
+        1:  747:  if (!(context_p->status_flags & PARSER_IS_STRICT)
+        1:  748:      && (scope_stack_p >= context_p->scope_stack_p + context_p->scope_stack_global_end))
+        -:  749:  {
+    #####:  750:    bool copy_value = true;
+        -:  751:
+    #####:  752:    parser_scope_stack_t *stack_p = context_p->scope_stack_p;
+        -:  753:
+    #####:  754:    while (stack_p < scope_stack_p)
+        -:  755:    {
+    #####:  756:      if (literal_index == stack_p->map_from && (stack_p->map_to & PARSER_SCOPE_STACK_NO_FUNCTION_COPY))
+        -:  757:      {
+    #####:  758:        copy_value = false;
+    #####:  759:        break;
+        -:  760:      }
+    #####:  761:      stack_p++;
+        -:  762:    }
+        -:  763:
+    #####:  764:    if (copy_value)
+        -:  765:    {
+    #####:  766:      stack_p = context_p->scope_stack_p;
+        -:  767:
+    #####:  768:      while (stack_p < scope_stack_p)
+        -:  769:      {
+    #####:  770:        if (literal_index == stack_p->map_from)
+        -:  771:        {
+    #####:  772:          JERRY_ASSERT (!(stack_p->map_to & PARSER_SCOPE_STACK_NO_FUNCTION_COPY));
+        -:  773:
+    #####:  774:          uint16_t map_to = scanner_decode_map_to (stack_p);
+    #####:  775:          uint16_t opcode = ((map_to >= PARSER_REGISTER_START) ? CBC_ASSIGN_LITERAL_SET_IDENT : CBC_COPY_TO_GLOBAL);
+        -:  776:
+    #####:  777:          parser_emit_cbc_literal_value (context_p, opcode, scanner_decode_map_to (scope_stack_p), map_to);
+    #####:  778:          break;
+        -:  779:        }
+    #####:  780:        stack_p++;
+        -:  781:      }
+        -:  782:
+    #####:  783:      parser_flush_cbc (context_p);
+        -:  784:    }
+        -:  785:
+    #####:  786:    if (JERRY_UNLIKELY (context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_SCOPE
+        -:  787:                        || context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_CONTEXT))
+        -:  788:    {
+    #####:  789:      parser_pop_block_context (context_p);
+        -:  790:    }
+        -:  791:  }
+        -:  792:#endif /* JERRY_ESNEXT */
+        -:  793:
+        1:  794:  lexer_literal_t *literal_p = PARSER_GET_LITERAL ((size_t) scope_stack_p[1].map_to);
+        -:  795:
+        1:  796:  JERRY_ASSERT ((literal_p->type == LEXER_UNUSED_LITERAL || literal_p->type == LEXER_FUNCTION_LITERAL)
+        -:  797:                && literal_p->status_flags == 0);
+        -:  798:
+        1:  799:  ecma_compiled_code_t *compiled_code_p = parser_parse_function (context_p, status_flags);
+        -:  800:
+    #####:  801:  if (literal_p->type == LEXER_FUNCTION_LITERAL)
+        -:  802:  {
+    #####:  803:    ecma_bytecode_deref (literal_p->u.bytecode_p);
+        -:  804:  }
+        -:  805:
+    #####:  806:  literal_p->u.bytecode_p = compiled_code_p;
+    #####:  807:  literal_p->type = LEXER_FUNCTION_LITERAL;
+        -:  808:
+        -:  809:#if JERRY_ESNEXT
+    #####:  810:  parser_compiled_code_set_function_name (context_p, compiled_code_p, function_name_index, 0);
+        -:  811:#endif /* JERRY_ESNEXT */
+        -:  812:
+    #####:  813:  lexer_next_token (context_p);
+    #####:  814:} /* parser_parse_function_statement */
+        -:  815:
+        -:  816:/**
+        -:  817: * Parse if statement (starting part).
+        -:  818: */
+        -:  819:static void
+    #####:  820:parser_parse_if_statement_start (parser_context_t *context_p) /**< context */
+        -:  821:{
+    #####:  822:  parser_if_else_statement_t if_statement;
+        -:  823:
+    #####:  824:  parser_parse_enclosed_expr (context_p);
+        -:  825:
+    #####:  826:  parser_emit_cbc_forward_branch (context_p, CBC_BRANCH_IF_FALSE_FORWARD, &if_statement.branch);
+        -:  827:
+    #####:  828:  parser_stack_push (context_p, &if_statement, sizeof (parser_if_else_statement_t));
+    #####:  829:  parser_stack_push_uint8 (context_p, PARSER_STATEMENT_IF);
+    #####:  830:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####:  831:} /* parser_parse_if_statement_start */
+        -:  832:
+        -:  833:/**
+        -:  834: * Parse if statement (ending part).
+        -:  835: *
+        -:  836: * @return true  - if parsing an 'else' statement
+        -:  837: *         false - otherwise
+        -:  838: */
+        -:  839:static bool
+    #####:  840:parser_parse_if_statement_end (parser_context_t *context_p) /**< context */
+        -:  841:{
+    #####:  842:  parser_if_else_statement_t if_statement;
+    #####:  843:  parser_if_else_statement_t else_statement;
+    #####:  844:  parser_stack_iterator_t iterator;
+        -:  845:
+    #####:  846:  JERRY_ASSERT (context_p->stack_top_uint8 == PARSER_STATEMENT_IF);
+        -:  847:
+    #####:  848:  if (context_p->token.type != LEXER_KEYW_ELSE)
+        -:  849:  {
+    #####:  850:    parser_stack_pop_uint8 (context_p);
+    #####:  851:    parser_stack_pop (context_p, &if_statement, sizeof (parser_if_else_statement_t));
+    #####:  852:    parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -:  853:
+    #####:  854:    parser_set_branch_to_current_position (context_p, &if_statement.branch);
+        -:  855:
+    #####:  856:    return false;
+        -:  857:  }
+        -:  858:
+    #####:  859:  parser_stack_change_last_uint8 (context_p, PARSER_STATEMENT_ELSE);
+    #####:  860:  parser_stack_iterator_init (context_p, &iterator);
+    #####:  861:  parser_stack_iterator_skip (&iterator, 1);
+    #####:  862:  parser_stack_iterator_read (&iterator, &if_statement, sizeof (parser_if_else_statement_t));
+        -:  863:
+    #####:  864:  parser_emit_cbc_forward_branch (context_p, CBC_JUMP_FORWARD, &else_statement.branch);
+        -:  865:
+    #####:  866:  parser_set_branch_to_current_position (context_p, &if_statement.branch);
+        -:  867:
+    #####:  868:  parser_stack_iterator_write (&iterator, &else_statement, sizeof (parser_if_else_statement_t));
+        -:  869:
+    #####:  870:  lexer_next_token (context_p);
+    #####:  871:  return true;
+        -:  872:} /* parser_parse_if_statement_end */
+        -:  873:
+        -:  874:/**
+        -:  875: * Parse with statement (starting part).
+        -:  876: */
+        -:  877:static void
+    #####:  878:parser_parse_with_statement_start (parser_context_t *context_p) /**< context */
+        -:  879:{
+    #####:  880:  parser_with_statement_t with_statement;
+        -:  881:
+    #####:  882:  if (context_p->status_flags & PARSER_IS_STRICT)
+        -:  883:  {
+    #####:  884:    parser_raise_error (context_p, PARSER_ERR_WITH_NOT_ALLOWED);
+        -:  885:  }
+        -:  886:
+    #####:  887:  parser_parse_enclosed_expr (context_p);
+        -:  888:
+        -:  889:#ifndef JERRY_NDEBUG
+    #####:  890:  PARSER_PLUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_WITH_CONTEXT_STACK_ALLOCATION);
+        -:  891:#endif /* !JERRY_NDEBUG */
+        -:  892:
+    #####:  893:  uint8_t inside_with = (context_p->status_flags & PARSER_INSIDE_WITH) != 0;
+        -:  894:
+    #####:  895:  context_p->status_flags |= PARSER_INSIDE_WITH;
+    #####:  896:  parser_emit_cbc_ext_forward_branch (context_p, CBC_EXT_WITH_CREATE_CONTEXT, &with_statement.branch);
+        -:  897:
+    #####:  898:  parser_stack_push (context_p, &with_statement, sizeof (parser_with_statement_t));
+    #####:  899:  parser_stack_push_uint8 (context_p, inside_with);
+    #####:  900:  parser_stack_push_uint8 (context_p, PARSER_STATEMENT_WITH);
+    #####:  901:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####:  902:} /* parser_parse_with_statement_start */
+        -:  903:
+        -:  904:/**
+        -:  905: * Parse with statement (ending part).
+        -:  906: */
+        -:  907:static void
+    #####:  908:parser_parse_with_statement_end (parser_context_t *context_p) /**< context */
+        -:  909:{
+    #####:  910:  parser_with_statement_t with_statement;
+        -:  911:
+    #####:  912:  JERRY_ASSERT (context_p->status_flags & PARSER_INSIDE_WITH);
+        -:  913:
+    #####:  914:  parser_stack_pop_uint8 (context_p);
+        -:  915:
+    #####:  916:  if (!context_p->stack_top_uint8)
+        -:  917:  {
+    #####:  918:    context_p->status_flags &= (uint32_t) ~PARSER_INSIDE_WITH;
+        -:  919:  }
+        -:  920:
+    #####:  921:  parser_stack_pop_uint8 (context_p);
+    #####:  922:  parser_stack_pop (context_p, &with_statement, sizeof (parser_with_statement_t));
+    #####:  923:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -:  924:
+    #####:  925:  parser_flush_cbc (context_p);
+    #####:  926:  PARSER_MINUS_EQUAL_U16 (context_p->stack_depth, PARSER_WITH_CONTEXT_STACK_ALLOCATION);
+        -:  927:#ifndef JERRY_NDEBUG
+    #####:  928:  PARSER_MINUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_WITH_CONTEXT_STACK_ALLOCATION);
+        -:  929:#endif /* !JERRY_NDEBUG */
+        -:  930:
+    #####:  931:  parser_emit_cbc (context_p, CBC_CONTEXT_END);
+    #####:  932:  parser_set_branch_to_current_position (context_p, &with_statement.branch);
+    #####:  933:} /* parser_parse_with_statement_end */
+        -:  934:
+        -:  935:/**
+        -:  936: * Parse do-while statement (ending part).
+        -:  937: */
+        -:  938:static void
+    #####:  939:parser_parse_do_while_statement_end (parser_context_t *context_p) /**< context */
+        -:  940:{
+    #####:  941:  parser_loop_statement_t loop;
+        -:  942:
+    #####:  943:  JERRY_ASSERT (context_p->stack_top_uint8 == PARSER_STATEMENT_DO_WHILE);
+        -:  944:
+    #####:  945:  if (context_p->token.type != LEXER_KEYW_WHILE)
+        -:  946:  {
+    #####:  947:    parser_raise_error (context_p, PARSER_ERR_WHILE_EXPECTED);
+        -:  948:  }
+        -:  949:
+    #####:  950:  parser_stack_iterator_t iterator;
+    #####:  951:  parser_stack_iterator_init (context_p, &iterator);
+        -:  952:
+    #####:  953:  parser_stack_iterator_skip (&iterator, 1);
+    #####:  954:  parser_stack_iterator_read (&iterator, &loop, sizeof (parser_loop_statement_t));
+        -:  955:
+    #####:  956:  parser_set_continues_to_current_position (context_p, loop.branch_list_p);
+        -:  957:
+    #####:  958:  JERRY_ASSERT (context_p->next_scanner_info_p->source_p != context_p->source_p);
+        -:  959:
+    #####:  960:  parser_parse_enclosed_expr (context_p);
+        -:  961:
+    #####:  962:  if (context_p->last_cbc_opcode != CBC_PUSH_FALSE)
+        -:  963:  {
+    #####:  964:    cbc_opcode_t opcode = CBC_BRANCH_IF_TRUE_BACKWARD;
+    #####:  965:    if (context_p->last_cbc_opcode == CBC_LOGICAL_NOT)
+        -:  966:    {
+    #####:  967:      context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####:  968:      opcode = CBC_BRANCH_IF_FALSE_BACKWARD;
+        -:  969:    }
+    #####:  970:    else if (context_p->last_cbc_opcode == CBC_PUSH_TRUE)
+        -:  971:    {
+    #####:  972:      context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####:  973:      opcode = CBC_JUMP_BACKWARD;
+        -:  974:    }
+        -:  975:
+    #####:  976:    parser_do_while_statement_t do_while_statement;
+    #####:  977:    parser_stack_iterator_skip (&iterator, sizeof (parser_loop_statement_t));
+    #####:  978:    parser_stack_iterator_read (&iterator, &do_while_statement, sizeof (parser_do_while_statement_t));
+        -:  979:
+    #####:  980:    parser_emit_cbc_backward_branch (context_p, (uint16_t) opcode, do_while_statement.start_offset);
+        -:  981:  }
+        -:  982:  else
+        -:  983:  {
+    #####:  984:    context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+        -:  985:  }
+        -:  986:
+    #####:  987:  parser_stack_pop (context_p, NULL, 1 + sizeof (parser_loop_statement_t) + sizeof (parser_do_while_statement_t));
+    #####:  988:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -:  989:
+    #####:  990:  parser_set_breaks_to_current_position (context_p, loop.branch_list_p);
+    #####:  991:} /* parser_parse_do_while_statement_end */
+        -:  992:
+        -:  993:/**
+        -:  994: * Parse while statement (starting part).
+        -:  995: */
+        -:  996:static void
+    #####:  997:parser_parse_while_statement_start (parser_context_t *context_p) /**< context */
+        -:  998:{
+    #####:  999:  parser_while_statement_t while_statement;
+    #####: 1000:  parser_loop_statement_t loop;
+        -: 1001:
+    #####: 1002:  JERRY_ASSERT (context_p->token.type == LEXER_KEYW_WHILE);
+    #####: 1003:  lexer_next_token (context_p);
+        -: 1004:
+    #####: 1005:  if (context_p->token.type != LEXER_LEFT_PAREN)
+        -: 1006:  {
+    #####: 1007:    parser_raise_error (context_p, PARSER_ERR_LEFT_PAREN_EXPECTED);
+        -: 1008:  }
+        -: 1009:
+    #####: 1010:  JERRY_ASSERT (context_p->next_scanner_info_p->source_p != context_p->source_p
+        -: 1011:                || context_p->next_scanner_info_p->type == SCANNER_TYPE_WHILE);
+        -: 1012:
+    #####: 1013:  if (context_p->next_scanner_info_p->source_p != context_p->source_p)
+        -: 1014:  {
+        -: 1015:    /* The prescanner couldn't find the end of the while condition. */
+    #####: 1016:    lexer_next_token (context_p);
+    #####: 1017:    parser_parse_expression (context_p, PARSE_EXPR);
+        -: 1018:
+    #####: 1019:    JERRY_ASSERT (context_p->token.type != LEXER_RIGHT_PAREN);
+    #####: 1020:    parser_raise_error (context_p, PARSER_ERR_RIGHT_PAREN_EXPECTED);
+        -: 1021:  }
+        -: 1022:
+    #####: 1023:  parser_emit_cbc_forward_branch (context_p, CBC_JUMP_FORWARD, &while_statement.branch);
+        -: 1024:
+    #####: 1025:  JERRY_ASSERT (context_p->last_cbc_opcode == PARSER_CBC_UNAVAILABLE);
+        -: 1026:
+    #####: 1027:  while_statement.start_offset = context_p->byte_code_size;
+    #####: 1028:  scanner_get_location (&while_statement.condition_location, context_p);
+        -: 1029:
+    #####: 1030:  scanner_set_location (context_p, &((scanner_location_info_t *) context_p->next_scanner_info_p)->location);
+    #####: 1031:  scanner_release_next (context_p, sizeof (scanner_location_info_t));
+    #####: 1032:  scanner_seek (context_p);
+    #####: 1033:  lexer_next_token (context_p);
+        -: 1034:
+    #####: 1035:  loop.branch_list_p = NULL;
+        -: 1036:
+    #####: 1037:  parser_stack_push (context_p, &while_statement, sizeof (parser_while_statement_t));
+    #####: 1038:  parser_stack_push (context_p, &loop, sizeof (parser_loop_statement_t));
+    #####: 1039:  parser_stack_push_uint8 (context_p, PARSER_STATEMENT_WHILE);
+    #####: 1040:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 1041:} /* parser_parse_while_statement_start */
+        -: 1042:
+        -: 1043:/**
+        -: 1044: * Parse while statement (ending part).
+        -: 1045: */
+        -: 1046:static void JERRY_ATTR_NOINLINE
+    #####: 1047:parser_parse_while_statement_end (parser_context_t *context_p) /**< context */
+        -: 1048:{
+    #####: 1049:  parser_while_statement_t while_statement;
+    #####: 1050:  parser_loop_statement_t loop;
+        -: 1051:  lexer_token_t current_token;
+    #####: 1052:  scanner_location_t location;
+        -: 1053:  cbc_opcode_t opcode;
+        -: 1054:
+    #####: 1055:  JERRY_ASSERT (context_p->stack_top_uint8 == PARSER_STATEMENT_WHILE);
+        -: 1056:
+    #####: 1057:  parser_stack_iterator_t iterator;
+    #####: 1058:  parser_stack_iterator_init (context_p, &iterator);
+        -: 1059:
+    #####: 1060:  parser_stack_iterator_skip (&iterator, 1);
+    #####: 1061:  parser_stack_iterator_read (&iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 1062:  parser_stack_iterator_skip (&iterator, sizeof (parser_loop_statement_t));
+    #####: 1063:  parser_stack_iterator_read (&iterator, &while_statement, sizeof (parser_while_statement_t));
+        -: 1064:
+    #####: 1065:  scanner_get_location (&location, context_p);
+    #####: 1066:  current_token = context_p->token;
+        -: 1067:
+    #####: 1068:  parser_set_branch_to_current_position (context_p, &while_statement.branch);
+    #####: 1069:  parser_set_continues_to_current_position (context_p, loop.branch_list_p);
+        -: 1070:
+    #####: 1071:  scanner_set_location (context_p, &while_statement.condition_location);
+    #####: 1072:  scanner_seek (context_p);
+    #####: 1073:  lexer_next_token (context_p);
+        -: 1074:
+    #####: 1075:  parser_parse_expression (context_p, PARSE_EXPR);
+    #####: 1076:  if (context_p->token.type != LEXER_RIGHT_PAREN)
+        -: 1077:  {
+    #####: 1078:    parser_raise_error (context_p, PARSER_ERR_RIGHT_PAREN_EXPECTED);
+        -: 1079:  }
+        -: 1080:
+    #####: 1081:  opcode = CBC_BRANCH_IF_TRUE_BACKWARD;
+    #####: 1082:  if (context_p->last_cbc_opcode == CBC_LOGICAL_NOT)
+        -: 1083:  {
+    #####: 1084:    context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####: 1085:    opcode = CBC_BRANCH_IF_FALSE_BACKWARD;
+        -: 1086:  }
+    #####: 1087:  else if (context_p->last_cbc_opcode == CBC_PUSH_TRUE)
+        -: 1088:  {
+    #####: 1089:    context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####: 1090:    opcode = CBC_JUMP_BACKWARD;
+        -: 1091:  }
+        -: 1092:
+    #####: 1093:  parser_stack_pop (context_p, NULL, 1 + sizeof (parser_loop_statement_t) + sizeof (parser_while_statement_t));
+    #####: 1094:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 1095:
+    #####: 1096:  parser_emit_cbc_backward_branch (context_p, (uint16_t) opcode, while_statement.start_offset);
+    #####: 1097:  parser_set_breaks_to_current_position (context_p, loop.branch_list_p);
+        -: 1098:
+        -: 1099:  /* Calling scanner_seek is unnecessary because all
+        -: 1100:   * info blocks inside the while statement should be processed. */
+    #####: 1101:  scanner_set_location (context_p, &location);
+    #####: 1102:  context_p->token = current_token;
+    #####: 1103:} /* parser_parse_while_statement_end */
+        -: 1104:
+        -: 1105:/**
+        -: 1106: * Check whether the opcode is a valid LeftHandSide expression
+        -: 1107: * and convert it back to an assignment.
+        -: 1108: *
+        -: 1109: * @return the compatible assignment opcode
+        -: 1110: */
+        -: 1111:static uint16_t
+    #####: 1112:parser_check_left_hand_side_expression (parser_context_t *context_p, /**< context */
+        -: 1113:                                        uint16_t opcode) /**< opcode to check */
+        -: 1114:{
+    #####: 1115:  if (opcode == CBC_PUSH_LITERAL && context_p->last_cbc.literal_type == LEXER_IDENT_LITERAL)
+        -: 1116:  {
+    #####: 1117:    context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####: 1118:    return CBC_ASSIGN_SET_IDENT;
+        -: 1119:  }
+    #####: 1120:  else if (opcode == CBC_PUSH_PROP)
+        -: 1121:  {
+    #####: 1122:    context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####: 1123:    return CBC_ASSIGN;
+        -: 1124:  }
+    #####: 1125:  else if (opcode == CBC_PUSH_PROP_LITERAL)
+        -: 1126:  {
+    #####: 1127:    context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####: 1128:    return CBC_ASSIGN_PROP_LITERAL;
+        -: 1129:  }
+    #####: 1130:  else if (opcode == CBC_PUSH_PROP_LITERAL_LITERAL)
+        -: 1131:  {
+    #####: 1132:    context_p->last_cbc_opcode = CBC_PUSH_TWO_LITERALS;
+    #####: 1133:    return CBC_ASSIGN;
+        -: 1134:  }
+    #####: 1135:  else if (opcode == CBC_PUSH_PROP_THIS_LITERAL)
+        -: 1136:  {
+    #####: 1137:    context_p->last_cbc_opcode = CBC_PUSH_THIS_LITERAL;
+    #####: 1138:    return CBC_ASSIGN;
+        -: 1139:  }
+        -: 1140:  else
+        -: 1141:  {
+        -: 1142:    /* Invalid LeftHandSide expression. */
+        -: 1143:#if JERRY_ESNEXT
+    #####: 1144:    parser_raise_error (context_p, PARSER_ERR_INVALID_LHS_FOR_LOOP);
+        -: 1145:#else /* !JERRY_ESNEXT */
+    #####: 1146:    parser_emit_cbc_ext (context_p, CBC_EXT_THROW_REFERENCE_ERROR);
+        -: 1147:#endif /* JERRY_ESNEXT */
+        -: 1148:
+    #####: 1149:    return CBC_ASSIGN;
+        -: 1150:  }
+        -: 1151:
+        -: 1152:  return opcode;
+        -: 1153:} /* parser_check_left_hand_side_expression */
+        -: 1154:
+        -: 1155:/**
+        -: 1156: * Parse for statement (starting part).
+        -: 1157: */
+        -: 1158:static void
+    #####: 1159:parser_parse_for_statement_start (parser_context_t *context_p) /**< context */
+        -: 1160:{
+    #####: 1161:  parser_loop_statement_t loop;
+        -: 1162:
+    #####: 1163:  JERRY_ASSERT (context_p->token.type == LEXER_KEYW_FOR);
+    #####: 1164:  lexer_next_token (context_p);
+        -: 1165:
+        -: 1166:#if JERRY_ESNEXT
+    #####: 1167:  bool is_for_await = false;
+        -: 1168:
+    #####: 1169:  if (context_p->token.type == LEXER_KEYW_AWAIT)
+        -: 1170:  {
+    #####: 1171:    if (JERRY_UNLIKELY (context_p->token.lit_location.status_flags & LEXER_LIT_LOCATION_HAS_ESCAPE))
+        -: 1172:    {
+    #####: 1173:      parser_raise_error (context_p, PARSER_ERR_INVALID_KEYWORD);
+        -: 1174:    }
+    #####: 1175:    lexer_next_token (context_p);
+    #####: 1176:    is_for_await = true;
+        -: 1177:  }
+        -: 1178:#endif /* JERRY_ESNEXT */
+        -: 1179:
+    #####: 1180:  if (context_p->token.type != LEXER_LEFT_PAREN)
+        -: 1181:  {
+        -: 1182:#if JERRY_ESNEXT
+    #####: 1183:    if (context_p->token.type == LEXER_LITERAL && context_p->token.keyword_type == LEXER_KEYW_AWAIT
+    #####: 1184:        && !(context_p->token.lit_location.status_flags & LEXER_LIT_LOCATION_HAS_ESCAPE))
+        -: 1185:    {
+    #####: 1186:      parser_raise_error (context_p, PARSER_ERR_FOR_AWAIT_NO_ASYNC);
+        -: 1187:    }
+        -: 1188:#endif /* JERRY_ESNEXT */
+    #####: 1189:    parser_raise_error (context_p, PARSER_ERR_LEFT_PAREN_EXPECTED);
+        -: 1190:  }
+        -: 1191:
+    #####: 1192:  if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 1193:  {
+    #####: 1194:    parser_for_in_of_statement_t for_in_of_statement;
+    #####: 1195:    scanner_location_t start_location, end_location;
+        -: 1196:
+        -: 1197:#if JERRY_ESNEXT
+    #####: 1198:    JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_FOR_IN
+        -: 1199:                  || context_p->next_scanner_info_p->type == SCANNER_TYPE_FOR_OF);
+        -: 1200:
+    #####: 1201:    bool is_for_in = (context_p->next_scanner_info_p->type == SCANNER_TYPE_FOR_IN);
+    #####: 1202:    end_location = ((scanner_location_info_t *) context_p->next_scanner_info_p)->location;
+        -: 1203:
+    #####: 1204:    scanner_release_next (context_p, sizeof (scanner_location_info_t));
+        -: 1205:
+    #####: 1206:    scanner_get_location (&start_location, context_p);
+    #####: 1207:    lexer_next_token (context_p);
+        -: 1208:
+    #####: 1209:    uint8_t token_type = LEXER_EOS;
+    #####: 1210:    bool has_context = false;
+        -: 1211:
+    #####: 1212:    if (context_p->token.type == LEXER_KEYW_VAR || context_p->token.type == LEXER_KEYW_LET
+    #####: 1213:        || context_p->token.type == LEXER_KEYW_CONST)
+        -: 1214:    {
+    #####: 1215:      token_type = context_p->token.type;
+    #####: 1216:      has_context = context_p->next_scanner_info_p->source_p == context_p->source_p;
+    #####: 1217:      JERRY_ASSERT (!has_context || context_p->next_scanner_info_p->type == SCANNER_TYPE_BLOCK);
+    #####: 1218:      scanner_get_location (&start_location, context_p);
+        -: 1219:
+        -: 1220:      /* TODO: remove this after the pre-scanner supports strict mode detection. */
+    #####: 1221:      if (context_p->next_scanner_info_p->source_p == context_p->source_p
+    #####: 1222:          && context_p->next_scanner_info_p->type == SCANNER_TYPE_LET_EXPRESSION)
+        -: 1223:      {
+    #####: 1224:        scanner_release_next (context_p, sizeof (scanner_info_t));
+        -: 1225:      }
+        -: 1226:    }
+    #####: 1227:    else if (context_p->token.type == LEXER_LITERAL && lexer_token_is_let (context_p))
+        -: 1228:    {
+    #####: 1229:      if (context_p->next_scanner_info_p->source_p == context_p->source_p
+    #####: 1230:          && context_p->next_scanner_info_p->type == SCANNER_TYPE_LET_EXPRESSION)
+        -: 1231:      {
+    #####: 1232:        scanner_release_next (context_p, sizeof (scanner_info_t));
+        -: 1233:      }
+        -: 1234:      else
+        -: 1235:      {
+    #####: 1236:        token_type = LEXER_KEYW_LET;
+    #####: 1237:        has_context = (context_p->next_scanner_info_p->source_p == context_p->source_p);
+    #####: 1238:        scanner_get_location (&start_location, context_p);
+        -: 1239:      }
+        -: 1240:    }
+        -: 1241:
+    #####: 1242:    if (has_context)
+        -: 1243:    {
+    #####: 1244:      has_context = parser_push_block_context (context_p, true);
+        -: 1245:    }
+        -: 1246:
+    #####: 1247:    scanner_set_location (context_p, &end_location);
+        -: 1248:#else /* !JERRY_ESNEXT */
+        -: 1249:    JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_FOR_IN);
+        -: 1250:
+    #####: 1251:    bool is_for_in = true;
+    #####: 1252:    scanner_get_location (&start_location, context_p);
+        -: 1253:
+    #####: 1254:    scanner_set_location (context_p, &((scanner_location_info_t *) context_p->next_scanner_info_p)->location);
+    #####: 1255:    scanner_release_next (context_p, sizeof (scanner_location_info_t));
+        -: 1256:#endif /* JERRY_ESNEXT */
+        -: 1257:
+        -: 1258:    /* The length of both 'in' and 'of' is two. */
+    #####: 1259:    const uint8_t *source_end_p = context_p->source_p - 2;
+        -: 1260:
+    #####: 1261:    scanner_seek (context_p);
+        -: 1262:
+        -: 1263:#if JERRY_ESNEXT
+    #####: 1264:    if (is_for_in && is_for_await)
+        -: 1265:    {
+    #####: 1266:      context_p->token.line = context_p->line;
+    #####: 1267:      context_p->token.column = context_p->column - 2;
+    #####: 1268:      parser_raise_error (context_p, PARSER_ERR_FOR_AWAIT_NO_OF);
+        -: 1269:    }
+        -: 1270:#endif /* JERRY_ESNEXT */
+        -: 1271:
+    #####: 1272:    lexer_next_token (context_p);
+    #####: 1273:    int options = is_for_in ? PARSE_EXPR : PARSE_EXPR_NO_COMMA;
+    #####: 1274:    parser_parse_expression (context_p, options);
+        -: 1275:
+    #####: 1276:    if (context_p->token.type != LEXER_RIGHT_PAREN)
+        -: 1277:    {
+    #####: 1278:      parser_raise_error (context_p, PARSER_ERR_RIGHT_PAREN_EXPECTED);
+        -: 1279:    }
+        -: 1280:
+        -: 1281:#ifndef JERRY_NDEBUG
+    #####: 1282:    PARSER_PLUS_EQUAL_U16 (context_p->context_stack_depth,
+        -: 1283:                           is_for_in ? PARSER_FOR_IN_CONTEXT_STACK_ALLOCATION : PARSER_FOR_OF_CONTEXT_STACK_ALLOCATION);
+        -: 1284:#endif /* !JERRY_NDEBUG */
+        -: 1285:
+    #####: 1286:    cbc_ext_opcode_t init_opcode = CBC_EXT_FOR_IN_INIT;
+        -: 1287:
+        -: 1288:#if JERRY_ESNEXT
+    #####: 1289:    if (!is_for_in)
+        -: 1290:    {
+    #####: 1291:      init_opcode = is_for_await ? CBC_EXT_FOR_AWAIT_OF_INIT : CBC_EXT_FOR_OF_INIT;
+        -: 1292:    }
+        -: 1293:#endif /* JERRY_ESNEXT */
+        -: 1294:
+    #####: 1295:    parser_emit_cbc_ext_forward_branch (context_p, init_opcode, &for_in_of_statement.branch);
+        -: 1296:
+    #####: 1297:    JERRY_ASSERT (context_p->last_cbc_opcode == PARSER_CBC_UNAVAILABLE);
+    #####: 1298:    for_in_of_statement.start_offset = context_p->byte_code_size;
+        -: 1299:
+        -: 1300:#if JERRY_ESNEXT
+    #####: 1301:    if (has_context)
+        -: 1302:    {
+    #####: 1303:      parser_emit_cbc_ext (context_p, CBC_EXT_CLONE_CONTEXT);
+        -: 1304:    }
+        -: 1305:#endif /* JERRY_ESNEXT */
+        -: 1306:
+        -: 1307:    /* The expression parser must not read the 'in' or 'of' tokens. */
+    #####: 1308:    scanner_get_location (&end_location, context_p);
+    #####: 1309:    scanner_set_location (context_p, &start_location);
+        -: 1310:
+    #####: 1311:    const uint8_t *original_source_end_p = context_p->source_end_p;
+    #####: 1312:    context_p->source_end_p = source_end_p;
+    #####: 1313:    scanner_seek (context_p);
+        -: 1314:
+        -: 1315:#if JERRY_ESNEXT
+    #####: 1316:    if (token_type == LEXER_EOS)
+        -: 1317:    {
+    #####: 1318:      lexer_next_token (context_p);
+        -: 1319:
+    #####: 1320:      if (context_p->token.type == LEXER_LEFT_SQUARE || context_p->token.type == LEXER_LEFT_BRACE)
+        -: 1321:      {
+    #####: 1322:        token_type = context_p->token.type;
+        -: 1323:      }
+        -: 1324:    }
+        -: 1325:#else /* !JERRY_ESNEXT */
+    #####: 1326:    lexer_next_token (context_p);
+        -: 1327:
+    #####: 1328:    uint8_t token_type = context_p->token.type;
+        -: 1329:#endif /* JERRY_ESNEXT */
+        -: 1330:
+    #####: 1331:    switch (token_type)
+        -: 1332:    {
+        -: 1333:#if JERRY_ESNEXT
+    #####: 1334:      case LEXER_KEYW_LET:
+        -: 1335:      case LEXER_KEYW_CONST:
+        -: 1336:#endif /* JERRY_ESNEXT */
+    #####: 1337:      case LEXER_KEYW_VAR:
+        -: 1338:      {
+        -: 1339:#if JERRY_ESNEXT
+    #####: 1340:        if (lexer_check_next_characters (context_p, LIT_CHAR_LEFT_SQUARE, LIT_CHAR_LEFT_BRACE))
+        -: 1341:        {
+    #####: 1342:          parser_emit_cbc_ext (context_p, is_for_in ? CBC_EXT_FOR_IN_GET_NEXT : CBC_EXT_FOR_OF_GET_NEXT);
+        -: 1343:
+    #####: 1344:          parser_pattern_flags_t flags = (PARSER_PATTERN_BINDING | PARSER_PATTERN_TARGET_ON_STACK);
+        -: 1345:
+    #####: 1346:          if (context_p->next_scanner_info_p->source_p == (context_p->source_p + 1))
+        -: 1347:          {
+    #####: 1348:            if (context_p->next_scanner_info_p->type == SCANNER_TYPE_INITIALIZER)
+        -: 1349:            {
+    #####: 1350:              scanner_release_next (context_p, sizeof (scanner_location_info_t));
+        -: 1351:            }
+        -: 1352:            else
+        -: 1353:            {
+    #####: 1354:              JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_LITERAL_FLAGS);
+    #####: 1355:              if (context_p->next_scanner_info_p->u8_arg & SCANNER_LITERAL_OBJECT_HAS_REST)
+        -: 1356:              {
+    #####: 1357:                flags |= PARSER_PATTERN_HAS_REST_ELEMENT;
+        -: 1358:              }
+        -: 1359:
+    #####: 1360:              scanner_release_next (context_p, sizeof (scanner_info_t));
+        -: 1361:            }
+        -: 1362:          }
+        -: 1363:
+    #####: 1364:          if (token_type == LEXER_KEYW_LET)
+        -: 1365:          {
+    #####: 1366:            flags |= PARSER_PATTERN_LET;
+        -: 1367:          }
+    #####: 1368:          else if (token_type == LEXER_KEYW_CONST)
+        -: 1369:          {
+    #####: 1370:            flags |= PARSER_PATTERN_CONST;
+        -: 1371:          }
+        -: 1372:
+    #####: 1373:          parser_parse_initializer_by_next_char (context_p, flags);
+    #####: 1374:          break;
+        -: 1375:        }
+        -: 1376:#endif /* JERRY_ESNEXT */
+        -: 1377:
+    #####: 1378:        lexer_expect_identifier (context_p, LEXER_IDENT_LITERAL);
+        -: 1379:
+        -: 1380:#if JERRY_ESNEXT
+    #####: 1381:        if (context_p->token.keyword_type == LEXER_KEYW_LET && token_type != LEXER_KEYW_VAR)
+        -: 1382:        {
+    #####: 1383:          parser_raise_error (context_p, PARSER_ERR_LEXICAL_LET_BINDING);
+        -: 1384:        }
+        -: 1385:#endif /* JERRY_ESNEXT */
+        -: 1386:
+    #####: 1387:        JERRY_ASSERT (context_p->token.type == LEXER_LITERAL
+        -: 1388:                      && context_p->token.lit_location.type == LEXER_IDENT_LITERAL);
+        -: 1389:
+    #####: 1390:        uint16_t literal_index = context_p->lit_object.index;
+    #####: 1391:        lexer_next_token (context_p);
+        -: 1392:
+    #####: 1393:        if (context_p->token.type == LEXER_ASSIGN)
+        -: 1394:        {
+        -: 1395:#if JERRY_ESNEXT
+    #####: 1396:          if ((context_p->status_flags & PARSER_IS_STRICT) || !is_for_in)
+        -: 1397:          {
+    #####: 1398:            parser_raise_error (context_p, PARSER_ERR_FOR_IN_OF_DECLARATION);
+        -: 1399:          }
+        -: 1400:#endif /* JERRY_ESNEXT */
+    #####: 1401:          parser_branch_t branch;
+        -: 1402:
+        -: 1403:          /* Initialiser is never executed. */
+    #####: 1404:          parser_emit_cbc_forward_branch (context_p, CBC_JUMP_FORWARD, &branch);
+    #####: 1405:          lexer_next_token (context_p);
+    #####: 1406:          parser_parse_expression_statement (context_p, PARSE_EXPR_NO_COMMA);
+    #####: 1407:          parser_set_branch_to_current_position (context_p, &branch);
+        -: 1408:        }
+        -: 1409:
+    #####: 1410:        parser_emit_cbc_ext (context_p, is_for_in ? CBC_EXT_FOR_IN_GET_NEXT : CBC_EXT_FOR_OF_GET_NEXT);
+        -: 1411:#if JERRY_ESNEXT
+        -: 1412:#ifndef JERRY_NDEBUG
+    #####: 1413:        if (literal_index < PARSER_REGISTER_START && has_context
+    #####: 1414:            && !scanner_literal_is_created (context_p, literal_index))
+        -: 1415:        {
+    #####: 1416:          context_p->global_status_flags |= ECMA_PARSE_INTERNAL_FOR_IN_OFF_CONTEXT_ERROR;
+        -: 1417:        }
+        -: 1418:#endif /* !JERRY_NDEBUG */
+        -: 1419:
+    #####: 1420:        uint16_t opcode = (has_context ? CBC_ASSIGN_LET_CONST : CBC_ASSIGN_SET_IDENT);
+    #####: 1421:        parser_emit_cbc_literal (context_p, opcode, literal_index);
+        -: 1422:#else /* !JERRY_ESNEXT */
+    #####: 1423:        parser_emit_cbc_literal (context_p, CBC_ASSIGN_SET_IDENT, literal_index);
+        -: 1424:#endif /* JERRY_ESNEXT */
+    #####: 1425:        break;
+        -: 1426:      }
+        -: 1427:#if JERRY_ESNEXT
+    #####: 1428:      case LEXER_LEFT_BRACE:
+        -: 1429:      case LEXER_LEFT_SQUARE:
+        -: 1430:      {
+    #####: 1431:        if (context_p->next_scanner_info_p->source_p == context_p->source_p
+    #####: 1432:            && context_p->next_scanner_info_p->type == SCANNER_TYPE_LITERAL_FLAGS
+    #####: 1433:            && (context_p->next_scanner_info_p->u8_arg & SCANNER_LITERAL_DESTRUCTURING_FOR))
+        -: 1434:        {
+    #####: 1435:          parser_emit_cbc_ext (context_p, is_for_in ? CBC_EXT_FOR_IN_GET_NEXT : CBC_EXT_FOR_OF_GET_NEXT);
+        -: 1436:
+    #####: 1437:          uint32_t flags = PARSER_PATTERN_TARGET_ON_STACK;
+        -: 1438:
+    #####: 1439:          if (context_p->next_scanner_info_p->u8_arg & SCANNER_LITERAL_OBJECT_HAS_REST)
+        -: 1440:          {
+    #####: 1441:            flags |= PARSER_PATTERN_HAS_REST_ELEMENT;
+        -: 1442:          }
+        -: 1443:
+    #####: 1444:          scanner_release_next (context_p, sizeof (scanner_info_t));
+    #####: 1445:          parser_parse_initializer (context_p, flags);
+        -: 1446:          /* Pop the value returned by GET_NEXT. */
+    #####: 1447:          parser_emit_cbc (context_p, CBC_POP);
+    #####: 1448:          break;
+        -: 1449:        }
+        -: 1450:        /* FALLTHRU */
+        -: 1451:      }
+        -: 1452:#endif /* JERRY_ESNEXT */
+    #####: 1453:      default:
+        -: 1454:      {
+        -: 1455:        uint16_t opcode;
+        -: 1456:
+    #####: 1457:        parser_parse_expression (context_p, PARSE_EXPR_LEFT_HAND_SIDE);
+        -: 1458:
+    #####: 1459:        opcode = context_p->last_cbc_opcode;
+        -: 1460:
+        -: 1461:        /* The CBC_EXT_FOR_IN_CREATE_CONTEXT flushed the opcode combiner. */
+    #####: 1462:        JERRY_ASSERT (opcode != CBC_PUSH_TWO_LITERALS && opcode != CBC_PUSH_THREE_LITERALS);
+        -: 1463:
+    #####: 1464:        opcode = parser_check_left_hand_side_expression (context_p, opcode);
+        -: 1465:
+    #####: 1466:        parser_emit_cbc_ext (context_p, is_for_in ? CBC_EXT_FOR_IN_GET_NEXT : CBC_EXT_FOR_OF_GET_NEXT);
+    #####: 1467:        parser_flush_cbc (context_p);
+        -: 1468:
+    #####: 1469:        context_p->last_cbc_opcode = opcode;
+    #####: 1470:        break;
+        -: 1471:      }
+        -: 1472:    }
+        -: 1473:
+    #####: 1474:    if (context_p->token.type != LEXER_EOS)
+        -: 1475:    {
+        -: 1476:#if JERRY_ESNEXT
+    #####: 1477:      parser_raise_error (context_p, is_for_in ? PARSER_ERR_IN_EXPECTED : PARSER_ERR_OF_EXPECTED);
+        -: 1478:#else /* !JERRY_ESNEXT */
+    #####: 1479:      parser_raise_error (context_p, PARSER_ERR_IN_EXPECTED);
+        -: 1480:#endif /* JERRY_ESNEXT */
+        -: 1481:    }
+        -: 1482:
+    #####: 1483:    parser_flush_cbc (context_p);
+    #####: 1484:    scanner_set_location (context_p, &end_location);
+    #####: 1485:    context_p->source_end_p = original_source_end_p;
+    #####: 1486:    lexer_next_token (context_p);
+        -: 1487:
+    #####: 1488:    loop.branch_list_p = NULL;
+        -: 1489:
+    #####: 1490:    parser_stack_push (context_p, &for_in_of_statement, sizeof (parser_for_in_of_statement_t));
+    #####: 1491:    parser_stack_push (context_p, &loop, sizeof (parser_loop_statement_t));
+        -: 1492:
+    #####: 1493:    uint8_t for_type = PARSER_STATEMENT_FOR_IN;
+        -: 1494:
+        -: 1495:#if JERRY_ESNEXT
+    #####: 1496:    if (!is_for_in)
+        -: 1497:    {
+    #####: 1498:      for_type = is_for_await ? PARSER_STATEMENT_FOR_AWAIT_OF : PARSER_STATEMENT_FOR_OF;
+        -: 1499:    }
+        -: 1500:#endif /* JERRY_ESNEXT */
+        -: 1501:
+    #####: 1502:    parser_stack_push_uint8 (context_p, for_type);
+    #####: 1503:    parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 1504:    return;
+        -: 1505:  }
+        -: 1506:
+    #####: 1507:  lexer_next_token (context_p);
+        -: 1508:
+    #####: 1509:  if (context_p->token.type != LEXER_SEMICOLON)
+        -: 1510:  {
+        -: 1511:#if JERRY_ESNEXT
+    #####: 1512:    const uint8_t *source_p = context_p->source_p;
+        -: 1513:#endif /* JERRY_ESNEXT */
+        -: 1514:
+    #####: 1515:    switch (context_p->token.type)
+        -: 1516:    {
+        -: 1517:#if JERRY_ESNEXT
+    #####: 1518:      case LEXER_LITERAL:
+        -: 1519:      {
+    #####: 1520:        if (!lexer_token_is_let (context_p))
+        -: 1521:        {
+    #####: 1522:          parser_parse_expression_statement (context_p, PARSE_EXPR);
+    #####: 1523:          break;
+        -: 1524:        }
+        -: 1525:
+        -: 1526:        /* FALLTHRU */
+        -: 1527:      }
+        -: 1528:      case LEXER_KEYW_LET:
+        -: 1529:      {
+    #####: 1530:        if (context_p->next_scanner_info_p->source_p == context_p->source_p
+    #####: 1531:            && context_p->next_scanner_info_p->type != SCANNER_TYPE_BLOCK)
+        -: 1532:        {
+    #####: 1533:          if (context_p->next_scanner_info_p->type == SCANNER_TYPE_LET_EXPRESSION)
+        -: 1534:          {
+    #####: 1535:            scanner_release_next (context_p, sizeof (scanner_info_t));
+        -: 1536:          }
+        -: 1537:
+    #####: 1538:          parser_parse_expression_statement (context_p, PARSE_EXPR);
+    #####: 1539:          break;
+        -: 1540:        }
+        -: 1541:
+    #####: 1542:        context_p->token.type = LEXER_KEYW_LET;
+        -: 1543:
+        -: 1544:        /* FALLTHRU */
+        -: 1545:      }
+    #####: 1546:      case LEXER_KEYW_CONST:
+        -: 1547:      {
+    #####: 1548:        if (context_p->next_scanner_info_p->source_p == source_p)
+        -: 1549:        {
+    #####: 1550:          parser_push_block_context (context_p, true);
+        -: 1551:        }
+        -: 1552:        /* FALLTHRU */
+        -: 1553:      }
+        -: 1554:#endif /* JERRY_ESNEXT */
+    #####: 1555:      case LEXER_KEYW_VAR:
+        -: 1556:      {
+    #####: 1557:        parser_parse_var_statement (context_p);
+    #####: 1558:        break;
+        -: 1559:      }
+    #####: 1560:      default:
+        -: 1561:      {
+    #####: 1562:        parser_parse_expression_statement (context_p, PARSE_EXPR);
+    #####: 1563:        break;
+        -: 1564:      }
+        -: 1565:    }
+        -: 1566:
+    #####: 1567:    if (context_p->token.type != LEXER_SEMICOLON)
+        -: 1568:    {
+    #####: 1569:      parser_raise_error (context_p, PARSER_ERR_SEMICOLON_EXPECTED);
+        -: 1570:    }
+        -: 1571:  }
+        -: 1572:
+        -: 1573:#if JERRY_ESNEXT
+    #####: 1574:  if (is_for_await)
+        -: 1575:  {
+    #####: 1576:    parser_raise_error (context_p, PARSER_ERR_FOR_AWAIT_NO_OF);
+        -: 1577:  }
+        -: 1578:#endif /* JERRY_ESNEXT */
+        -: 1579:
+    #####: 1580:  JERRY_ASSERT (context_p->next_scanner_info_p->source_p != context_p->source_p
+        -: 1581:                || context_p->next_scanner_info_p->type == SCANNER_TYPE_FOR);
+        -: 1582:
+    #####: 1583:  if (context_p->next_scanner_info_p->source_p != context_p->source_p
+    #####: 1584:      || ((scanner_for_info_t *) context_p->next_scanner_info_p)->end_location.source_p == NULL)
+        -: 1585:  {
+    #####: 1586:    if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 1587:    {
+        -: 1588:      /* Even though the scanning is failed, there might be valid statements
+        -: 1589:       * inside the for statement which depend on scanner info blocks. */
+    #####: 1590:      scanner_release_next (context_p, sizeof (scanner_for_info_t));
+        -: 1591:    }
+        -: 1592:
+        -: 1593:    /* The prescanner couldn't find the second semicolon or the closing paranthesis. */
+    #####: 1594:    lexer_next_token (context_p);
+    #####: 1595:    parser_parse_expression (context_p, PARSE_EXPR);
+        -: 1596:
+    #####: 1597:    if (context_p->token.type != LEXER_SEMICOLON)
+        -: 1598:    {
+    #####: 1599:      parser_raise_error (context_p, PARSER_ERR_SEMICOLON_EXPECTED);
+        -: 1600:    }
+        -: 1601:
+    #####: 1602:    lexer_next_token (context_p);
+    #####: 1603:    parser_parse_expression_statement (context_p, PARSE_EXPR);
+        -: 1604:
+    #####: 1605:    JERRY_ASSERT (context_p->token.type != LEXER_RIGHT_PAREN);
+    #####: 1606:    parser_raise_error (context_p, PARSER_ERR_RIGHT_PAREN_EXPECTED);
+        -: 1607:  }
+        -: 1608:
+    #####: 1609:  parser_for_statement_t for_statement;
+    #####: 1610:  scanner_for_info_t *for_info_p = (scanner_for_info_t *) context_p->next_scanner_info_p;
+        -: 1611:
+    #####: 1612:  parser_emit_cbc_forward_branch (context_p, CBC_JUMP_FORWARD, &for_statement.branch);
+        -: 1613:
+    #####: 1614:  JERRY_ASSERT (context_p->last_cbc_opcode == PARSER_CBC_UNAVAILABLE);
+        -: 1615:
+    #####: 1616:  for_statement.start_offset = context_p->byte_code_size;
+    #####: 1617:  scanner_get_location (&for_statement.condition_location, context_p);
+    #####: 1618:  for_statement.expression_location = for_info_p->expression_location;
+        -: 1619:
+    #####: 1620:  scanner_set_location (context_p, &for_info_p->end_location);
+    #####: 1621:  scanner_release_next (context_p, sizeof (scanner_for_info_t));
+    #####: 1622:  scanner_seek (context_p);
+    #####: 1623:  lexer_next_token (context_p);
+        -: 1624:
+    #####: 1625:  loop.branch_list_p = NULL;
+        -: 1626:
+    #####: 1627:  parser_stack_push (context_p, &for_statement, sizeof (parser_for_statement_t));
+    #####: 1628:  parser_stack_push (context_p, &loop, sizeof (parser_loop_statement_t));
+    #####: 1629:  parser_stack_push_uint8 (context_p, PARSER_STATEMENT_FOR);
+    #####: 1630:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 1631:} /* parser_parse_for_statement_start */
+        -: 1632:
+        -: 1633:/**
+        -: 1634: * Parse for statement (ending part).
+        -: 1635: */
+        -: 1636:static void JERRY_ATTR_NOINLINE
+    #####: 1637:parser_parse_for_statement_end (parser_context_t *context_p) /**< context */
+        -: 1638:{
+    #####: 1639:  parser_for_statement_t for_statement;
+    #####: 1640:  parser_loop_statement_t loop;
+        -: 1641:  lexer_token_t current_token;
+    #####: 1642:  scanner_location_t location;
+        -: 1643:  cbc_opcode_t opcode;
+        -: 1644:
+    #####: 1645:  JERRY_ASSERT (context_p->stack_top_uint8 == PARSER_STATEMENT_FOR);
+        -: 1646:
+    #####: 1647:  parser_stack_iterator_t iterator;
+    #####: 1648:  parser_stack_iterator_init (context_p, &iterator);
+        -: 1649:
+    #####: 1650:  parser_stack_iterator_skip (&iterator, 1);
+    #####: 1651:  parser_stack_iterator_read (&iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 1652:  parser_stack_iterator_skip (&iterator, sizeof (parser_loop_statement_t));
+    #####: 1653:  parser_stack_iterator_read (&iterator, &for_statement, sizeof (parser_for_statement_t));
+        -: 1654:
+        -: 1655:#if JERRY_ESNEXT
+    #####: 1656:  bool has_block_context = false;
+    #####: 1657:  uint8_t next_statement_type;
+        -: 1658:
+    #####: 1659:  parser_stack_iterator_skip (&iterator, sizeof (parser_for_statement_t));
+    #####: 1660:  parser_stack_iterator_read (&iterator, &next_statement_type, 1);
+        -: 1661:
+    #####: 1662:  if (next_statement_type == PARSER_STATEMENT_PRIVATE_CONTEXT)
+        -: 1663:  {
+    #####: 1664:    has_block_context = true;
+        -: 1665:  }
+        -: 1666:#endif /* JERRY_ESNEXT */
+        -: 1667:
+    #####: 1668:  scanner_get_location (&location, context_p);
+    #####: 1669:  current_token = context_p->token;
+        -: 1670:
+    #####: 1671:  scanner_set_location (context_p, &for_statement.expression_location);
+    #####: 1672:  scanner_seek (context_p);
+    #####: 1673:  lexer_next_token (context_p);
+        -: 1674:
+    #####: 1675:  parser_set_continues_to_current_position (context_p, loop.branch_list_p);
+        -: 1676:
+        -: 1677:#if JERRY_ESNEXT
+    #####: 1678:  if (has_block_context)
+        -: 1679:  {
+    #####: 1680:    parser_emit_cbc_ext (context_p, CBC_EXT_CLONE_FULL_CONTEXT);
+        -: 1681:  }
+        -: 1682:#endif /* JERRY_ESNEXT */
+        -: 1683:
+    #####: 1684:  if (context_p->token.type != LEXER_RIGHT_PAREN)
+        -: 1685:  {
+    #####: 1686:    parser_parse_expression_statement (context_p, PARSE_EXPR);
+        -: 1687:
+    #####: 1688:    if (context_p->token.type != LEXER_RIGHT_PAREN)
+        -: 1689:    {
+    #####: 1690:      parser_raise_error (context_p, PARSER_ERR_RIGHT_PAREN_EXPECTED);
+        -: 1691:    }
+        -: 1692:  }
+        -: 1693:
+    #####: 1694:  parser_set_branch_to_current_position (context_p, &for_statement.branch);
+        -: 1695:
+    #####: 1696:  scanner_set_location (context_p, &for_statement.condition_location);
+    #####: 1697:  scanner_seek (context_p);
+    #####: 1698:  lexer_next_token (context_p);
+        -: 1699:
+    #####: 1700:  if (context_p->token.type != LEXER_SEMICOLON)
+        -: 1701:  {
+    #####: 1702:    parser_parse_expression (context_p, PARSE_EXPR);
+        -: 1703:
+    #####: 1704:    if (context_p->token.type != LEXER_SEMICOLON)
+        -: 1705:    {
+    #####: 1706:      parser_raise_error (context_p, PARSER_ERR_SEMICOLON_EXPECTED);
+        -: 1707:    }
+        -: 1708:
+    #####: 1709:    opcode = CBC_BRANCH_IF_TRUE_BACKWARD;
+    #####: 1710:    if (context_p->last_cbc_opcode == CBC_LOGICAL_NOT)
+        -: 1711:    {
+    #####: 1712:      context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####: 1713:      opcode = CBC_BRANCH_IF_FALSE_BACKWARD;
+        -: 1714:    }
+    #####: 1715:    else if (context_p->last_cbc_opcode == CBC_PUSH_TRUE)
+        -: 1716:    {
+    #####: 1717:      context_p->last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+    #####: 1718:      opcode = CBC_JUMP_BACKWARD;
+        -: 1719:    }
+        -: 1720:  }
+        -: 1721:  else
+        -: 1722:  {
+    #####: 1723:    opcode = CBC_JUMP_BACKWARD;
+        -: 1724:  }
+        -: 1725:
+    #####: 1726:  parser_stack_pop (context_p, NULL, 1 + sizeof (parser_loop_statement_t) + sizeof (parser_for_statement_t));
+    #####: 1727:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 1728:
+    #####: 1729:  parser_emit_cbc_backward_branch (context_p, (uint16_t) opcode, for_statement.start_offset);
+    #####: 1730:  parser_set_breaks_to_current_position (context_p, loop.branch_list_p);
+        -: 1731:
+        -: 1732:#if JERRY_ESNEXT
+    #####: 1733:  if (context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_SCOPE
+    #####: 1734:      || context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_CONTEXT)
+        -: 1735:  {
+    #####: 1736:    parser_pop_block_context (context_p);
+        -: 1737:  }
+        -: 1738:#endif /* JERRY_ESNEXT */
+        -: 1739:
+        -: 1740:  /* Calling scanner_seek is unnecessary because all
+        -: 1741:   * info blocks inside the for statement should be processed. */
+    #####: 1742:  scanner_set_location (context_p, &location);
+    #####: 1743:  context_p->token = current_token;
+    #####: 1744:} /* parser_parse_for_statement_end */
+        -: 1745:
+        -: 1746:/**
+        -: 1747: * Parse switch statement (starting part).
+        -: 1748: */
+        -: 1749:static void JERRY_ATTR_NOINLINE
+    #####: 1750:parser_parse_switch_statement_start (parser_context_t *context_p) /**< context */
+        -: 1751:{
+    #####: 1752:  parser_switch_statement_t switch_statement;
+    #####: 1753:  parser_loop_statement_t loop;
+    #####: 1754:  parser_stack_iterator_t iterator;
+    #####: 1755:  scanner_location_t start_location;
+        -: 1756:  bool switch_case_was_found;
+        -: 1757:  bool default_case_was_found;
+    #####: 1758:  parser_branch_node_t *case_branches_p = NULL;
+        -: 1759:
+    #####: 1760:  JERRY_ASSERT (context_p->token.type == LEXER_KEYW_SWITCH);
+        -: 1761:
+    #####: 1762:  parser_parse_enclosed_expr (context_p);
+        -: 1763:
+    #####: 1764:  if (context_p->token.type != LEXER_LEFT_BRACE)
+        -: 1765:  {
+    #####: 1766:    parser_raise_error (context_p, PARSER_ERR_LEFT_BRACE_EXPECTED);
+        -: 1767:  }
+        -: 1768:
+        -: 1769:#if JERRY_ESNEXT
+    #####: 1770:  if (context_p->next_scanner_info_p->source_p == context_p->source_p - 1)
+        -: 1771:  {
+    #####: 1772:    parser_push_block_context (context_p, true);
+        -: 1773:  }
+        -: 1774:#endif /* JERRY_ESNEXT */
+        -: 1775:
+    #####: 1776:  JERRY_ASSERT (context_p->next_scanner_info_p->source_p == context_p->source_p
+        -: 1777:                && context_p->next_scanner_info_p->type == SCANNER_TYPE_SWITCH);
+        -: 1778:
+    #####: 1779:  scanner_case_info_t *case_info_p = ((scanner_switch_info_t *) context_p->next_scanner_info_p)->case_p;
+    #####: 1780:  scanner_set_active (context_p);
+        -: 1781:
+    #####: 1782:  if (case_info_p == NULL)
+        -: 1783:  {
+    #####: 1784:    lexer_next_token (context_p);
+        -: 1785:
+    #####: 1786:    if (context_p->token.type == LEXER_RIGHT_BRACE)
+        -: 1787:    {
+    #####: 1788:      scanner_release_active (context_p, sizeof (scanner_switch_info_t));
+        -: 1789:
+    #####: 1790:      parser_emit_cbc (context_p, CBC_POP);
+    #####: 1791:      parser_flush_cbc (context_p);
+        -: 1792:
+    #####: 1793:      parser_stack_push_uint8 (context_p, PARSER_STATEMENT_BLOCK);
+    #####: 1794:      parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 1795:      return;
+        -: 1796:    }
+        -: 1797:
+    #####: 1798:    parser_raise_error (context_p, PARSER_ERR_INVALID_SWITCH);
+        -: 1799:  }
+        -: 1800:
+    #####: 1801:  scanner_get_location (&start_location, context_p);
+        -: 1802:
+        -: 1803:  /* The reason of using an iterator is error management. If an error
+        -: 1804:   * occures, parser_free_jumps() free all data. However, the branches
+        -: 1805:   * created by parser_emit_cbc_forward_branch_item() would not be freed.
+        -: 1806:   * To free these branches, the current switch data is always stored
+        -: 1807:   * on the stack. If any change happens, this data is updated. Updates
+        -: 1808:   * are done using the iterator. */
+        -: 1809:
+    #####: 1810:  switch_statement.branch_list_p = NULL;
+    #####: 1811:  loop.branch_list_p = NULL;
+        -: 1812:
+    #####: 1813:  parser_stack_push (context_p, &switch_statement, sizeof (parser_switch_statement_t));
+    #####: 1814:  parser_stack_iterator_init (context_p, &iterator);
+    #####: 1815:  parser_stack_push (context_p, &loop, sizeof (parser_loop_statement_t));
+    #####: 1816:  parser_stack_push_uint8 (context_p, PARSER_STATEMENT_SWITCH);
+    #####: 1817:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 1818:
+    #####: 1819:  switch_case_was_found = false;
+    #####: 1820:  default_case_was_found = false;
+        -: 1821:
+        -: 1822:  do
+        -: 1823:  {
+    #####: 1824:    scanner_set_location (context_p, &case_info_p->location);
+    #####: 1825:    scanner_seek (context_p);
+    #####: 1826:    case_info_p = case_info_p->next_p;
+        -: 1827:
+        -: 1828:    /* The last letter of case and default is 'e' and 't' respectively.  */
+    #####: 1829:    JERRY_ASSERT (context_p->source_p[-1] == LIT_CHAR_LOWERCASE_E || context_p->source_p[-1] == LIT_CHAR_LOWERCASE_T);
+        -: 1830:
+    #####: 1831:    bool is_default = context_p->source_p[-1] == LIT_CHAR_LOWERCASE_T;
+    #####: 1832:    lexer_next_token (context_p);
+        -: 1833:
+    #####: 1834:    if (is_default)
+        -: 1835:    {
+    #####: 1836:      if (default_case_was_found)
+        -: 1837:      {
+    #####: 1838:        parser_raise_error (context_p, PARSER_ERR_MULTIPLE_DEFAULTS_NOT_ALLOWED);
+        -: 1839:      }
+        -: 1840:
+    #####: 1841:      if (context_p->token.type != LEXER_COLON)
+        -: 1842:      {
+    #####: 1843:        parser_raise_error (context_p, PARSER_ERR_COLON_EXPECTED);
+        -: 1844:      }
+        -: 1845:
+    #####: 1846:      default_case_was_found = true;
+    #####: 1847:      continue;
+        -: 1848:    }
+        -: 1849:
+    #####: 1850:    switch_case_was_found = true;
+        -: 1851:
+        -: 1852:#if JERRY_LINE_INFO
+    #####: 1853:    parser_line_info_append (context_p, context_p->token.line, context_p->token.column);
+        -: 1854:#endif /* JERRY_LINE_INFO */
+        -: 1855:
+    #####: 1856:    parser_parse_expression (context_p, PARSE_EXPR);
+        -: 1857:
+    #####: 1858:    if (context_p->token.type != LEXER_COLON)
+        -: 1859:    {
+    #####: 1860:      parser_raise_error (context_p, PARSER_ERR_COLON_EXPECTED);
+        -: 1861:    }
+        -: 1862:
+    #####: 1863:    uint16_t opcode = CBC_BRANCH_IF_STRICT_EQUAL;
+        -: 1864:
+    #####: 1865:    if (case_info_p == NULL
+    #####: 1866:        || (case_info_p->next_p == NULL && case_info_p->location.source_p[-1] == LIT_CHAR_LOWERCASE_T))
+        -: 1867:    {
+        -: 1868:      /* There are no more 'case' statements in the switch. */
+    #####: 1869:      parser_emit_cbc (context_p, CBC_STRICT_EQUAL);
+    #####: 1870:      opcode = CBC_BRANCH_IF_TRUE_FORWARD;
+        -: 1871:    }
+        -: 1872:
+    #####: 1873:    parser_branch_node_t *new_case_p = parser_emit_cbc_forward_branch_item (context_p, opcode, NULL);
+        -: 1874:
+    #####: 1875:    if (case_branches_p == NULL)
+        -: 1876:    {
+    #####: 1877:      switch_statement.branch_list_p = new_case_p;
+    #####: 1878:      parser_stack_iterator_write (&iterator, &switch_statement, sizeof (parser_switch_statement_t));
+        -: 1879:    }
+        -: 1880:    else
+        -: 1881:    {
+    #####: 1882:      case_branches_p->next_p = new_case_p;
+        -: 1883:    }
+        -: 1884:
+    #####: 1885:    case_branches_p = new_case_p;
+    #####: 1886:  } while (case_info_p != NULL);
+        -: 1887:
+    #####: 1888:  JERRY_ASSERT (switch_case_was_found || default_case_was_found);
+        -: 1889:
+    #####: 1890:  if (!switch_case_was_found)
+        -: 1891:  {
+        -: 1892:    /* There was no case statement, so the expression result
+        -: 1893:     * of the switch must be popped from the stack */
+    #####: 1894:    parser_emit_cbc (context_p, CBC_POP);
+        -: 1895:  }
+        -: 1896:
+    #####: 1897:  parser_emit_cbc_forward_branch (context_p, CBC_JUMP_FORWARD, &switch_statement.default_branch);
+    #####: 1898:  parser_stack_iterator_write (&iterator, &switch_statement, sizeof (parser_switch_statement_t));
+        -: 1899:
+    #####: 1900:  if (!default_case_was_found)
+        -: 1901:  {
+    #####: 1902:    parser_stack_change_last_uint8 (context_p, PARSER_STATEMENT_SWITCH_NO_DEFAULT);
+        -: 1903:  }
+        -: 1904:
+    #####: 1905:  scanner_release_switch_cases (((scanner_switch_info_t *) context_p->active_scanner_info_p)->case_p);
+    #####: 1906:  scanner_release_active (context_p, sizeof (scanner_switch_info_t));
+        -: 1907:
+    #####: 1908:  scanner_set_location (context_p, &start_location);
+    #####: 1909:  scanner_seek (context_p);
+    #####: 1910:  lexer_next_token (context_p);
+        -: 1911:} /* parser_parse_switch_statement_start */
+        -: 1912:
+        -: 1913:/**
+        -: 1914: * Parse try statement (ending part).
+        -: 1915: */
+        -: 1916:static void
+    #####: 1917:parser_parse_try_statement_end (parser_context_t *context_p) /**< context */
+        -: 1918:{
+    #####: 1919:  parser_try_statement_t try_statement;
+    #####: 1920:  parser_stack_iterator_t iterator;
+        -: 1921:
+    #####: 1922:  JERRY_ASSERT (context_p->stack_top_uint8 == PARSER_STATEMENT_TRY);
+        -: 1923:
+    #####: 1924:  parser_stack_iterator_init (context_p, &iterator);
+    #####: 1925:  parser_stack_iterator_skip (&iterator, 1);
+    #####: 1926:  parser_stack_iterator_read (&iterator, &try_statement, sizeof (parser_try_statement_t));
+        -: 1927:
+        -: 1928:#if JERRY_ESNEXT
+    #####: 1929:  context_p->scope_stack_top = try_statement.scope_stack_top;
+    #####: 1930:  context_p->scope_stack_reg_top = try_statement.scope_stack_reg_top;
+        -: 1931:#endif /* JERRY_ESNEXT */
+        -: 1932:
+    #####: 1933:  lexer_next_token (context_p);
+        -: 1934:
+    #####: 1935:  if (try_statement.type == parser_finally_block)
+        -: 1936:  {
+    #####: 1937:    parser_flush_cbc (context_p);
+    #####: 1938:    PARSER_MINUS_EQUAL_U16 (context_p->stack_depth, PARSER_FINALLY_CONTEXT_STACK_ALLOCATION);
+        -: 1939:#ifndef JERRY_NDEBUG
+    #####: 1940:    PARSER_MINUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_FINALLY_CONTEXT_STACK_ALLOCATION);
+        -: 1941:#endif /* !JERRY_NDEBUG */
+        -: 1942:
+    #####: 1943:    parser_emit_cbc (context_p, CBC_CONTEXT_END);
+    #####: 1944:    parser_set_branch_to_current_position (context_p, &try_statement.branch);
+        -: 1945:  }
+        -: 1946:  else
+        -: 1947:  {
+    #####: 1948:    parser_set_branch_to_current_position (context_p, &try_statement.branch);
+        -: 1949:
+    #####: 1950:    if (try_statement.type == parser_catch_block)
+        -: 1951:    {
+        -: 1952:#if !JERRY_ESNEXT
+    #####: 1953:      context_p->scope_stack_top = try_statement.scope_stack_top;
+    #####: 1954:      context_p->scope_stack_reg_top = try_statement.scope_stack_reg_top;
+        -: 1955:#endif /* !JERRY_ESNEXT */
+        -: 1956:
+    #####: 1957:      if (context_p->token.type != LEXER_KEYW_FINALLY)
+        -: 1958:      {
+    #####: 1959:        parser_flush_cbc (context_p);
+    #####: 1960:        PARSER_MINUS_EQUAL_U16 (context_p->stack_depth, PARSER_TRY_CONTEXT_STACK_ALLOCATION);
+        -: 1961:#ifndef JERRY_NDEBUG
+    #####: 1962:        PARSER_MINUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_TRY_CONTEXT_STACK_ALLOCATION);
+        -: 1963:#endif /* !JERRY_NDEBUG */
+        -: 1964:
+    #####: 1965:        parser_emit_cbc (context_p, CBC_CONTEXT_END);
+    #####: 1966:        parser_flush_cbc (context_p);
+        -: 1967:
+    #####: 1968:        try_statement.type = parser_finally_block;
+        -: 1969:      }
+        -: 1970:    }
+        -: 1971:    else
+        -: 1972:    {
+    #####: 1973:      JERRY_ASSERT (try_statement.type == parser_try_block);
+        -: 1974:
+    #####: 1975:      if (context_p->token.type != LEXER_KEYW_CATCH && context_p->token.type != LEXER_KEYW_FINALLY)
+        -: 1976:      {
+    #####: 1977:        parser_raise_error (context_p, PARSER_ERR_CATCH_FINALLY_EXPECTED);
+        -: 1978:      }
+        -: 1979:    }
+        -: 1980:  }
+        -: 1981:
+    #####: 1982:  if (try_statement.type == parser_finally_block)
+        -: 1983:  {
+    #####: 1984:    parser_stack_pop (context_p, NULL, (uint32_t) (sizeof (parser_try_statement_t) + 1));
+    #####: 1985:    parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 1986:    return;
+        -: 1987:  }
+        -: 1988:
+    #####: 1989:  if (context_p->token.type == LEXER_KEYW_CATCH)
+        -: 1990:  {
+    #####: 1991:    lexer_next_token (context_p);
+        -: 1992:
+    #####: 1993:    try_statement.type = parser_catch_block;
+    #####: 1994:    parser_emit_cbc_ext_forward_branch (context_p, CBC_EXT_CATCH, &try_statement.branch);
+        -: 1995:
+    #####: 1996:    try_statement.scope_stack_top = context_p->scope_stack_top;
+    #####: 1997:    try_statement.scope_stack_reg_top = context_p->scope_stack_reg_top;
+        -: 1998:
+        -: 1999:#ifndef JERRY_NDEBUG
+    #####: 2000:    bool block_found = false;
+        -: 2001:#endif /* !JERRY_NDEBUG */
+        -: 2002:
+    #####: 2003:    if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 2004:    {
+    #####: 2005:      JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_BLOCK);
+        -: 2006:#ifndef JERRY_NDEBUG
+    #####: 2007:      block_found = true;
+        -: 2008:#endif /* !JERRY_NDEBUG */
+        -: 2009:
+    #####: 2010:      if (scanner_is_context_needed (context_p, PARSER_CHECK_BLOCK_CONTEXT))
+        -: 2011:      {
+    #####: 2012:        parser_emit_cbc_ext (context_p, CBC_EXT_TRY_CREATE_ENV);
+        -: 2013:      }
+        -: 2014:
+    #####: 2015:      scanner_create_variables (context_p, SCANNER_CREATE_VARS_NO_OPTS);
+        -: 2016:    }
+        -: 2017:
+    #####: 2018:    if (context_p->token.type == LEXER_LEFT_PAREN)
+        -: 2019:    {
+        -: 2020:#if JERRY_ESNEXT
+    #####: 2021:      if (lexer_check_next_characters (context_p, LIT_CHAR_LEFT_SQUARE, LIT_CHAR_LEFT_BRACE))
+        -: 2022:      {
+    #####: 2023:        parser_pattern_flags_t flags = (PARSER_PATTERN_BINDING | PARSER_PATTERN_TARGET_ON_STACK | PARSER_PATTERN_LET);
+        -: 2024:
+    #####: 2025:        parser_parse_initializer_by_next_char (context_p, flags);
+        -: 2026:      }
+        -: 2027:      else
+        -: 2028:      {
+        -: 2029:#endif /* JERRY_ESNEXT */
+    #####: 2030:        lexer_expect_identifier (context_p, LEXER_IDENT_LITERAL);
+    #####: 2031:        JERRY_ASSERT (context_p->token.type == LEXER_LITERAL
+        -: 2032:                      && context_p->token.lit_location.type == LEXER_IDENT_LITERAL);
+        -: 2033:
+        -: 2034:#if JERRY_ESNEXT
+    #####: 2035:        uint16_t literal_index = context_p->lit_object.index;
+    #####: 2036:        parser_emit_cbc_literal (context_p,
+    #####: 2037:                                 (literal_index >= PARSER_REGISTER_START) ? CBC_ASSIGN_SET_IDENT : CBC_ASSIGN_LET_CONST,
+        -: 2038:                                 literal_index);
+        -: 2039:#else /* !JERRY_ESNEXT */
+    #####: 2040:      parser_emit_cbc_literal (context_p, CBC_ASSIGN_SET_IDENT, context_p->lit_object.index);
+        -: 2041:#endif /* JERRY_ESNEXT */
+        -: 2042:
+    #####: 2043:        lexer_next_token (context_p);
+        -: 2044:
+        -: 2045:#ifndef JERRY_NDEBUG
+    #####: 2046:        JERRY_ASSERT (block_found);
+        -: 2047:#endif /* !JERRY_NDEBUG */
+        -: 2048:#if JERRY_ESNEXT
+        -: 2049:      }
+        -: 2050:#endif /* JERRY_ESNEXT */
+        -: 2051:
+    #####: 2052:      if (context_p->token.type != LEXER_RIGHT_PAREN)
+        -: 2053:      {
+    #####: 2054:        parser_raise_error (context_p, PARSER_ERR_RIGHT_PAREN_EXPECTED);
+        -: 2055:      }
+        -: 2056:
+    #####: 2057:      lexer_next_token (context_p);
+        -: 2058:
+    #####: 2059:      if (context_p->token.type != LEXER_LEFT_BRACE)
+        -: 2060:      {
+    #####: 2061:        parser_raise_error (context_p, PARSER_ERR_LEFT_BRACE_EXPECTED);
+        -: 2062:      }
+        -: 2063:    }
+        -: 2064:#if JERRY_ESNEXT
+    #####: 2065:    else if (context_p->token.type == LEXER_LEFT_BRACE)
+        -: 2066:    {
+    #####: 2067:      parser_emit_cbc (context_p, CBC_POP);
+        -: 2068:    }
+        -: 2069:#endif /* JERRY_ESNEXT */
+        -: 2070:    else
+        -: 2071:    {
+    #####: 2072:      parser_raise_error (context_p, PARSER_ERR_LEFT_PAREN_EXPECTED);
+        -: 2073:    }
+        -: 2074:
+    #####: 2075:    parser_flush_cbc (context_p);
+        -: 2076:  }
+        -: 2077:  else
+        -: 2078:  {
+    #####: 2079:    JERRY_ASSERT (context_p->token.type == LEXER_KEYW_FINALLY);
+        -: 2080:
+    #####: 2081:    lexer_next_token (context_p);
+        -: 2082:
+    #####: 2083:    if (context_p->token.type != LEXER_LEFT_BRACE)
+        -: 2084:    {
+    #####: 2085:      parser_raise_error (context_p, PARSER_ERR_LEFT_BRACE_EXPECTED);
+        -: 2086:    }
+        -: 2087:
+        -: 2088:#ifndef JERRY_NDEBUG
+    #####: 2089:    PARSER_PLUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_FINALLY_CONTEXT_EXTRA_STACK_ALLOCATION);
+        -: 2090:#endif /* !JERRY_NDEBUG */
+        -: 2091:
+    #####: 2092:    try_statement.type = parser_finally_block;
+    #####: 2093:    parser_emit_cbc_ext_forward_branch (context_p, CBC_EXT_FINALLY, &try_statement.branch);
+        -: 2094:
+        -: 2095:#if JERRY_ESNEXT
+    #####: 2096:    if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 2097:    {
+    #####: 2098:      JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_BLOCK);
+        -: 2099:
+    #####: 2100:      if (scanner_is_context_needed (context_p, PARSER_CHECK_BLOCK_CONTEXT))
+        -: 2101:      {
+    #####: 2102:        parser_emit_cbc_ext (context_p, CBC_EXT_TRY_CREATE_ENV);
+        -: 2103:      }
+        -: 2104:
+    #####: 2105:      scanner_create_variables (context_p, SCANNER_CREATE_VARS_NO_OPTS);
+        -: 2106:    }
+        -: 2107:#endif /* JERRY_ESNEXT */
+        -: 2108:  }
+        -: 2109:
+    #####: 2110:  lexer_next_token (context_p);
+    #####: 2111:  parser_stack_iterator_write (&iterator, &try_statement, sizeof (parser_try_statement_t));
+        -: 2112:} /* parser_parse_try_statement_end */
+        -: 2113:
+        -: 2114:/**
+        -: 2115: * Parse default statement.
+        -: 2116: */
+        -: 2117:static void
+    #####: 2118:parser_parse_default_statement (parser_context_t *context_p) /**< context */
+        -: 2119:{
+    #####: 2120:  parser_stack_iterator_t iterator;
+    #####: 2121:  parser_switch_statement_t switch_statement;
+        -: 2122:
+    #####: 2123:  if (context_p->stack_top_uint8 != PARSER_STATEMENT_SWITCH
+    #####: 2124:      && context_p->stack_top_uint8 != PARSER_STATEMENT_SWITCH_NO_DEFAULT)
+        -: 2125:  {
+    #####: 2126:    parser_raise_error (context_p, PARSER_ERR_DEFAULT_NOT_IN_SWITCH);
+        -: 2127:  }
+        -: 2128:
+    #####: 2129:  lexer_next_token (context_p);
+        -: 2130:  /* Already checked in parser_parse_switch_statement_start. */
+    #####: 2131:  JERRY_ASSERT (context_p->token.type == LEXER_COLON);
+    #####: 2132:  lexer_next_token (context_p);
+        -: 2133:
+    #####: 2134:  parser_stack_iterator_init (context_p, &iterator);
+    #####: 2135:  parser_stack_iterator_skip (&iterator, 1 + sizeof (parser_loop_statement_t));
+    #####: 2136:  parser_stack_iterator_read (&iterator, &switch_statement, sizeof (parser_switch_statement_t));
+        -: 2137:
+    #####: 2138:  parser_set_branch_to_current_position (context_p, &switch_statement.default_branch);
+    #####: 2139:} /* parser_parse_default_statement */
+        -: 2140:
+        -: 2141:/**
+        -: 2142: * Parse case statement.
+        -: 2143: */
+        -: 2144:static void
+    #####: 2145:parser_parse_case_statement (parser_context_t *context_p) /**< context */
+        -: 2146:{
+    #####: 2147:  parser_stack_iterator_t iterator;
+    #####: 2148:  parser_switch_statement_t switch_statement;
+        -: 2149:  parser_branch_node_t *branch_p;
+        -: 2150:
+    #####: 2151:  if (context_p->stack_top_uint8 != PARSER_STATEMENT_SWITCH
+    #####: 2152:      && context_p->stack_top_uint8 != PARSER_STATEMENT_SWITCH_NO_DEFAULT)
+        -: 2153:  {
+    #####: 2154:    parser_raise_error (context_p, PARSER_ERR_CASE_NOT_IN_SWITCH);
+        -: 2155:  }
+        -: 2156:
+    #####: 2157:  if (context_p->next_scanner_info_p->source_p != context_p->source_p)
+        -: 2158:  {
+    #####: 2159:    lexer_next_token (context_p);
+        -: 2160:
+    #####: 2161:    parser_parse_expression (context_p, PARSE_EXPR);
+        -: 2162:
+    #####: 2163:    JERRY_ASSERT (context_p->token.type != LEXER_COLON);
+    #####: 2164:    parser_raise_error (context_p, PARSER_ERR_COLON_EXPECTED);
+        -: 2165:  }
+        -: 2166:
+    #####: 2167:  JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_CASE);
+        -: 2168:
+    #####: 2169:  scanner_set_location (context_p, &((scanner_location_info_t *) context_p->next_scanner_info_p)->location);
+    #####: 2170:  scanner_release_next (context_p, sizeof (scanner_location_info_t));
+    #####: 2171:  scanner_seek (context_p);
+    #####: 2172:  lexer_next_token (context_p);
+        -: 2173:
+    #####: 2174:  parser_stack_iterator_init (context_p, &iterator);
+    #####: 2175:  parser_stack_iterator_skip (&iterator, 1 + sizeof (parser_loop_statement_t));
+    #####: 2176:  parser_stack_iterator_read (&iterator, &switch_statement, sizeof (parser_switch_statement_t));
+        -: 2177:
+        -: 2178:  /* Free memory after the case statement is found. */
+        -: 2179:
+    #####: 2180:  branch_p = switch_statement.branch_list_p;
+    #####: 2181:  JERRY_ASSERT (branch_p != NULL);
+    #####: 2182:  switch_statement.branch_list_p = branch_p->next_p;
+    #####: 2183:  parser_stack_iterator_write (&iterator, &switch_statement, sizeof (parser_switch_statement_t));
+        -: 2184:
+    #####: 2185:  parser_set_branch_to_current_position (context_p, &branch_p->branch);
+    #####: 2186:  parser_free (branch_p, sizeof (parser_branch_node_t));
+    #####: 2187:} /* parser_parse_case_statement */
+        -: 2188:
+        -: 2189:/**
+        -: 2190: * Parse break statement.
+        -: 2191: */
+        -: 2192:static void
+    #####: 2193:parser_parse_break_statement (parser_context_t *context_p) /**< context */
+        -: 2194:{
+    #####: 2195:  parser_stack_iterator_t iterator;
+    #####: 2196:  cbc_opcode_t opcode = CBC_JUMP_FORWARD;
+        -: 2197:
+    #####: 2198:  lexer_next_token (context_p);
+    #####: 2199:  parser_stack_iterator_init (context_p, &iterator);
+        -: 2200:
+    #####: 2201:  if (!(context_p->token.flags & LEXER_WAS_NEWLINE) && context_p->token.type == LEXER_LITERAL
+    #####: 2202:      && context_p->token.lit_location.type == LEXER_IDENT_LITERAL)
+        -: 2203:  {
+        -: 2204:    /* The label with the same name is searched on the stack. */
+        -: 2205:    while (true)
+    #####: 2206:    {
+    #####: 2207:      uint8_t type = parser_stack_iterator_read_uint8 (&iterator);
+    #####: 2208:      if (type == PARSER_STATEMENT_START)
+        -: 2209:      {
+    #####: 2210:        parser_raise_error (context_p, PARSER_ERR_INVALID_BREAK_LABEL);
+        -: 2211:      }
+        -: 2212:
+    #####: 2213:      if (parser_statement_flags[type] & PARSER_STATM_CONTEXT_BREAK)
+        -: 2214:      {
+    #####: 2215:        opcode = CBC_JUMP_FORWARD_EXIT_CONTEXT;
+        -: 2216:      }
+        -: 2217:
+    #####: 2218:      if (type == PARSER_STATEMENT_LABEL)
+        -: 2219:      {
+    #####: 2220:        parser_label_statement_t label_statement;
+        -: 2221:
+    #####: 2222:        parser_stack_iterator_skip (&iterator, 1);
+    #####: 2223:        parser_stack_iterator_read (&iterator, &label_statement, sizeof (parser_label_statement_t));
+        -: 2224:
+    #####: 2225:        if (lexer_current_is_literal (context_p, &label_statement.label_ident))
+        -: 2226:        {
+    #####: 2227:          label_statement.break_list_p =
+    #####: 2228:            parser_emit_cbc_forward_branch_item (context_p, (uint16_t) opcode, label_statement.break_list_p);
+    #####: 2229:          parser_stack_iterator_write (&iterator, &label_statement, sizeof (parser_label_statement_t));
+    #####: 2230:          lexer_next_token (context_p);
+    #####: 2231:          return;
+        -: 2232:        }
+    #####: 2233:        parser_stack_iterator_skip (&iterator, sizeof (parser_label_statement_t));
+        -: 2234:      }
+        -: 2235:      else
+        -: 2236:      {
+    #####: 2237:        parser_stack_iterator_skip (&iterator, parser_statement_length (type));
+        -: 2238:      }
+        -: 2239:    }
+        -: 2240:  }
+        -: 2241:
+        -: 2242:  /* The first switch or loop statement is searched. */
+        -: 2243:  while (true)
+    #####: 2244:  {
+    #####: 2245:    uint8_t type = parser_stack_iterator_read_uint8 (&iterator);
+    #####: 2246:    if (type == PARSER_STATEMENT_START)
+        -: 2247:    {
+    #####: 2248:      parser_raise_error (context_p, PARSER_ERR_INVALID_BREAK);
+        -: 2249:    }
+        -: 2250:
+    #####: 2251:    if (parser_statement_flags[type] & PARSER_STATM_CONTEXT_BREAK)
+        -: 2252:    {
+    #####: 2253:      opcode = CBC_JUMP_FORWARD_EXIT_CONTEXT;
+        -: 2254:    }
+        -: 2255:
+    #####: 2256:    if (parser_statement_flags[type] & PARSER_STATM_BREAK_TARGET)
+        -: 2257:    {
+    #####: 2258:      parser_loop_statement_t loop;
+        -: 2259:
+    #####: 2260:      parser_stack_iterator_skip (&iterator, 1);
+    #####: 2261:      parser_stack_iterator_read (&iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 2262:      loop.branch_list_p = parser_emit_cbc_forward_branch_item (context_p, (uint16_t) opcode, loop.branch_list_p);
+    #####: 2263:      parser_stack_iterator_write (&iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 2264:      return;
+        -: 2265:    }
+        -: 2266:
+    #####: 2267:    parser_stack_iterator_skip (&iterator, parser_statement_length (type));
+        -: 2268:  }
+        -: 2269:} /* parser_parse_break_statement */
+        -: 2270:
+        -: 2271:/**
+        -: 2272: * Parse continue statement.
+        -: 2273: */
+        -: 2274:static void
+    #####: 2275:parser_parse_continue_statement (parser_context_t *context_p) /**< context */
+        -: 2276:{
+    #####: 2277:  parser_stack_iterator_t iterator;
+    #####: 2278:  cbc_opcode_t opcode = CBC_JUMP_FORWARD;
+        -: 2279:
+    #####: 2280:  lexer_next_token (context_p);
+    #####: 2281:  parser_stack_iterator_init (context_p, &iterator);
+        -: 2282:
+    #####: 2283:  if (!(context_p->token.flags & LEXER_WAS_NEWLINE) && context_p->token.type == LEXER_LITERAL
+    #####: 2284:      && context_p->token.lit_location.type == LEXER_IDENT_LITERAL)
+        -: 2285:  {
+    #####: 2286:    parser_stack_iterator_t loop_iterator;
+        -: 2287:
+    #####: 2288:    loop_iterator.current_p = NULL;
+        -: 2289:
+        -: 2290:    /* The label with the same name is searched on the stack. */
+        -: 2291:    while (true)
+    #####: 2292:    {
+    #####: 2293:      uint8_t type = parser_stack_iterator_read_uint8 (&iterator);
+        -: 2294:
+    #####: 2295:      if (type == PARSER_STATEMENT_START)
+        -: 2296:      {
+    #####: 2297:        parser_raise_error (context_p, PARSER_ERR_INVALID_CONTINUE_LABEL);
+        -: 2298:      }
+        -: 2299:
+        -: 2300:      /* Only those labels are checked, whose are label of a loop. */
+    #####: 2301:      if (loop_iterator.current_p != NULL && type == PARSER_STATEMENT_LABEL)
+        -: 2302:      {
+    #####: 2303:        parser_label_statement_t label_statement;
+        -: 2304:
+    #####: 2305:        parser_stack_iterator_skip (&iterator, 1);
+    #####: 2306:        parser_stack_iterator_read (&iterator, &label_statement, sizeof (parser_label_statement_t));
+        -: 2307:
+    #####: 2308:        if (lexer_current_is_literal (context_p, &label_statement.label_ident))
+        -: 2309:        {
+    #####: 2310:          parser_loop_statement_t loop;
+        -: 2311:
+    #####: 2312:          parser_stack_iterator_skip (&loop_iterator, 1);
+    #####: 2313:          parser_stack_iterator_read (&loop_iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 2314:          loop.branch_list_p = parser_emit_cbc_forward_branch_item (context_p, (uint16_t) opcode, loop.branch_list_p);
+    #####: 2315:          loop.branch_list_p->branch.offset |= CBC_HIGHEST_BIT_MASK;
+    #####: 2316:          parser_stack_iterator_write (&loop_iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 2317:          lexer_next_token (context_p);
+    #####: 2318:          return;
+        -: 2319:        }
+    #####: 2320:        parser_stack_iterator_skip (&iterator, sizeof (parser_label_statement_t));
+    #####: 2321:        continue;
+        -: 2322:      }
+        -: 2323:
+    #####: 2324:      if (parser_statement_flags[type] & PARSER_STATM_CONTEXT_BREAK)
+        -: 2325:      {
+    #####: 2326:        opcode = CBC_JUMP_FORWARD_EXIT_CONTEXT;
+        -: 2327:      }
+        -: 2328:
+        -: 2329:#if JERRY_ESNEXT
+    #####: 2330:      const bool is_private_scope =
+    #####: 2331:        (type == PARSER_STATEMENT_PRIVATE_SCOPE || type == PARSER_STATEMENT_PRIVATE_CONTEXT);
+        -: 2332:#else /* !JERRY_ESNEXT */
+    #####: 2333:      const bool is_private_scope = false;
+        -: 2334:#endif /* !JERRY_ESNEXT */
+        -: 2335:
+    #####: 2336:      if (parser_statement_flags[type] & PARSER_STATM_CONTINUE_TARGET)
+        -: 2337:      {
+    #####: 2338:        loop_iterator = iterator;
+        -: 2339:      }
+    #####: 2340:      else if (!is_private_scope)
+        -: 2341:      {
+    #####: 2342:        loop_iterator.current_p = NULL;
+        -: 2343:      }
+        -: 2344:
+    #####: 2345:      parser_stack_iterator_skip (&iterator, parser_statement_length (type));
+        -: 2346:    }
+        -: 2347:  }
+        -: 2348:
+        -: 2349:  /* The first loop statement is searched. */
+        -: 2350:  while (true)
+    #####: 2351:  {
+    #####: 2352:    uint8_t type = parser_stack_iterator_read_uint8 (&iterator);
+    #####: 2353:    if (type == PARSER_STATEMENT_START)
+        -: 2354:    {
+    #####: 2355:      parser_raise_error (context_p, PARSER_ERR_INVALID_CONTINUE);
+        -: 2356:    }
+        -: 2357:
+    #####: 2358:    if (parser_statement_flags[type] & PARSER_STATM_CONTINUE_TARGET)
+        -: 2359:    {
+    #####: 2360:      parser_loop_statement_t loop;
+        -: 2361:
+    #####: 2362:      parser_stack_iterator_skip (&iterator, 1);
+    #####: 2363:      parser_stack_iterator_read (&iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 2364:      loop.branch_list_p = parser_emit_cbc_forward_branch_item (context_p, (uint16_t) opcode, loop.branch_list_p);
+    #####: 2365:      loop.branch_list_p->branch.offset |= CBC_HIGHEST_BIT_MASK;
+    #####: 2366:      parser_stack_iterator_write (&iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 2367:      return;
+        -: 2368:    }
+        -: 2369:
+    #####: 2370:    if (parser_statement_flags[type] & PARSER_STATM_CONTEXT_BREAK)
+        -: 2371:    {
+    #####: 2372:      opcode = CBC_JUMP_FORWARD_EXIT_CONTEXT;
+        -: 2373:    }
+        -: 2374:
+    #####: 2375:    parser_stack_iterator_skip (&iterator, parser_statement_length (type));
+        -: 2376:  }
+        -: 2377:} /* parser_parse_continue_statement */
+        -: 2378:
+        -: 2379:#if JERRY_MODULE_SYSTEM
+        -: 2380:/**
+        -: 2381: * Parse import statement.
+        -: 2382: * Note: See 15.2.2
+        -: 2383: */
+        -: 2384:static void
+    #####: 2385:parser_parse_import_statement (parser_context_t *context_p) /**< parser context */
+        -: 2386:{
+    #####: 2387:  JERRY_ASSERT (context_p->token.type == LEXER_KEYW_IMPORT);
+    #####: 2388:  JERRY_ASSERT (context_p->module_names_p == NULL);
+        -: 2389:
+    #####: 2390:  if (lexer_check_next_characters (context_p, LIT_CHAR_LEFT_PAREN, LIT_CHAR_DOT))
+        -: 2391:  {
+    #####: 2392:    if (context_p->status_flags & PARSER_IS_FUNCTION)
+        -: 2393:    {
+    #####: 2394:      parser_parse_expression_statement (context_p, PARSE_EXPR);
+    #####: 2395:      return;
+        -: 2396:    }
+        -: 2397:
+    #####: 2398:    parser_parse_block_expression (context_p, PARSE_EXPR);
+    #####: 2399:    return;
+        -: 2400:  }
+        -: 2401:
+    #####: 2402:  parser_module_check_request_place (context_p);
+    #####: 2403:  lexer_next_token (context_p);
+        -: 2404:
+        -: 2405:  /* Check for a ModuleSpecifier*/
+    #####: 2406:  if (context_p->token.type != LEXER_LITERAL || context_p->token.lit_location.type != LEXER_STRING_LITERAL)
+        -: 2407:  {
+    #####: 2408:    if (!(context_p->token.type == LEXER_LEFT_BRACE || context_p->token.type == LEXER_MULTIPLY
+    #####: 2409:          || (context_p->token.type == LEXER_LITERAL && context_p->token.lit_location.type == LEXER_IDENT_LITERAL)))
+        -: 2410:    {
+    #####: 2411:      parser_raise_error (context_p, PARSER_ERR_LEFT_BRACE_MULTIPLY_LITERAL_EXPECTED);
+        -: 2412:    }
+        -: 2413:
+    #####: 2414:    if (context_p->token.type == LEXER_LITERAL)
+        -: 2415:    {
+        -: 2416:      /* Handle ImportedDefaultBinding */
+    #####: 2417:      lexer_construct_literal_object (context_p, &context_p->token.lit_location, LEXER_IDENT_LITERAL);
+        -: 2418:
+    #####: 2419:      ecma_string_t *local_name_p = parser_new_ecma_string_from_literal (context_p->lit_object.literal_p);
+        -: 2420:
+    #####: 2421:      if (parser_module_check_duplicate_import (context_p, local_name_p))
+        -: 2422:      {
+    #####: 2423:        ecma_deref_ecma_string (local_name_p);
+    #####: 2424:        parser_raise_error (context_p, PARSER_ERR_DUPLICATED_IMPORT_BINDING);
+        -: 2425:      }
+        -: 2426:
+    #####: 2427:      ecma_string_t *import_name_p = ecma_get_magic_string (LIT_MAGIC_STRING_DEFAULT);
+    #####: 2428:      parser_module_add_names_to_node (context_p, import_name_p, local_name_p);
+        -: 2429:
+    #####: 2430:      ecma_deref_ecma_string (local_name_p);
+    #####: 2431:      ecma_deref_ecma_string (import_name_p);
+        -: 2432:
+    #####: 2433:      lexer_next_token (context_p);
+        -: 2434:
+    #####: 2435:      if (context_p->token.type == LEXER_COMMA)
+        -: 2436:      {
+    #####: 2437:        lexer_next_token (context_p);
+    #####: 2438:        if (context_p->token.type != LEXER_MULTIPLY && context_p->token.type != LEXER_LEFT_BRACE)
+        -: 2439:        {
+    #####: 2440:          parser_raise_error (context_p, PARSER_ERR_LEFT_BRACE_MULTIPLY_EXPECTED);
+        -: 2441:        }
+        -: 2442:      }
+    #####: 2443:      else if (!lexer_token_is_identifier (context_p, "from", 4))
+        -: 2444:      {
+    #####: 2445:        parser_raise_error (context_p, PARSER_ERR_FROM_COMMA_EXPECTED);
+        -: 2446:      }
+        -: 2447:    }
+        -: 2448:
+    #####: 2449:    if (context_p->token.type == LEXER_MULTIPLY)
+        -: 2450:    {
+        -: 2451:      /* NameSpaceImport */
+    #####: 2452:      lexer_next_token (context_p);
+    #####: 2453:      if (!lexer_token_is_identifier (context_p, "as", 2))
+        -: 2454:      {
+    #####: 2455:        parser_raise_error (context_p, PARSER_ERR_AS_EXPECTED);
+        -: 2456:      }
+        -: 2457:
+    #####: 2458:      lexer_next_token (context_p);
+    #####: 2459:      if (context_p->token.type != LEXER_LITERAL)
+        -: 2460:      {
+    #####: 2461:        parser_raise_error (context_p, PARSER_ERR_IDENTIFIER_EXPECTED);
+        -: 2462:      }
+        -: 2463:
+    #####: 2464:      lexer_construct_literal_object (context_p, &context_p->token.lit_location, LEXER_IDENT_LITERAL);
+        -: 2465:
+    #####: 2466:      ecma_string_t *local_name_p = parser_new_ecma_string_from_literal (context_p->lit_object.literal_p);
+        -: 2467:
+    #####: 2468:      if (parser_module_check_duplicate_import (context_p, local_name_p))
+        -: 2469:      {
+    #####: 2470:        ecma_deref_ecma_string (local_name_p);
+    #####: 2471:        parser_raise_error (context_p, PARSER_ERR_DUPLICATED_IMPORT_BINDING);
+        -: 2472:      }
+        -: 2473:
+    #####: 2474:      ecma_string_t *import_name_p = ecma_get_magic_string (LIT_MAGIC_STRING_ASTERIX_CHAR);
+        -: 2475:
+    #####: 2476:      parser_module_add_names_to_node (context_p, import_name_p, local_name_p);
+    #####: 2477:      ecma_deref_ecma_string (local_name_p);
+    #####: 2478:      ecma_deref_ecma_string (import_name_p);
+        -: 2479:
+    #####: 2480:      lexer_next_token (context_p);
+        -: 2481:    }
+    #####: 2482:    else if (context_p->token.type == LEXER_LEFT_BRACE)
+        -: 2483:    {
+        -: 2484:      /* Handle NamedImports */
+    #####: 2485:      parser_module_parse_import_clause (context_p);
+        -: 2486:    }
+        -: 2487:
+    #####: 2488:    if (!lexer_token_is_identifier (context_p, "from", 4))
+        -: 2489:    {
+    #####: 2490:      parser_raise_error (context_p, PARSER_ERR_FROM_EXPECTED);
+        -: 2491:    }
+    #####: 2492:    lexer_next_token (context_p);
+        -: 2493:  }
+        -: 2494:
+    #####: 2495:  parser_module_handle_module_specifier (context_p, NULL);
+        -: 2496:} /* parser_parse_import_statement */
+        -: 2497:
+        -: 2498:/**
+        -: 2499: * Parse export statement.
+        -: 2500: *
+        -: 2501: * @return true - if function of class statement was found
+        -: 2502: *         false - otherwise
+        -: 2503: */
+        -: 2504:static bool
+    #####: 2505:parser_parse_export_statement (parser_context_t *context_p) /**< context */
+        -: 2506:{
+    #####: 2507:  JERRY_ASSERT (context_p->token.type == LEXER_KEYW_EXPORT);
+    #####: 2508:  JERRY_ASSERT (context_p->module_names_p == NULL);
+        -: 2509:
+    #####: 2510:  parser_module_check_request_place (context_p);
+        -: 2511:
+    #####: 2512:  bool consume_last_statement = false;
+        -: 2513:
+    #####: 2514:  lexer_next_token (context_p);
+    #####: 2515:  switch (context_p->token.type)
+        -: 2516:  {
+    #####: 2517:    case LEXER_KEYW_DEFAULT:
+        -: 2518:    {
+    #####: 2519:      scanner_location_t location;
+    #####: 2520:      scanner_get_location (&location, context_p);
+        -: 2521:
+    #####: 2522:      context_p->status_flags |= PARSER_MODULE_STORE_IDENT;
+        -: 2523:
+    #####: 2524:      lexer_next_token (context_p);
+        -: 2525:
+    #####: 2526:      if (context_p->token.type == LEXER_LITERAL && lexer_token_is_async (context_p)
+    #####: 2527:          && context_p->next_scanner_info_p->source_p == context_p->source_p
+    #####: 2528:          && context_p->next_scanner_info_p->type == SCANNER_TYPE_FUNCTION)
+        -: 2529:      {
+        -: 2530:#if JERRY_FUNCTION_TO_STRING
+    #####: 2531:        context_p->function_start_p = context_p->token.lit_location.char_p;
+        -: 2532:#endif /* JERRY_FUNCTION_TO_STRING */
+    #####: 2533:        lexer_next_token (context_p);
+        -: 2534:      }
+        -: 2535:
+    #####: 2536:      if (context_p->token.type == LEXER_KEYW_CLASS)
+        -: 2537:      {
+    #####: 2538:        context_p->status_flags |= PARSER_MODULE_DEFAULT_CLASS_OR_FUNC;
+    #####: 2539:        parser_parse_class (context_p, true);
+    #####: 2540:        consume_last_statement = true;
+        -: 2541:      }
+    #####: 2542:      else if (context_p->token.type == LEXER_KEYW_FUNCTION)
+        -: 2543:      {
+    #####: 2544:        context_p->status_flags |= PARSER_MODULE_DEFAULT_CLASS_OR_FUNC;
+    #####: 2545:        parser_parse_function_statement (context_p);
+    #####: 2546:        consume_last_statement = true;
+        -: 2547:      }
+        -: 2548:      else
+        -: 2549:      {
+        -: 2550:        /* Assignment expression */
+    #####: 2551:        scanner_set_location (context_p, &location);
+        -: 2552:
+        -: 2553:        /* 15.2.3.5 Use the synthetic name '*default*' as the identifier. */
+    #####: 2554:        lexer_construct_literal_object (context_p, &lexer_default_literal, lexer_default_literal.type);
+        -: 2555:
+    #####: 2556:        context_p->token.lit_location.type = LEXER_IDENT_LITERAL;
+    #####: 2557:        parser_emit_cbc_literal_from_token (context_p, CBC_PUSH_LITERAL);
+        -: 2558:
+        -: 2559:        /* Do not overwrite this identifier. */
+    #####: 2560:        context_p->status_flags &= (uint32_t) ~PARSER_MODULE_STORE_IDENT;
+    #####: 2561:        context_p->module_identifier_lit_p = context_p->lit_object.literal_p;
+        -: 2562:
+        -: 2563:        /* Fake an assignment to the default identifier */
+    #####: 2564:        context_p->token.type = LEXER_ASSIGN;
+        -: 2565:
+    #####: 2566:        parser_parse_expression_statement (context_p, PARSE_EXPR_NO_COMMA | PARSE_EXPR_HAS_LITERAL);
+        -: 2567:      }
+        -: 2568:
+    #####: 2569:      ecma_string_t *name_p = parser_new_ecma_string_from_literal (context_p->module_identifier_lit_p);
+        -: 2570:
+    #####: 2571:      ecma_string_t *export_name_p = ecma_get_magic_string (LIT_MAGIC_STRING_DEFAULT);
+        -: 2572:
+    #####: 2573:      if (parser_module_check_duplicate_export (context_p, export_name_p))
+        -: 2574:      {
+    #####: 2575:        ecma_deref_ecma_string (name_p);
+    #####: 2576:        ecma_deref_ecma_string (export_name_p);
+    #####: 2577:        parser_raise_error (context_p, PARSER_ERR_DUPLICATED_EXPORT_IDENTIFIER);
+        -: 2578:      }
+        -: 2579:
+    #####: 2580:      parser_module_add_names_to_node (context_p, export_name_p, name_p);
+    #####: 2581:      ecma_deref_ecma_string (name_p);
+    #####: 2582:      ecma_deref_ecma_string (export_name_p);
+    #####: 2583:      break;
+        -: 2584:    }
+    #####: 2585:    case LEXER_MULTIPLY:
+        -: 2586:    {
+    #####: 2587:      lexer_next_token (context_p);
+        -: 2588:
+    #####: 2589:      ecma_module_node_t **target_node_list_p = &(JERRY_CONTEXT (module_current_p)->star_exports_p);
+        -: 2590:
+    #####: 2591:      if (lexer_token_is_identifier (context_p, "as", 2))
+        -: 2592:      {
+    #####: 2593:        target_node_list_p = &(JERRY_CONTEXT (module_current_p)->indirect_exports_p);
+        -: 2594:
+    #####: 2595:        lexer_next_token (context_p);
+        -: 2596:
+    #####: 2597:        if (context_p->token.type != LEXER_LITERAL || context_p->token.lit_location.type != LEXER_IDENT_LITERAL)
+        -: 2598:        {
+    #####: 2599:          parser_raise_error (context_p, PARSER_ERR_IDENTIFIER_EXPECTED);
+        -: 2600:        }
+        -: 2601:
+    #####: 2602:        lexer_construct_literal_object (context_p, &context_p->token.lit_location, LEXER_NEW_IDENT_LITERAL);
+        -: 2603:
+    #####: 2604:        lexer_literal_t *literal_p = PARSER_GET_LITERAL (context_p->lit_object.index);
+    #####: 2605:        ecma_string_t *export_name_p = parser_new_ecma_string_from_literal (literal_p);
+        -: 2606:
+    #####: 2607:        if (parser_module_check_duplicate_export (context_p, export_name_p))
+        -: 2608:        {
+    #####: 2609:          ecma_deref_ecma_string (export_name_p);
+    #####: 2610:          parser_raise_error (context_p, PARSER_ERR_DUPLICATED_EXPORT_IDENTIFIER);
+        -: 2611:        }
+        -: 2612:
+    #####: 2613:        ecma_string_t *local_name_p = ecma_get_magic_string (LIT_MAGIC_STRING_ASTERIX_CHAR);
+    #####: 2614:        parser_module_add_names_to_node (context_p, export_name_p, local_name_p);
+    #####: 2615:        ecma_deref_ecma_string (export_name_p);
+        -: 2616:
+    #####: 2617:        lexer_next_token (context_p);
+        -: 2618:      }
+        -: 2619:
+    #####: 2620:      if (!lexer_token_is_identifier (context_p, "from", 4))
+        -: 2621:      {
+    #####: 2622:        parser_raise_error (context_p, PARSER_ERR_FROM_EXPECTED);
+        -: 2623:      }
+        -: 2624:
+    #####: 2625:      lexer_next_token (context_p);
+    #####: 2626:      parser_module_handle_module_specifier (context_p, target_node_list_p);
+    #####: 2627:      return false;
+        -: 2628:    }
+    #####: 2629:    case LEXER_KEYW_VAR:
+        -: 2630:    case LEXER_KEYW_LET:
+        -: 2631:    case LEXER_KEYW_CONST:
+        -: 2632:    {
+    #####: 2633:      context_p->status_flags |= PARSER_MODULE_STORE_IDENT;
+    #####: 2634:      parser_parse_var_statement (context_p);
+    #####: 2635:      break;
+        -: 2636:    }
+    #####: 2637:    case LEXER_KEYW_CLASS:
+        -: 2638:    {
+    #####: 2639:      context_p->status_flags |= PARSER_MODULE_STORE_IDENT;
+    #####: 2640:      parser_parse_class (context_p, true);
+    #####: 2641:      consume_last_statement = true;
+    #####: 2642:      break;
+        -: 2643:    }
+    #####: 2644:    case LEXER_KEYW_FUNCTION:
+        -: 2645:    {
+    #####: 2646:      context_p->status_flags |= PARSER_MODULE_STORE_IDENT;
+    #####: 2647:      parser_parse_function_statement (context_p);
+    #####: 2648:      consume_last_statement = true;
+    #####: 2649:      break;
+        -: 2650:    }
+    #####: 2651:    case LEXER_LEFT_BRACE:
+        -: 2652:    {
+    #####: 2653:      parser_module_parse_export_clause (context_p);
+        -: 2654:
+    #####: 2655:      if (lexer_token_is_identifier (context_p, "from", 4))
+        -: 2656:      {
+    #####: 2657:        lexer_next_token (context_p);
+    #####: 2658:        parser_module_handle_module_specifier (context_p, &(JERRY_CONTEXT (module_current_p)->indirect_exports_p));
+    #####: 2659:        return false;
+        -: 2660:      }
+    #####: 2661:      break;
+        -: 2662:    }
+    #####: 2663:    default:
+        -: 2664:    {
+    #####: 2665:      parser_raise_error (context_p, PARSER_ERR_LEFT_BRACE_MULTIPLY_LITERAL_EXPECTED);
+    #####: 2666:      break;
+        -: 2667:    }
+        -: 2668:  }
+        -: 2669:
+    #####: 2670:  context_p->status_flags &= (uint32_t) ~(PARSER_MODULE_DEFAULT_CLASS_OR_FUNC | PARSER_MODULE_STORE_IDENT);
+    #####: 2671:  parser_module_append_names (context_p, &(JERRY_CONTEXT (module_current_p)->local_exports_p));
+        -: 2672:
+    #####: 2673:  return consume_last_statement;
+        -: 2674:} /* parser_parse_export_statement */
+        -: 2675:#endif /* JERRY_MODULE_SYSTEM */
+        -: 2676:
+        -: 2677:/**
+        -: 2678: * Parse label statement.
+        -: 2679: */
+        -: 2680:static void
+    #####: 2681:parser_parse_label (parser_context_t *context_p) /**< context */
+        -: 2682:{
+    #####: 2683:  parser_stack_iterator_t iterator;
+    #####: 2684:  parser_label_statement_t label_statement;
+        -: 2685:
+    #####: 2686:  parser_stack_iterator_init (context_p, &iterator);
+        -: 2687:
+        -: 2688:  while (true)
+    #####: 2689:  {
+    #####: 2690:    uint8_t type = parser_stack_iterator_read_uint8 (&iterator);
+    #####: 2691:    if (type == PARSER_STATEMENT_START)
+        -: 2692:    {
+    #####: 2693:      break;
+        -: 2694:    }
+        -: 2695:
+    #####: 2696:    if (type == PARSER_STATEMENT_LABEL)
+        -: 2697:    {
+    #####: 2698:      parser_stack_iterator_skip (&iterator, 1);
+    #####: 2699:      parser_stack_iterator_read (&iterator, &label_statement, sizeof (parser_label_statement_t));
+    #####: 2700:      parser_stack_iterator_skip (&iterator, sizeof (parser_label_statement_t));
+        -: 2701:
+    #####: 2702:      if (lexer_current_is_literal (context_p, &label_statement.label_ident))
+        -: 2703:      {
+    #####: 2704:        parser_raise_error (context_p, PARSER_ERR_DUPLICATED_LABEL);
+        -: 2705:      }
+        -: 2706:    }
+        -: 2707:    else
+        -: 2708:    {
+    #####: 2709:      parser_stack_iterator_skip (&iterator, parser_statement_length (type));
+        -: 2710:    }
+        -: 2711:  }
+        -: 2712:
+    #####: 2713:  label_statement.label_ident = context_p->token.lit_location;
+    #####: 2714:  label_statement.break_list_p = NULL;
+    #####: 2715:  parser_stack_push (context_p, &label_statement, sizeof (parser_label_statement_t));
+    #####: 2716:  parser_stack_push_uint8 (context_p, PARSER_STATEMENT_LABEL);
+    #####: 2717:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 2718:} /* parser_parse_label */
+        -: 2719:
+        -: 2720:/**
+        -: 2721: * Strict mode types for statement parsing.
+        -: 2722: */
+        -: 2723:typedef enum
+        -: 2724:{
+        -: 2725:  PARSER_USE_STRICT_NOT_FOUND = 0, /**< 'use strict' directive is not found */
+        -: 2726:  PARSER_USE_STRICT_FOUND = 1, /**< 'use strict' directive is found but strict mode has already been enabled */
+        -: 2727:  PARSER_USE_STRICT_SET = 2, /**< strict mode is enabled after 'use strict' directive is found */
+        -: 2728:} parser_strict_mode_type_t;
+        -: 2729:
+        -: 2730:/**
+        -: 2731: * Parse statements.
+        -: 2732: */
+        -: 2733:void
+        2: 2734:parser_parse_statements (parser_context_t *context_p) /**< context */
+        -: 2735:{
+        -: 2736:  /* Statement parsing cannot be nested. */
+        2: 2737:  JERRY_ASSERT (context_p->last_statement.current_p == NULL);
+        2: 2738:  parser_stack_push_uint8 (context_p, PARSER_STATEMENT_START);
+        2: 2739:  parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 2740:
+        -: 2741:#if JERRY_DEBUGGER
+        -: 2742:  /* Set lexical enviroment for the debugger. */
+        -: 2743:  if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 2744:  {
+        -: 2745:    context_p->status_flags |= PARSER_LEXICAL_ENV_NEEDED;
+        -: 2746:    context_p->last_breakpoint_line = 0;
+        -: 2747:  }
+        -: 2748:#endif /* JERRY_DEBUGGER */
+        -: 2749:
+        4: 2750:  while (context_p->token.type == LEXER_LITERAL && context_p->token.lit_location.type == LEXER_STRING_LITERAL)
+        -: 2751:  {
+    #####: 2752:    lexer_lit_location_t lit_location;
+    #####: 2753:    parser_strict_mode_type_t strict_mode = PARSER_USE_STRICT_NOT_FOUND;
+        -: 2754:
+    #####: 2755:    JERRY_ASSERT (context_p->stack_depth <= 1);
+        -: 2756:#ifndef JERRY_NDEBUG
+    #####: 2757:    JERRY_ASSERT (context_p->context_stack_depth == context_p->stack_depth);
+        -: 2758:#endif /* !JERRY_NDEBUG */
+        -: 2759:
+    #####: 2760:    if (lexer_string_is_use_strict (context_p))
+        -: 2761:    {
+    #####: 2762:      strict_mode = PARSER_USE_STRICT_FOUND;
+        -: 2763:
+    #####: 2764:      if (!(context_p->status_flags & PARSER_IS_STRICT))
+        -: 2765:      {
+        -: 2766:        /* The next token should be parsed in strict mode. */
+    #####: 2767:        context_p->status_flags |= PARSER_IS_STRICT;
+    #####: 2768:        strict_mode = PARSER_USE_STRICT_SET;
+        -: 2769:      }
+        -: 2770:    }
+        -: 2771:
+    #####: 2772:    lit_location = context_p->token.lit_location;
+    #####: 2773:    lexer_next_token (context_p);
+        -: 2774:
+    #####: 2775:    if (!lexer_string_is_directive (context_p))
+        -: 2776:    {
+        -: 2777:      /* The string is part of an expression statement. */
+    #####: 2778:      if (strict_mode == PARSER_USE_STRICT_SET)
+        -: 2779:      {
+    #####: 2780:        context_p->status_flags &= (uint32_t) ~PARSER_IS_STRICT;
+        -: 2781:      }
+        -: 2782:
+        -: 2783:#if JERRY_DEBUGGER
+        -: 2784:      if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 2785:      {
+        -: 2786:        JERRY_ASSERT (context_p->last_breakpoint_line == 0);
+        -: 2787:
+        -: 2788:        parser_emit_cbc (context_p, CBC_BREAKPOINT_DISABLED);
+        -: 2789:        parser_flush_cbc (context_p);
+        -: 2790:
+        -: 2791:        parser_append_breakpoint_info (context_p, JERRY_DEBUGGER_BREAKPOINT_LIST, context_p->token.line);
+        -: 2792:
+        -: 2793:        context_p->last_breakpoint_line = context_p->token.line;
+        -: 2794:      }
+        -: 2795:#endif /* JERRY_DEBUGGER */
+        -: 2796:#if JERRY_LINE_INFO
+    #####: 2797:      parser_line_info_append (context_p, context_p->token.line, context_p->token.column);
+        -: 2798:#endif /* JERRY_LINE_INFO */
+        -: 2799:
+    #####: 2800:      lexer_construct_literal_object (context_p, &lit_location, LEXER_STRING_LITERAL);
+    #####: 2801:      parser_emit_cbc_literal_from_token (context_p, CBC_PUSH_LITERAL);
+        -: 2802:      /* The extra_value is used for saving the token. */
+    #####: 2803:      context_p->token.extra_value = context_p->token.type;
+    #####: 2804:      context_p->token.type = LEXER_EXPRESSION_START;
+    #####: 2805:      break;
+        -: 2806:    }
+        -: 2807:
+        -: 2808:#if JERRY_PARSER_DUMP_BYTE_CODE
+        -: 2809:    if (strict_mode == PARSER_USE_STRICT_SET && context_p->is_show_opcodes)
+        -: 2810:    {
+        -: 2811:      JERRY_DEBUG_MSG ("  Note: switch to strict mode\n\n");
+        -: 2812:    }
+        -: 2813:#endif /* JERRY_PARSER_DUMP_BYTE_CODE */
+        -: 2814:
+        -: 2815:#if JERRY_ESNEXT
+    #####: 2816:    if (strict_mode != PARSER_USE_STRICT_NOT_FOUND && (context_p->status_flags & PARSER_FUNCTION_HAS_COMPLEX_ARGUMENT))
+        -: 2817:    {
+    #####: 2818:      parser_raise_error (context_p, PARSER_ERR_USE_STRICT_NOT_ALLOWED);
+        -: 2819:    }
+        -: 2820:#endif /* JERRY_ESNEXT */
+        -: 2821:
+    #####: 2822:    if (context_p->token.type == LEXER_SEMICOLON)
+        -: 2823:    {
+    #####: 2824:      lexer_next_token (context_p);
+        -: 2825:    }
+        -: 2826:
+        -: 2827:    /* The last directive prologue can be the result of the script. */
+    #####: 2828:    if (!(context_p->status_flags & PARSER_IS_FUNCTION)
+    #####: 2829:        && (context_p->token.type != LEXER_LITERAL || context_p->token.lit_location.type != LEXER_STRING_LITERAL))
+        -: 2830:    {
+    #####: 2831:      lexer_construct_literal_object (context_p, &lit_location, LEXER_STRING_LITERAL);
+    #####: 2832:      parser_emit_cbc_literal_from_token (context_p, CBC_PUSH_LITERAL);
+    #####: 2833:      parser_emit_cbc (context_p, CBC_POP_BLOCK);
+    #####: 2834:      parser_flush_cbc (context_p);
+    #####: 2835:      break;
+        -: 2836:    }
+        -: 2837:  }
+        -: 2838:
+        2: 2839:  if (context_p->status_flags & PARSER_IS_STRICT && context_p->status_flags & PARSER_HAS_NON_STRICT_ARG)
+        -: 2840:  {
+    #####: 2841:    parser_raise_error (context_p, PARSER_ERR_NON_STRICT_ARG_DEFINITION);
+        -: 2842:  }
+        -: 2843:
+        4: 2844:  while (context_p->token.type != LEXER_EOS || context_p->stack_top_uint8 != PARSER_STATEMENT_START)
+        -: 2845:  {
+        -: 2846:#ifndef JERRY_NDEBUG
+        2: 2847:    JERRY_ASSERT (context_p->stack_depth == context_p->context_stack_depth);
+        -: 2848:#endif /* !JERRY_NDEBUG */
+        -: 2849:
+        -: 2850:#if JERRY_ESNEXT
+        2: 2851:    JERRY_ASSERT (context_p->stack_top_uint8 != PARSER_STATEMENT_PRIVATE_SCOPE
+        -: 2852:                  && context_p->stack_top_uint8 != PARSER_STATEMENT_PRIVATE_CONTEXT);
+        -: 2853:#endif /* JERRY_ESNEXT */
+        -: 2854:
+        -: 2855:#if JERRY_DEBUGGER
+        -: 2856:    if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED
+        -: 2857:        && context_p->token.line != context_p->last_breakpoint_line && context_p->token.type != LEXER_SEMICOLON
+        -: 2858:        && context_p->token.type != LEXER_LEFT_BRACE && context_p->token.type != LEXER_RIGHT_BRACE
+        -: 2859:        && context_p->token.type != LEXER_KEYW_VAR && context_p->token.type != LEXER_KEYW_LET
+        -: 2860:        && context_p->token.type != LEXER_KEYW_CONST && context_p->token.type != LEXER_KEYW_FUNCTION
+        -: 2861:        && context_p->token.type != LEXER_KEYW_CASE && context_p->token.type != LEXER_KEYW_DEFAULT)
+        -: 2862:    {
+        -: 2863:      parser_emit_cbc (context_p, CBC_BREAKPOINT_DISABLED);
+        -: 2864:      parser_flush_cbc (context_p);
+        -: 2865:
+        -: 2866:      parser_append_breakpoint_info (context_p, JERRY_DEBUGGER_BREAKPOINT_LIST, context_p->token.line);
+        -: 2867:
+        -: 2868:      context_p->last_breakpoint_line = context_p->token.line;
+        -: 2869:    }
+        -: 2870:#endif /* JERRY_DEBUGGER */
+        -: 2871:
+        -: 2872:#if JERRY_LINE_INFO
+        2: 2873:    if (context_p->token.type != LEXER_SEMICOLON && context_p->token.type != LEXER_LEFT_BRACE
+        2: 2874:        && context_p->token.type != LEXER_RIGHT_BRACE && context_p->token.type != LEXER_KEYW_VAR
+        1: 2875:        && context_p->token.type != LEXER_KEYW_LET && context_p->token.type != LEXER_KEYW_CONST
+        1: 2876:        && context_p->token.type != LEXER_KEYW_FUNCTION && context_p->token.type != LEXER_KEYW_CASE
+    #####: 2877:        && context_p->token.type != LEXER_KEYW_DEFAULT)
+        -: 2878:    {
+    #####: 2879:      parser_line_info_append (context_p, context_p->token.line, context_p->token.column);
+        -: 2880:    }
+        -: 2881:#endif /* JERRY_LINE_INFO */
+        -: 2882:
+        2: 2883:    switch (context_p->token.type)
+        -: 2884:    {
+    #####: 2885:      case LEXER_SEMICOLON:
+        -: 2886:      {
+    #####: 2887:        break;
+        -: 2888:      }
+        -: 2889:
+    #####: 2890:      case LEXER_RIGHT_BRACE:
+        -: 2891:      {
+    #####: 2892:        if (parser_statement_flags[context_p->stack_top_uint8] & PARSER_STATM_SINGLE_STATM)
+        -: 2893:        {
+    #####: 2894:          parser_raise_error (context_p, PARSER_ERR_STATEMENT_EXPECTED);
+        -: 2895:        }
+    #####: 2896:        break;
+        -: 2897:      }
+        -: 2898:
+    #####: 2899:      case LEXER_LEFT_BRACE:
+        -: 2900:      {
+        -: 2901:#if JERRY_ESNEXT
+    #####: 2902:        if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 2903:        {
+    #####: 2904:          parser_push_block_context (context_p, false);
+        -: 2905:        }
+        -: 2906:        else
+        -: 2907:        {
+    #####: 2908:          parser_stack_push_uint8 (context_p, PARSER_STATEMENT_BLOCK);
+        -: 2909:        }
+        -: 2910:#else /* !JERRY_ESNEXT */
+    #####: 2911:        parser_stack_push_uint8 (context_p, PARSER_STATEMENT_BLOCK);
+        -: 2912:#endif /* JERRY_ESNEXT */
+        -: 2913:
+    #####: 2914:        parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 2915:        lexer_next_token (context_p);
+    #####: 2916:        continue;
+        -: 2917:      }
+        -: 2918:
+        1: 2919:      case LEXER_KEYW_VAR:
+        -: 2920:#if JERRY_ESNEXT
+        -: 2921:      case LEXER_KEYW_LET:
+        -: 2922:      case LEXER_KEYW_CONST:
+        -: 2923:#endif /* JERRY_ESNEXT */
+        -: 2924:      {
+        1: 2925:        parser_parse_var_statement (context_p);
+    #####: 2926:        break;
+        -: 2927:      }
+        -: 2928:
+        -: 2929:#if JERRY_ESNEXT
+    #####: 2930:      case LEXER_KEYW_CLASS:
+        -: 2931:      {
+    #####: 2932:        parser_validate_lexical_context (context_p);
+    #####: 2933:        parser_parse_class (context_p, true);
+    #####: 2934:        goto consume_last_statement;
+        -: 2935:      }
+        -: 2936:#endif /* JERRY_ESNEXT */
+        -: 2937:
+        -: 2938:#if JERRY_MODULE_SYSTEM
+    #####: 2939:      case LEXER_KEYW_IMPORT:
+        -: 2940:      {
+    #####: 2941:        parser_parse_import_statement (context_p);
+    #####: 2942:        break;
+        -: 2943:      }
+        -: 2944:
+    #####: 2945:      case LEXER_KEYW_EXPORT:
+        -: 2946:      {
+    #####: 2947:        if (parser_parse_export_statement (context_p))
+        -: 2948:        {
+    #####: 2949:          goto consume_last_statement;
+        -: 2950:        }
+    #####: 2951:        break;
+        -: 2952:      }
+        -: 2953:#endif /* JERRY_MODULE_SYSTEM */
+        -: 2954:
+        1: 2955:      case LEXER_KEYW_FUNCTION:
+        -: 2956:      {
+        1: 2957:        parser_parse_function_statement (context_p);
+    #####: 2958:        goto consume_last_statement;
+        -: 2959:      }
+        -: 2960:
+    #####: 2961:      case LEXER_KEYW_IF:
+        -: 2962:      {
+    #####: 2963:        parser_parse_if_statement_start (context_p);
+    #####: 2964:        continue;
+        -: 2965:      }
+        -: 2966:
+    #####: 2967:      case LEXER_KEYW_SWITCH:
+        -: 2968:      {
+    #####: 2969:        parser_parse_switch_statement_start (context_p);
+    #####: 2970:        continue;
+        -: 2971:      }
+        -: 2972:
+    #####: 2973:      case LEXER_KEYW_DO:
+        -: 2974:      {
+    #####: 2975:        parser_do_while_statement_t do_while_statement;
+    #####: 2976:        parser_loop_statement_t loop;
+        -: 2977:
+    #####: 2978:        JERRY_ASSERT (context_p->last_cbc_opcode == PARSER_CBC_UNAVAILABLE);
+        -: 2979:
+    #####: 2980:        do_while_statement.start_offset = context_p->byte_code_size;
+    #####: 2981:        loop.branch_list_p = NULL;
+        -: 2982:
+    #####: 2983:        parser_stack_push (context_p, &do_while_statement, sizeof (parser_do_while_statement_t));
+    #####: 2984:        parser_stack_push (context_p, &loop, sizeof (parser_loop_statement_t));
+    #####: 2985:        parser_stack_push_uint8 (context_p, PARSER_STATEMENT_DO_WHILE);
+    #####: 2986:        parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 2987:        lexer_next_token (context_p);
+    #####: 2988:        continue;
+        -: 2989:      }
+        -: 2990:
+    #####: 2991:      case LEXER_KEYW_WHILE:
+        -: 2992:      {
+    #####: 2993:        parser_parse_while_statement_start (context_p);
+    #####: 2994:        continue;
+        -: 2995:      }
+        -: 2996:
+    #####: 2997:      case LEXER_KEYW_FOR:
+        -: 2998:      {
+    #####: 2999:        parser_parse_for_statement_start (context_p);
+    #####: 3000:        continue;
+        -: 3001:      }
+        -: 3002:
+    #####: 3003:      case LEXER_KEYW_WITH:
+        -: 3004:      {
+    #####: 3005:        parser_parse_with_statement_start (context_p);
+    #####: 3006:        continue;
+        -: 3007:      }
+        -: 3008:
+    #####: 3009:      case LEXER_KEYW_TRY:
+        -: 3010:      {
+    #####: 3011:        parser_try_statement_t try_statement;
+        -: 3012:
+    #####: 3013:        lexer_next_token (context_p);
+        -: 3014:
+    #####: 3015:        if (context_p->token.type != LEXER_LEFT_BRACE)
+        -: 3016:        {
+    #####: 3017:          parser_raise_error (context_p, PARSER_ERR_LEFT_BRACE_EXPECTED);
+        -: 3018:        }
+        -: 3019:
+        -: 3020:#ifndef JERRY_NDEBUG
+    #####: 3021:        PARSER_PLUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_TRY_CONTEXT_STACK_ALLOCATION);
+        -: 3022:#endif /* !JERRY_NDEBUG */
+        -: 3023:
+    #####: 3024:        try_statement.type = parser_try_block;
+    #####: 3025:        parser_emit_cbc_ext_forward_branch (context_p, CBC_EXT_TRY_CREATE_CONTEXT, &try_statement.branch);
+        -: 3026:
+        -: 3027:#if JERRY_ESNEXT
+    #####: 3028:        try_statement.scope_stack_top = context_p->scope_stack_top;
+    #####: 3029:        try_statement.scope_stack_reg_top = context_p->scope_stack_reg_top;
+        -: 3030:
+    #####: 3031:        if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 3032:        {
+    #####: 3033:          JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_BLOCK);
+        -: 3034:
+    #####: 3035:          if (scanner_is_context_needed (context_p, PARSER_CHECK_BLOCK_CONTEXT))
+        -: 3036:          {
+    #####: 3037:            parser_emit_cbc_ext (context_p, CBC_EXT_TRY_CREATE_ENV);
+        -: 3038:          }
+        -: 3039:
+    #####: 3040:          scanner_create_variables (context_p, SCANNER_CREATE_VARS_NO_OPTS);
+        -: 3041:        }
+        -: 3042:#endif /* JERRY_ESNEXT */
+        -: 3043:
+    #####: 3044:        parser_stack_push (context_p, &try_statement, sizeof (parser_try_statement_t));
+    #####: 3045:        parser_stack_push_uint8 (context_p, PARSER_STATEMENT_TRY);
+    #####: 3046:        parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 3047:        lexer_next_token (context_p);
+    #####: 3048:        continue;
+        -: 3049:      }
+        -: 3050:
+    #####: 3051:      case LEXER_KEYW_DEFAULT:
+        -: 3052:      {
+    #####: 3053:        parser_parse_default_statement (context_p);
+    #####: 3054:        continue;
+        -: 3055:      }
+        -: 3056:
+    #####: 3057:      case LEXER_KEYW_CASE:
+        -: 3058:      {
+    #####: 3059:        parser_parse_case_statement (context_p);
+    #####: 3060:        continue;
+        -: 3061:      }
+        -: 3062:
+    #####: 3063:      case LEXER_KEYW_BREAK:
+        -: 3064:      {
+    #####: 3065:        parser_parse_break_statement (context_p);
+    #####: 3066:        break;
+        -: 3067:      }
+        -: 3068:
+    #####: 3069:      case LEXER_KEYW_CONTINUE:
+        -: 3070:      {
+    #####: 3071:        parser_parse_continue_statement (context_p);
+    #####: 3072:        break;
+        -: 3073:      }
+        -: 3074:
+    #####: 3075:      case LEXER_KEYW_THROW:
+        -: 3076:      {
+    #####: 3077:        lexer_next_token (context_p);
+    #####: 3078:        if (context_p->token.flags & LEXER_WAS_NEWLINE)
+        -: 3079:        {
+    #####: 3080:          parser_raise_error (context_p, PARSER_ERR_EXPRESSION_EXPECTED);
+        -: 3081:        }
+    #####: 3082:        parser_parse_expression (context_p, PARSE_EXPR);
+    #####: 3083:        parser_emit_cbc (context_p, CBC_THROW);
+    #####: 3084:        break;
+        -: 3085:      }
+        -: 3086:
+    #####: 3087:      case LEXER_KEYW_RETURN:
+        -: 3088:      {
+    #####: 3089:        if (!(context_p->status_flags & PARSER_IS_FUNCTION))
+        -: 3090:        {
+    #####: 3091:          parser_raise_error (context_p, PARSER_ERR_INVALID_RETURN);
+        -: 3092:        }
+        -: 3093:#if JERRY_ESNEXT
+    #####: 3094:        if (context_p->status_flags & PARSER_IS_CLASS_STATIC_BLOCK)
+        -: 3095:        {
+    #####: 3096:          parser_raise_error (context_p, PARSER_ERR_INVALID_RETURN);
+        -: 3097:        }
+        -: 3098:#endif /* JERRY_ESNEXT */
+        -: 3099:
+    #####: 3100:        lexer_next_token (context_p);
+        -: 3101:
+    #####: 3102:        if ((context_p->token.flags & LEXER_WAS_NEWLINE) || context_p->token.type == LEXER_SEMICOLON
+    #####: 3103:            || context_p->token.type == LEXER_EOS || context_p->token.type == LEXER_RIGHT_BRACE)
+        -: 3104:        {
+        -: 3105:#if JERRY_ESNEXT
+    #####: 3106:          if (context_p->status_flags & PARSER_IS_ASYNC_FUNCTION)
+        -: 3107:          {
+    #####: 3108:            parser_emit_cbc_ext (context_p, CBC_EXT_RETURN_UNDEFINED);
+    #####: 3109:            break;
+        -: 3110:          }
+        -: 3111:#endif /* JERRY_ESNEXT */
+        -: 3112:
+    #####: 3113:          parser_emit_cbc (context_p, CBC_RETURN_FUNCTION_END);
+    #####: 3114:          break;
+        -: 3115:        }
+        -: 3116:
+    #####: 3117:        parser_parse_expression (context_p, PARSE_EXPR);
+        -: 3118:
+    #####: 3119:        if (context_p->last_cbc_opcode == CBC_PUSH_LITERAL)
+        -: 3120:        {
+    #####: 3121:          context_p->last_cbc_opcode = CBC_RETURN_WITH_LITERAL;
+    #####: 3122:          break;
+        -: 3123:        }
+        -: 3124:
+    #####: 3125:        parser_emit_cbc (context_p, CBC_RETURN);
+    #####: 3126:        break;
+        -: 3127:      }
+        -: 3128:
+    #####: 3129:      case LEXER_KEYW_DEBUGGER:
+        -: 3130:      {
+        -: 3131:#if JERRY_DEBUGGER
+        -: 3132:        /* This breakpoint location is not reported to the
+        -: 3133:         * debugger, so it is impossible to disable it. */
+        -: 3134:        if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 3135:        {
+        -: 3136:          parser_emit_cbc (context_p, CBC_BREAKPOINT_ENABLED);
+        -: 3137:        }
+        -: 3138:#endif /* JERRY_DEBUGGER */
+    #####: 3139:        lexer_next_token (context_p);
+    #####: 3140:        break;
+        -: 3141:      }
+        -: 3142:
+    #####: 3143:      case LEXER_LITERAL:
+        -: 3144:      {
+    #####: 3145:        if (context_p->token.lit_location.type == LEXER_IDENT_LITERAL)
+        -: 3146:        {
+    #####: 3147:          if (JERRY_UNLIKELY (lexer_check_next_character (context_p, LIT_CHAR_COLON)))
+        -: 3148:          {
+    #####: 3149:            parser_parse_label (context_p);
+    #####: 3150:            lexer_consume_next_character (context_p);
+    #####: 3151:            lexer_next_token (context_p);
+    #####: 3152:            continue;
+        -: 3153:          }
+        -: 3154:#if JERRY_ESNEXT
+    #####: 3155:          if (JERRY_UNLIKELY (lexer_token_is_let (context_p)))
+        -: 3156:          {
+    #####: 3157:            if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 3158:            {
+    #####: 3159:              if (context_p->next_scanner_info_p->type == SCANNER_TYPE_LET_EXPRESSION)
+        -: 3160:              {
+    #####: 3161:                scanner_release_next (context_p, sizeof (scanner_info_t));
+        -: 3162:              }
+        -: 3163:
+    #####: 3164:              if (context_p->status_flags & PARSER_IS_FUNCTION)
+        -: 3165:              {
+    #####: 3166:                parser_parse_expression_statement (context_p, PARSE_EXPR);
+    #####: 3167:                break;
+        -: 3168:              }
+        -: 3169:
+    #####: 3170:              parser_parse_block_expression (context_p, PARSE_EXPR);
+    #####: 3171:              break;
+        -: 3172:            }
+        -: 3173:
+    #####: 3174:            context_p->token.type = LEXER_KEYW_LET;
+    #####: 3175:            parser_parse_var_statement (context_p);
+    #####: 3176:            break;
+        -: 3177:          }
+        -: 3178:
+    #####: 3179:          if (JERRY_UNLIKELY (lexer_token_is_async (context_p))
+    #####: 3180:              && context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 3181:          {
+    #####: 3182:            bool is_statement = true;
+        -: 3183:
+    #####: 3184:            if (context_p->next_scanner_info_p->type == SCANNER_TYPE_FUNCTION)
+        -: 3185:            {
+    #####: 3186:              is_statement = (context_p->next_scanner_info_p->u8_arg & SCANNER_FUNCTION_STATEMENT) != 0;
+        -: 3187:
+    #####: 3188:              JERRY_ASSERT (!is_statement || (context_p->next_scanner_info_p->u8_arg & SCANNER_FUNCTION_ASYNC));
+        -: 3189:            }
+        -: 3190:            else
+        -: 3191:            {
+    #####: 3192:              JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_ERR_ASYNC_FUNCTION);
+        -: 3193:
+    #####: 3194:              scanner_release_next (context_p, sizeof (scanner_info_t));
+        -: 3195:            }
+        -: 3196:
+    #####: 3197:            if (is_statement)
+        -: 3198:            {
+    #####: 3199:              if (parser_statement_flags[context_p->stack_top_uint8] & PARSER_STATM_SINGLE_STATM)
+        -: 3200:              {
+    #####: 3201:                parser_raise_error (context_p, PARSER_ERR_LEXICAL_SINGLE_STATEMENT);
+        -: 3202:              }
+        -: 3203:
+        -: 3204:#if JERRY_FUNCTION_TO_STRING
+    #####: 3205:              context_p->function_start_p = context_p->token.lit_location.char_p;
+        -: 3206:#endif /* JERRY_FUNCTION_TO_STRING */
+    #####: 3207:              lexer_next_token (context_p);
+    #####: 3208:              JERRY_ASSERT (context_p->token.type == LEXER_KEYW_FUNCTION);
+    #####: 3209:              continue;
+        -: 3210:            }
+        -: 3211:          }
+        -: 3212:#endif /* JERRY_ESNEXT */
+        -: 3213:        }
+        -: 3214:        /* FALLTHRU */
+        -: 3215:      }
+        -: 3216:
+        -: 3217:      default:
+        -: 3218:      {
+    #####: 3219:        int options = PARSE_EXPR;
+        -: 3220:
+    #####: 3221:        if (context_p->token.type == LEXER_EXPRESSION_START)
+        -: 3222:        {
+        -: 3223:          /* Restore the token type form the extra_value. */
+    #####: 3224:          context_p->token.type = context_p->token.extra_value;
+    #####: 3225:          options |= PARSE_EXPR_HAS_LITERAL;
+        -: 3226:        }
+        -: 3227:
+    #####: 3228:        if (context_p->status_flags & PARSER_IS_FUNCTION)
+        -: 3229:        {
+    #####: 3230:          parser_parse_expression_statement (context_p, options);
+        -: 3231:        }
+        -: 3232:        else
+        -: 3233:        {
+    #####: 3234:          parser_parse_block_expression (context_p, options);
+        -: 3235:        }
+        -: 3236:
+    #####: 3237:        break;
+        -: 3238:      }
+        -: 3239:    }
+        -: 3240:
+    #####: 3241:    parser_flush_cbc (context_p);
+        -: 3242:
+    #####: 3243:    if (context_p->token.type == LEXER_RIGHT_BRACE)
+        -: 3244:    {
+    #####: 3245:      if (context_p->stack_top_uint8 == PARSER_STATEMENT_BLOCK)
+        -: 3246:      {
+    #####: 3247:        parser_stack_pop_uint8 (context_p);
+    #####: 3248:        parser_stack_iterator_init (context_p, &context_p->last_statement);
+    #####: 3249:        lexer_next_token (context_p);
+        -: 3250:      }
+        -: 3251:#if JERRY_ESNEXT
+    #####: 3252:      else if (context_p->stack_top_uint8 == PARSER_STATEMENT_BLOCK_SCOPE
+    #####: 3253:               || context_p->stack_top_uint8 == PARSER_STATEMENT_BLOCK_CONTEXT)
+        -: 3254:      {
+    #####: 3255:        parser_pop_block_context (context_p);
+    #####: 3256:        lexer_next_token (context_p);
+        -: 3257:      }
+        -: 3258:#endif /* JERRY_ESNEXT */
+    #####: 3259:      else if (context_p->stack_top_uint8 == PARSER_STATEMENT_SWITCH
+    #####: 3260:               || context_p->stack_top_uint8 == PARSER_STATEMENT_SWITCH_NO_DEFAULT)
+        -: 3261:      {
+    #####: 3262:        int has_default = (context_p->stack_top_uint8 == PARSER_STATEMENT_SWITCH);
+    #####: 3263:        parser_loop_statement_t loop;
+    #####: 3264:        parser_switch_statement_t switch_statement;
+        -: 3265:
+    #####: 3266:        parser_stack_pop_uint8 (context_p);
+    #####: 3267:        parser_stack_pop (context_p, &loop, sizeof (parser_loop_statement_t));
+    #####: 3268:        parser_stack_pop (context_p, &switch_statement, sizeof (parser_switch_statement_t));
+    #####: 3269:        parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 3270:
+    #####: 3271:        JERRY_ASSERT (switch_statement.branch_list_p == NULL);
+        -: 3272:
+    #####: 3273:        if (!has_default)
+        -: 3274:        {
+    #####: 3275:          parser_set_branch_to_current_position (context_p, &switch_statement.default_branch);
+        -: 3276:        }
+        -: 3277:
+    #####: 3278:        parser_set_breaks_to_current_position (context_p, loop.branch_list_p);
+    #####: 3279:        lexer_next_token (context_p);
+        -: 3280:
+        -: 3281:#if JERRY_ESNEXT
+    #####: 3282:        if (context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_SCOPE
+    #####: 3283:            || context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_CONTEXT)
+        -: 3284:        {
+    #####: 3285:          parser_pop_block_context (context_p);
+        -: 3286:        }
+        -: 3287:#endif /* JERRY_ESNEXT */
+        -: 3288:      }
+    #####: 3289:      else if (context_p->stack_top_uint8 == PARSER_STATEMENT_TRY)
+        -: 3290:      {
+    #####: 3291:        parser_parse_try_statement_end (context_p);
+        -: 3292:      }
+    #####: 3293:      else if (context_p->stack_top_uint8 == PARSER_STATEMENT_START)
+        -: 3294:      {
+    #####: 3295:        if (context_p->status_flags & PARSER_IS_CLOSURE)
+        -: 3296:        {
+        -: 3297:#if JERRY_LINE_INFO
+    #####: 3298:          if (context_p->line_info_p == NULL)
+        -: 3299:          {
+    #####: 3300:            parser_line_info_append (context_p, context_p->token.line, context_p->token.column);
+        -: 3301:          }
+        -: 3302:#endif /* JERRY_LINE_INFO */
+        -: 3303:
+        -: 3304:#if JERRY_FUNCTION_TO_STRING
+    #####: 3305:          context_p->function_end_p = context_p->source_p;
+        -: 3306:#endif /* JERRY_FUNCTION_TO_STRING */
+        -: 3307:
+    #####: 3308:          parser_stack_pop_uint8 (context_p);
+    #####: 3309:          context_p->last_statement.current_p = NULL;
+        -: 3310:          /* There is no lexer_next_token here, since the
+        -: 3311:           * next token belongs to the parent context. */
+    #####: 3312:          return;
+        -: 3313:        }
+    #####: 3314:        parser_raise_error (context_p, PARSER_ERR_INVALID_RIGHT_SQUARE);
+        -: 3315:      }
+        -: 3316:    }
+    #####: 3317:    else if (context_p->token.type == LEXER_SEMICOLON)
+        -: 3318:    {
+    #####: 3319:      lexer_next_token (context_p);
+        -: 3320:    }
+    #####: 3321:    else if (context_p->token.type != LEXER_EOS && !(context_p->token.flags & LEXER_WAS_NEWLINE))
+        -: 3322:    {
+    #####: 3323:      parser_raise_error (context_p, PARSER_ERR_SEMICOLON_EXPECTED);
+        -: 3324:    }
+        -: 3325:
+    #####: 3326:consume_last_statement:
+        -: 3327:    while (true)
+        -: 3328:    {
+    #####: 3329:      switch (context_p->stack_top_uint8)
+        -: 3330:      {
+    #####: 3331:        case PARSER_STATEMENT_LABEL:
+        -: 3332:        {
+    #####: 3333:          parser_label_statement_t label;
+        -: 3334:
+    #####: 3335:          parser_stack_pop_uint8 (context_p);
+    #####: 3336:          parser_stack_pop (context_p, &label, sizeof (parser_label_statement_t));
+    #####: 3337:          parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 3338:
+    #####: 3339:          parser_set_breaks_to_current_position (context_p, label.break_list_p);
+    #####: 3340:          continue;
+        -: 3341:        }
+        -: 3342:
+    #####: 3343:        case PARSER_STATEMENT_IF:
+        -: 3344:        {
+    #####: 3345:          if (parser_parse_if_statement_end (context_p))
+        -: 3346:          {
+    #####: 3347:            break;
+        -: 3348:          }
+    #####: 3349:          continue;
+        -: 3350:        }
+        -: 3351:
+    #####: 3352:        case PARSER_STATEMENT_ELSE:
+        -: 3353:        {
+    #####: 3354:          parser_if_else_statement_t else_statement;
+        -: 3355:
+    #####: 3356:          parser_stack_pop_uint8 (context_p);
+    #####: 3357:          parser_stack_pop (context_p, &else_statement, sizeof (parser_if_else_statement_t));
+    #####: 3358:          parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 3359:
+    #####: 3360:          parser_set_branch_to_current_position (context_p, &else_statement.branch);
+    #####: 3361:          continue;
+        -: 3362:        }
+        -: 3363:
+    #####: 3364:        case PARSER_STATEMENT_DO_WHILE:
+        -: 3365:        {
+    #####: 3366:          parser_parse_do_while_statement_end (context_p);
+    #####: 3367:          if (context_p->token.type == LEXER_SEMICOLON)
+        -: 3368:          {
+    #####: 3369:            lexer_next_token (context_p);
+        -: 3370:          }
+    #####: 3371:          continue;
+        -: 3372:        }
+        -: 3373:
+    #####: 3374:        case PARSER_STATEMENT_WHILE:
+        -: 3375:        {
+    #####: 3376:          parser_parse_while_statement_end (context_p);
+    #####: 3377:          continue;
+        -: 3378:        }
+        -: 3379:
+    #####: 3380:        case PARSER_STATEMENT_FOR:
+        -: 3381:        {
+    #####: 3382:          parser_parse_for_statement_end (context_p);
+    #####: 3383:          continue;
+        -: 3384:        }
+        -: 3385:
+    #####: 3386:        case PARSER_STATEMENT_FOR_IN:
+        -: 3387:#if JERRY_ESNEXT
+        -: 3388:        case PARSER_STATEMENT_FOR_OF:
+        -: 3389:        case PARSER_STATEMENT_FOR_AWAIT_OF:
+        -: 3390:#endif /* JERRY_ESNEXT */
+        -: 3391:        {
+    #####: 3392:          parser_for_in_of_statement_t for_in_of_statement;
+    #####: 3393:          parser_loop_statement_t loop;
+        -: 3394:
+        -: 3395:#if JERRY_ESNEXT
+    #####: 3396:          uint8_t for_type = context_p->stack_top_uint8;
+        -: 3397:#endif /* JERRY_ESNEXT */
+        -: 3398:
+    #####: 3399:          parser_stack_pop_uint8 (context_p);
+    #####: 3400:          parser_stack_pop (context_p, &loop, sizeof (parser_loop_statement_t));
+    #####: 3401:          parser_stack_pop (context_p, &for_in_of_statement, sizeof (parser_for_in_of_statement_t));
+    #####: 3402:          parser_stack_iterator_init (context_p, &context_p->last_statement);
+        -: 3403:
+    #####: 3404:          parser_set_continues_to_current_position (context_p, loop.branch_list_p);
+        -: 3405:
+    #####: 3406:          parser_flush_cbc (context_p);
+        -: 3407:
+    #####: 3408:          uint16_t stack_allocation = PARSER_FOR_IN_CONTEXT_STACK_ALLOCATION;
+        -: 3409:#if JERRY_ESNEXT
+    #####: 3410:          if (for_type != PARSER_STATEMENT_FOR_IN)
+        -: 3411:          {
+    #####: 3412:            stack_allocation = (for_type == PARSER_STATEMENT_FOR_OF ? PARSER_FOR_OF_CONTEXT_STACK_ALLOCATION
+        -: 3413:                                                                    : PARSER_FOR_AWAIT_OF_CONTEXT_STACK_ALLOCATION);
+        -: 3414:          }
+        -: 3415:#endif /* JERRY_ESNEXT */
+        -: 3416:
+    #####: 3417:          PARSER_MINUS_EQUAL_U16 (context_p->stack_depth, stack_allocation);
+        -: 3418:#ifndef JERRY_NDEBUG
+    #####: 3419:          PARSER_MINUS_EQUAL_U16 (context_p->context_stack_depth, stack_allocation);
+        -: 3420:#endif /* !JERRY_NDEBUG */
+        -: 3421:
+    #####: 3422:          cbc_ext_opcode_t opcode = CBC_EXT_BRANCH_IF_FOR_IN_HAS_NEXT;
+        -: 3423:
+        -: 3424:#if JERRY_ESNEXT
+    #####: 3425:          if (for_type != PARSER_STATEMENT_FOR_IN)
+        -: 3426:          {
+    #####: 3427:            opcode = (for_type == PARSER_STATEMENT_FOR_OF ? CBC_EXT_BRANCH_IF_FOR_OF_HAS_NEXT
+    #####: 3428:                                                          : CBC_EXT_BRANCH_IF_FOR_AWAIT_OF_HAS_NEXT);
+        -: 3429:          }
+        -: 3430:#endif /* JERRY_ESNEXT */
+        -: 3431:
+    #####: 3432:          parser_emit_cbc_ext_backward_branch (context_p, opcode, for_in_of_statement.start_offset);
+        -: 3433:
+    #####: 3434:          parser_set_breaks_to_current_position (context_p, loop.branch_list_p);
+    #####: 3435:          parser_set_branch_to_current_position (context_p, &for_in_of_statement.branch);
+        -: 3436:
+        -: 3437:#if JERRY_ESNEXT
+    #####: 3438:          if (context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_SCOPE
+    #####: 3439:              || context_p->stack_top_uint8 == PARSER_STATEMENT_PRIVATE_CONTEXT)
+        -: 3440:          {
+    #####: 3441:            parser_pop_block_context (context_p);
+        -: 3442:          }
+        -: 3443:#endif /* JERRY_ESNEXT */
+    #####: 3444:          continue;
+        -: 3445:        }
+        -: 3446:
+    #####: 3447:        case PARSER_STATEMENT_WITH:
+        -: 3448:        {
+    #####: 3449:          parser_parse_with_statement_end (context_p);
+    #####: 3450:          continue;
+        -: 3451:        }
+        -: 3452:
+    #####: 3453:        default:
+        -: 3454:        {
+    #####: 3455:          break;
+        -: 3456:        }
+        -: 3457:      }
+    #####: 3458:      break;
+        -: 3459:    }
+        -: 3460:  }
+        -: 3461:
+    #####: 3462:  parser_stack_pop_uint8 (context_p);
+    #####: 3463:  context_p->last_statement.current_p = NULL;
+        -: 3464:
+    #####: 3465:  if (context_p->status_flags & PARSER_IS_CLOSURE)
+        -: 3466:  {
+    #####: 3467:    parser_raise_error (context_p, PARSER_ERR_STATEMENT_EXPECTED);
+        -: 3468:  }
+        -: 3469:
+        -: 3470:#if JERRY_LINE_INFO
+    #####: 3471:  if (context_p->line_info_p == NULL)
+        -: 3472:  {
+    #####: 3473:    parser_line_info_append (context_p, context_p->token.line, context_p->token.column);
+        -: 3474:  }
+        -: 3475:#endif /* JERRY_LINE_INFO */
+        -: 3476:} /* parser_parse_statements */
+        -: 3477:
+        -: 3478:/**
+        -: 3479: * Free jumps stored on the stack if a parse error is occurred.
+        -: 3480: */
+        -: 3481:void JERRY_ATTR_NOINLINE
+    #####: 3482:parser_free_jumps (parser_stack_iterator_t iterator) /**< iterator position */
+        -: 3483:{
+        -: 3484:  while (true)
+    #####: 3485:  {
+    #####: 3486:    uint8_t type = parser_stack_iterator_read_uint8 (&iterator);
+    #####: 3487:    parser_branch_node_t *branch_list_p = NULL;
+        -: 3488:
+    #####: 3489:    switch (type)
+        -: 3490:    {
+    #####: 3491:      case PARSER_STATEMENT_START:
+        -: 3492:      {
+    #####: 3493:        return;
+        -: 3494:      }
+        -: 3495:
+    #####: 3496:      case PARSER_STATEMENT_LABEL:
+        -: 3497:      {
+    #####: 3498:        parser_label_statement_t label;
+        -: 3499:
+    #####: 3500:        parser_stack_iterator_skip (&iterator, 1);
+    #####: 3501:        parser_stack_iterator_read (&iterator, &label, sizeof (parser_label_statement_t));
+    #####: 3502:        parser_stack_iterator_skip (&iterator, sizeof (parser_label_statement_t));
+    #####: 3503:        branch_list_p = label.break_list_p;
+    #####: 3504:        break;
+        -: 3505:      }
+        -: 3506:
+    #####: 3507:      case PARSER_STATEMENT_SWITCH:
+        -: 3508:      case PARSER_STATEMENT_SWITCH_NO_DEFAULT:
+        -: 3509:      {
+    #####: 3510:        parser_switch_statement_t switch_statement;
+    #####: 3511:        parser_loop_statement_t loop;
+        -: 3512:
+    #####: 3513:        parser_stack_iterator_skip (&iterator, 1);
+    #####: 3514:        parser_stack_iterator_read (&iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 3515:        parser_stack_iterator_skip (&iterator, sizeof (parser_loop_statement_t));
+    #####: 3516:        parser_stack_iterator_read (&iterator, &switch_statement, sizeof (parser_switch_statement_t));
+    #####: 3517:        parser_stack_iterator_skip (&iterator, sizeof (parser_switch_statement_t));
+        -: 3518:
+    #####: 3519:        branch_list_p = switch_statement.branch_list_p;
+    #####: 3520:        while (branch_list_p != NULL)
+        -: 3521:        {
+    #####: 3522:          parser_branch_node_t *next_p = branch_list_p->next_p;
+    #####: 3523:          parser_free (branch_list_p, sizeof (parser_branch_node_t));
+    #####: 3524:          branch_list_p = next_p;
+        -: 3525:        }
+    #####: 3526:        branch_list_p = loop.branch_list_p;
+    #####: 3527:        break;
+        -: 3528:      }
+        -: 3529:
+    #####: 3530:      case PARSER_STATEMENT_DO_WHILE:
+        -: 3531:      case PARSER_STATEMENT_WHILE:
+        -: 3532:      case PARSER_STATEMENT_FOR:
+        -: 3533:      case PARSER_STATEMENT_FOR_IN:
+        -: 3534:#if JERRY_ESNEXT
+        -: 3535:      case PARSER_STATEMENT_FOR_OF:
+        -: 3536:#endif /* JERRY_ESNEXT */
+        -: 3537:      {
+    #####: 3538:        parser_loop_statement_t loop;
+        -: 3539:
+    #####: 3540:        parser_stack_iterator_skip (&iterator, 1);
+    #####: 3541:        parser_stack_iterator_read (&iterator, &loop, sizeof (parser_loop_statement_t));
+    #####: 3542:        parser_stack_iterator_skip (&iterator, parser_statement_length (type) - 1);
+    #####: 3543:        branch_list_p = loop.branch_list_p;
+    #####: 3544:        break;
+        -: 3545:      }
+        -: 3546:
+    #####: 3547:      default:
+        -: 3548:      {
+    #####: 3549:        parser_stack_iterator_skip (&iterator, parser_statement_length (type));
+    #####: 3550:        continue;
+        -: 3551:      }
+        -: 3552:    }
+        -: 3553:
+    #####: 3554:    while (branch_list_p != NULL)
+        -: 3555:    {
+    #####: 3556:      parser_branch_node_t *next_p = branch_list_p->next_p;
+    #####: 3557:      parser_free (branch_list_p, sizeof (parser_branch_node_t));
+    #####: 3558:      branch_list_p = next_p;
+        -: 3559:    }
+        -: 3560:  }
+        -: 3561:} /* parser_free_jumps */
+        -: 3562:
+        -: 3563:/**
+        -: 3564: * @}
+        -: 3565: * @}
+        -: 3566: * @}
+        -: 3567: */
+        -: 3568:
+        -: 3569:#endif /* JERRY_PARSER */

@@ -1,0 +1,2816 @@
+        -:    0:Source:/home/workspace/jerry-core/parser/js/js-parser.c
+        -:    0:Programs:274
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "debugger.h"
+        -:   17:#include "ecma-exceptions.h"
+        -:   18:#include "ecma-helpers.h"
+        -:   19:#include "ecma-literal-storage.h"
+        -:   20:#include "ecma-module.h"
+        -:   21:#include "jcontext.h"
+        -:   22:#include "js-parser-internal.h"
+        -:   23:
+        -:   24:#if ENABLED (JERRY_PARSER)
+        -:   25:
+        -:   26:JERRY_STATIC_ASSERT ((int) ECMA_PARSE_STRICT_MODE == (int) PARSER_IS_STRICT,
+        -:   27:                     ecma_parse_strict_mode_must_be_equal_to_parser_is_strict);
+        -:   28:
+        -:   29:#if ENABLED (JERRY_ES2015)
+        -:   30:JERRY_STATIC_ASSERT ((ECMA_PARSE_CLASS_CONSTRUCTOR << PARSER_SAVED_FLAGS_OFFSET) == PARSER_CLASS_CONSTRUCTOR,
+        -:   31:                     ecma_saved_parse_options_must_be_transformed_to_ecma_general_flags);
+        -:   32:#endif /* ENABLED (JERRY_ES2015) */
+        -:   33:
+        -:   34:/** \addtogroup parser Parser
+        -:   35: * @{
+        -:   36: *
+        -:   37: * \addtogroup jsparser JavaScript
+        -:   38: * @{
+        -:   39: *
+        -:   40: * \addtogroup jsparser_parser Parser
+        -:   41: * @{
+        -:   42: */
+        -:   43:
+        -:   44:/**
+        -:   45: * Compute real literal indicies.
+        -:   46: *
+        -:   47: * @return length of the prefix opcodes
+        -:   48: */
+        -:   49:static void
+        3:   50:parser_compute_indicies (parser_context_t *context_p, /**< context */
+        -:   51:                         uint16_t *ident_end, /**< end of the identifier group */
+        -:   52:                         uint16_t *const_literal_end) /**< end of the const literal group */
+        -:   53:{
+        3:   54:  parser_list_iterator_t literal_iterator;
+        -:   55:  lexer_literal_t *literal_p;
+        -:   56:
+        3:   57:  uint16_t ident_count = 0;
+        3:   58:  uint16_t const_literal_count = 0;
+        -:   59:
+        -:   60:  uint16_t ident_index;
+        -:   61:  uint16_t const_literal_index;
+        -:   62:  uint16_t literal_index;
+        -:   63:
+        -:   64:  /* First phase: count the number of items in each group. */
+        3:   65:  parser_list_iterator_init (&context_p->literal_pool, &literal_iterator);
+       40:   66:  while ((literal_p = (lexer_literal_t *) parser_list_iterator_next (&literal_iterator)))
+        -:   67:  {
+       34:   68:    switch (literal_p->type)
+        -:   69:    {
+       24:   70:      case LEXER_IDENT_LITERAL:
+        -:   71:      {
+       24:   72:        if (literal_p->status_flags & LEXER_FLAG_USED)
+        -:   73:        {
+       24:   74:          ident_count++;
+       24:   75:          break;
+        -:   76:        }
+        -:   77:#if !ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+    #####:   78:        else if (!(literal_p->status_flags & LEXER_FLAG_SOURCE_PTR))
+        -:   79:        {
+    #####:   80:          jmem_heap_free_block ((void *) literal_p->u.char_p, literal_p->prop.length);
+        -:   81:          /* This literal should not be freed even if an error is encountered later. */
+    #####:   82:          literal_p->status_flags |= LEXER_FLAG_SOURCE_PTR;
+        -:   83:        }
+        -:   84:#endif /* !ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+    #####:   85:        continue;
+        -:   86:      }
+        5:   87:      case LEXER_STRING_LITERAL:
+        -:   88:      {
+        5:   89:        const_literal_count++;
+        5:   90:        break;
+        -:   91:      }
+        3:   92:      case LEXER_NUMBER_LITERAL:
+        -:   93:      {
+        3:   94:        const_literal_count++;
+        3:   95:        continue;
+        -:   96:      }
+        2:   97:      case LEXER_FUNCTION_LITERAL:
+        -:   98:      case LEXER_REGEXP_LITERAL:
+        -:   99:      {
+        2:  100:        continue;
+        -:  101:      }
+    #####:  102:      default:
+        -:  103:      {
+    #####:  104:        JERRY_ASSERT (literal_p->type == LEXER_UNUSED_LITERAL);
+    #####:  105:        continue;
+        -:  106:      }
+        -:  107:    }
+        -:  108:
+        -:  109:#if !ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+       29:  110:    const uint8_t *char_p = literal_p->u.char_p;
+       29:  111:    uint32_t status_flags = context_p->status_flags;
+        -:  112:
+       29:  113:    if ((literal_p->status_flags & LEXER_FLAG_SOURCE_PTR)
+       29:  114:        && literal_p->prop.length < 0xfff)
+        -:  115:    {
+       29:  116:      size_t bytes_to_end = (size_t) (context_p->source_end_p - char_p);
+        -:  117:
+       29:  118:      if (bytes_to_end < 0xfffff)
+        -:  119:      {
+       27:  120:        literal_p->u.source_data = ((uint32_t) bytes_to_end) | (((uint32_t) literal_p->prop.length) << 20);
+       27:  121:        literal_p->status_flags |= LEXER_FLAG_LATE_INIT;
+       27:  122:        status_flags |= PARSER_HAS_LATE_LIT_INIT;
+       27:  123:        context_p->status_flags = status_flags;
+       27:  124:        char_p = NULL;
+        -:  125:      }
+        -:  126:    }
+        -:  127:
+       29:  128:    if (char_p != NULL)
+        -:  129:    {
+        2:  130:      literal_p->u.value = ecma_find_or_create_literal_string (char_p,
+        2:  131:                                                               literal_p->prop.length);
+        -:  132:
+        2:  133:      if (!(literal_p->status_flags & LEXER_FLAG_SOURCE_PTR))
+        -:  134:      {
+    #####:  135:        jmem_heap_free_block ((void *) char_p, literal_p->prop.length);
+        -:  136:        /* This literal should not be freed even if an error is encountered later. */
+    #####:  137:        literal_p->status_flags |= LEXER_FLAG_SOURCE_PTR;
+        -:  138:      }
+        -:  139:    }
+        -:  140:#endif /* !ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  141:  }
+        -:  142:
+        3:  143:  ident_index = context_p->register_count;
+        3:  144:  const_literal_index = (uint16_t) (ident_index + ident_count);
+        3:  145:  literal_index = (uint16_t) (const_literal_index + const_literal_count);
+        -:  146:
+        -:  147:  /* Second phase: Assign an index to each literal. */
+        3:  148:  parser_list_iterator_init (&context_p->literal_pool, &literal_iterator);
+        -:  149:
+       40:  150:  while ((literal_p = (lexer_literal_t *) parser_list_iterator_next (&literal_iterator)))
+        -:  151:  {
+       34:  152:    switch (literal_p->type)
+        -:  153:    {
+       24:  154:      case LEXER_IDENT_LITERAL:
+        -:  155:      {
+       24:  156:        if (literal_p->status_flags & LEXER_FLAG_USED)
+        -:  157:        {
+       24:  158:          literal_p->prop.index = ident_index;
+       24:  159:          ident_index++;
+        -:  160:        }
+       24:  161:        break;
+        -:  162:      }
+        8:  163:      case LEXER_STRING_LITERAL:
+        -:  164:      case LEXER_NUMBER_LITERAL:
+        -:  165:      {
+        8:  166:        JERRY_ASSERT ((literal_p->status_flags & ~(LEXER_FLAG_SOURCE_PTR | LEXER_FLAG_LATE_INIT)) == 0);
+        8:  167:        literal_p->prop.index = const_literal_index;
+        8:  168:        const_literal_index++;
+        8:  169:        break;
+        -:  170:      }
+        2:  171:      case LEXER_FUNCTION_LITERAL:
+        -:  172:      case LEXER_REGEXP_LITERAL:
+        -:  173:      {
+        2:  174:        JERRY_ASSERT (literal_p->status_flags == 0);
+        -:  175:
+        2:  176:        literal_p->prop.index = literal_index;
+        2:  177:        literal_index++;
+        2:  178:        break;
+        -:  179:      }
+    #####:  180:      default:
+        -:  181:      {
+    #####:  182:        JERRY_ASSERT (literal_p->type == LEXER_UNUSED_LITERAL
+        -:  183:                      && literal_p->status_flags == LEXER_FLAG_FUNCTION_ARGUMENT);
+    #####:  184:        break;
+        -:  185:      }
+        -:  186:    }
+        -:  187:  }
+        -:  188:
+        3:  189:  JERRY_ASSERT (ident_index == context_p->register_count + ident_count);
+        3:  190:  JERRY_ASSERT (const_literal_index == ident_index + const_literal_count);
+        3:  191:  JERRY_ASSERT (literal_index <= context_p->register_count + context_p->literal_count);
+        -:  192:
+        3:  193:  context_p->literal_count = literal_index;
+        -:  194:
+        3:  195:  *ident_end = ident_index;
+        3:  196:  *const_literal_end = const_literal_index;
+        3:  197:} /* parser_compute_indicies */
+        -:  198:
+        -:  199:/**
+        -:  200: * Initialize literal pool.
+        -:  201: */
+        -:  202:static void
+        3:  203:parser_init_literal_pool (parser_context_t *context_p, /**< context */
+        -:  204:                          ecma_value_t *literal_pool_p) /**< start of literal pool */
+        -:  205:{
+        3:  206:  parser_list_iterator_t literal_iterator;
+        -:  207:  lexer_literal_t *literal_p;
+        -:  208:
+        3:  209:  parser_list_iterator_init (&context_p->literal_pool, &literal_iterator);
+        -:  210:
+       40:  211:  while ((literal_p = (lexer_literal_t *) parser_list_iterator_next (&literal_iterator)))
+        -:  212:  {
+       34:  213:    switch (literal_p->type)
+        -:  214:    {
+       24:  215:      case LEXER_IDENT_LITERAL:
+        -:  216:      {
+       24:  217:        if (!(literal_p->status_flags & LEXER_FLAG_USED))
+        -:  218:        {
+    #####:  219:          break;
+        -:  220:        }
+        -:  221:        /* FALLTHRU */
+        -:  222:      }
+        -:  223:      case LEXER_STRING_LITERAL:
+        -:  224:      {
+        -:  225:        ecma_value_t lit_value;
+        -:  226:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  227:        lit_value = ecma_find_or_create_literal_string (literal_p->u.char_p,
+        -:  228:                                                        literal_p->prop.length);
+        -:  229:#else /* !ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+       29:  230:        lit_value = literal_p->u.value;
+        -:  231:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  232:
+       29:  233:        JERRY_ASSERT (literal_p->prop.index >= context_p->register_count);
+       29:  234:        literal_pool_p[literal_p->prop.index] = lit_value;
+        -:  235:
+        -:  236:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  237:        if (!context_p->is_show_opcodes
+        -:  238:            && !(literal_p->status_flags & LEXER_FLAG_SOURCE_PTR))
+        -:  239:        {
+        -:  240:          jmem_heap_free_block ((void *) literal_p->u.char_p, literal_p->prop.length);
+        -:  241:        }
+        -:  242:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+       29:  243:        break;
+        -:  244:      }
+        3:  245:      case LEXER_NUMBER_LITERAL:
+        -:  246:      {
+        3:  247:        JERRY_ASSERT (literal_p->prop.index >= context_p->register_count);
+        -:  248:
+        3:  249:        literal_pool_p[literal_p->prop.index] = literal_p->u.value;
+        3:  250:        break;
+        -:  251:      }
+        2:  252:      case LEXER_FUNCTION_LITERAL:
+        -:  253:      case LEXER_REGEXP_LITERAL:
+        -:  254:      {
+        2:  255:        JERRY_ASSERT (literal_p->prop.index >= context_p->register_count);
+        -:  256:
+        2:  257:        ECMA_SET_INTERNAL_VALUE_POINTER (literal_pool_p[literal_p->prop.index],
+        -:  258:                                         literal_p->u.bytecode_p);
+        2:  259:        break;
+        -:  260:      }
+    #####:  261:      default:
+        -:  262:      {
+    #####:  263:        JERRY_ASSERT (literal_p->type == LEXER_UNUSED_LITERAL);
+    #####:  264:        break;
+        -:  265:      }
+        -:  266:    }
+    #####:  267:  }
+        3:  268:} /* parser_init_literal_pool */
+        -:  269:
+        -:  270:/*
+        -:  271: * During byte code post processing certain bytes are not
+        -:  272: * copied into the final byte code buffer. For example, if
+        -:  273: * one byte is enough for encoding a literal index, the
+        -:  274: * second byte is not copied. However, when a byte is skipped,
+        -:  275: * the offsets of those branches which crosses (jumps over)
+        -:  276: * that byte code should also be decreased by one. Instead
+        -:  277: * of finding these jumps every time when a byte is skipped,
+        -:  278: * all branch offset updates are computed in one step.
+        -:  279: *
+        -:  280: * Branch offset mapping example:
+        -:  281: *
+        -:  282: * Let's assume that each parser_mem_page of the byte_code
+        -:  283: * buffer is 8 bytes long and only 4 bytes are kept for a
+        -:  284: * given page:
+        -:  285: *
+        -:  286: * +---+---+---+---+---+---+---+---+
+        -:  287: * | X | 1 | 2 | 3 | X | 4 | X | X |
+        -:  288: * +---+---+---+---+---+---+---+---+
+        -:  289: *
+        -:  290: * X marks those bytes which are removed. The resulting
+        -:  291: * offset mapping is the following:
+        -:  292: *
+        -:  293: * +---+---+---+---+---+---+---+---+
+        -:  294: * | 0 | 1 | 2 | 3 | 3 | 4 | 4 | 4 |
+        -:  295: * +---+---+---+---+---+---+---+---+
+        -:  296: *
+        -:  297: * Each X is simply replaced by the index of the previous
+        -:  298: * index starting from zero. This shows the number of
+        -:  299: * copied bytes before a given byte including the byte
+        -:  300: * itself. The last byte always shows the number of bytes
+        -:  301: * copied from this page.
+        -:  302: *
+        -:  303: * This mapping allows recomputing all branch targets,
+        -:  304: * since mapping[to] - mapping[from] is the new argument
+        -:  305: * for forward branches. As for backward branches, the
+        -:  306: * equation is reversed to mapping[from] - mapping[to].
+        -:  307: *
+        -:  308: * The mapping is relative to one page, so distance
+        -:  309: * computation affecting multiple pages requires a loop.
+        -:  310: * We should also note that only argument bytes can
+        -:  311: * be skipped, so removed bytes cannot be targeted by
+        -:  312: * branches. Valid branches always target instruction
+        -:  313: * starts only.
+        -:  314: */
+        -:  315:
+        -:  316:/**
+        -:  317: * Recompute the argument of a forward branch.
+        -:  318: *
+        -:  319: * @return the new distance
+        -:  320: */
+        -:  321:static size_t
+        1:  322:parser_update_forward_branch (parser_mem_page_t *page_p, /**< current page */
+        -:  323:                              size_t full_distance, /**< full distance */
+        -:  324:                              uint8_t bytes_copied_before_jump) /**< bytes copied before jump */
+        -:  325:{
+        1:  326:  size_t new_distance = 0;
+        -:  327:
+        2:  328:  while (full_distance > PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  329:  {
+    #####:  330:    new_distance += page_p->bytes[PARSER_CBC_STREAM_PAGE_SIZE - 1] & CBC_LOWER_SEVEN_BIT_MASK;
+    #####:  331:    full_distance -= PARSER_CBC_STREAM_PAGE_SIZE;
+    #####:  332:    page_p = page_p->next_p;
+        -:  333:  }
+        -:  334:
+        1:  335:  new_distance += page_p->bytes[full_distance - 1] & CBC_LOWER_SEVEN_BIT_MASK;
+        1:  336:  return new_distance - bytes_copied_before_jump;
+        -:  337:} /* parser_update_forward_branch */
+        -:  338:
+        -:  339:/**
+        -:  340: * Recompute the argument of a backward branch.
+        -:  341: *
+        -:  342: * @return the new distance
+        -:  343: */
+        -:  344:static size_t
+    #####:  345:parser_update_backward_branch (parser_mem_page_t *page_p, /**< current page */
+        -:  346:                               size_t full_distance, /**< full distance */
+        -:  347:                               uint8_t bytes_copied_before_jump) /**< bytes copied before jump */
+        -:  348:{
+    #####:  349:  size_t new_distance = bytes_copied_before_jump;
+        -:  350:
+    #####:  351:  while (full_distance >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  352:  {
+    #####:  353:    JERRY_ASSERT (page_p != NULL);
+    #####:  354:    new_distance += page_p->bytes[PARSER_CBC_STREAM_PAGE_SIZE - 1] & CBC_LOWER_SEVEN_BIT_MASK;
+    #####:  355:    full_distance -= PARSER_CBC_STREAM_PAGE_SIZE;
+    #####:  356:    page_p = page_p->next_p;
+        -:  357:  }
+        -:  358:
+    #####:  359:  if (full_distance > 0)
+        -:  360:  {
+    #####:  361:    size_t offset = PARSER_CBC_STREAM_PAGE_SIZE - full_distance;
+        -:  362:
+    #####:  363:    JERRY_ASSERT (page_p != NULL);
+        -:  364:
+    #####:  365:    new_distance += page_p->bytes[PARSER_CBC_STREAM_PAGE_SIZE - 1] & CBC_LOWER_SEVEN_BIT_MASK;
+    #####:  366:    new_distance -= page_p->bytes[offset - 1] & CBC_LOWER_SEVEN_BIT_MASK;
+        -:  367:  }
+        -:  368:
+    #####:  369:  return new_distance;
+        -:  370:} /* parser_update_backward_branch */
+        -:  371:
+        -:  372:/**
+        -:  373: * Update targets of all branches in one step.
+        -:  374: */
+        -:  375:static void
+        3:  376:parse_update_branches (parser_context_t *context_p, /**< context */
+        -:  377:                       uint8_t *byte_code_p) /**< byte code */
+        -:  378:{
+        3:  379:  parser_mem_page_t *page_p = context_p->byte_code.first_p;
+        3:  380:  parser_mem_page_t *prev_page_p = NULL;
+        3:  381:  parser_mem_page_t *last_page_p = context_p->byte_code.last_p;
+        3:  382:  size_t last_position = context_p->byte_code.last_position;
+        3:  383:  size_t offset = 0;
+        3:  384:  size_t bytes_copied = 0;
+        -:  385:
+        3:  386:  if (last_position >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  387:  {
+    #####:  388:    last_page_p = NULL;
+    #####:  389:    last_position = 0;
+        -:  390:  }
+        -:  391:
+      229:  392:  while (page_p != last_page_p || offset < last_position)
+        -:  393:  {
+        -:  394:    /* Branch instructions are marked to improve search speed. */
+      223:  395:    if (page_p->bytes[offset] & CBC_HIGHEST_BIT_MASK)
+        -:  396:    {
+        2:  397:      uint8_t *bytes_p = byte_code_p + bytes_copied;
+        -:  398:      uint8_t flags;
+        2:  399:      uint8_t bytes_copied_before_jump = 0;
+        -:  400:      size_t branch_argument_length;
+        -:  401:      size_t target_distance;
+        -:  402:      size_t length;
+        -:  403:
+        2:  404:      if (offset > 0)
+        -:  405:      {
+        2:  406:        bytes_copied_before_jump = page_p->bytes[offset - 1] & CBC_LOWER_SEVEN_BIT_MASK;
+        -:  407:      }
+        2:  408:      bytes_p += bytes_copied_before_jump;
+        -:  409:
+        2:  410:      if (*bytes_p == CBC_EXT_OPCODE)
+        -:  411:      {
+    #####:  412:        bytes_p++;
+    #####:  413:        flags = cbc_ext_flags[*bytes_p];
+        -:  414:      }
+        -:  415:      else
+        -:  416:      {
+        2:  417:        flags = cbc_flags[*bytes_p];
+        -:  418:      }
+        -:  419:
+        2:  420:      JERRY_ASSERT (flags & CBC_HAS_BRANCH_ARG);
+        2:  421:      branch_argument_length = CBC_BRANCH_OFFSET_LENGTH (*bytes_p);
+        2:  422:      bytes_p++;
+        -:  423:
+        -:  424:      /* Decoding target. */
+        2:  425:      length = branch_argument_length;
+        2:  426:      target_distance = 0;
+        -:  427:      do
+        -:  428:      {
+        2:  429:        target_distance = (target_distance << 8) | *bytes_p;
+        2:  430:        bytes_p++;
+        -:  431:      }
+        2:  432:      while (--length > 0);
+        -:  433:
+        2:  434:      if (CBC_BRANCH_IS_FORWARD (flags))
+        -:  435:      {
+        -:  436:        /* Branch target was not set. */
+        1:  437:        JERRY_ASSERT (target_distance > 0);
+        -:  438:
+        1:  439:        target_distance = parser_update_forward_branch (page_p,
+        -:  440:                                                        offset + target_distance,
+        -:  441:                                                        bytes_copied_before_jump);
+        -:  442:      }
+        -:  443:      else
+        -:  444:      {
+        1:  445:        if (target_distance < offset)
+        -:  446:        {
+        1:  447:          uint8_t bytes_copied_before_target = page_p->bytes[offset - target_distance - 1];
+        1:  448:          bytes_copied_before_target = bytes_copied_before_target & CBC_LOWER_SEVEN_BIT_MASK;
+        -:  449:
+        1:  450:          target_distance = (size_t) (bytes_copied_before_jump - bytes_copied_before_target);
+        -:  451:        }
+    #####:  452:        else if (target_distance == offset)
+        -:  453:        {
+    #####:  454:          target_distance = bytes_copied_before_jump;
+        -:  455:        }
+        -:  456:        else
+        -:  457:        {
+    #####:  458:          target_distance = parser_update_backward_branch (prev_page_p,
+        -:  459:                                                           target_distance - offset,
+        -:  460:                                                           bytes_copied_before_jump);
+        -:  461:        }
+        -:  462:      }
+        -:  463:
+        -:  464:      /* Encoding target again. */
+        -:  465:      do
+        -:  466:      {
+        2:  467:        bytes_p--;
+        2:  468:        *bytes_p = (uint8_t) (target_distance & 0xff);
+        2:  469:        target_distance >>= 8;
+        -:  470:      }
+        2:  471:      while (--branch_argument_length > 0);
+        -:  472:    }
+        -:  473:
+      223:  474:    offset++;
+      223:  475:    if (offset >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  476:    {
+        2:  477:      parser_mem_page_t *next_p = page_p->next_p;
+        -:  478:
+        -:  479:      /* We reverse the pages before the current page. */
+        2:  480:      page_p->next_p = prev_page_p;
+        2:  481:      prev_page_p = page_p;
+        -:  482:
+        2:  483:      bytes_copied += page_p->bytes[PARSER_CBC_STREAM_PAGE_SIZE - 1] & CBC_LOWER_SEVEN_BIT_MASK;
+        2:  484:      page_p = next_p;
+        2:  485:      offset = 0;
+        -:  486:    }
+        -:  487:  }
+        -:  488:
+        -:  489:  /* After this point the pages of the byte code stream are
+        -:  490:   * not used anymore. However, they needs to be freed during
+        -:  491:   * cleanup, so the first and last pointers of the stream
+        -:  492:   * descriptor are reversed as well. */
+        3:  493:  if (last_page_p != NULL)
+        -:  494:  {
+        3:  495:    JERRY_ASSERT (last_page_p == context_p->byte_code.last_p);
+        3:  496:    last_page_p->next_p = prev_page_p;
+        -:  497:  }
+        -:  498:  else
+        -:  499:  {
+    #####:  500:    last_page_p = context_p->byte_code.last_p;
+        -:  501:  }
+        -:  502:
+        3:  503:  context_p->byte_code.last_p = context_p->byte_code.first_p;
+        3:  504:  context_p->byte_code.first_p = last_page_p;
+        3:  505:} /* parse_update_branches */
+        -:  506:
+        -:  507:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -:  508:
+        -:  509:/**
+        -:  510: * Print literal.
+        -:  511: */
+        -:  512:static void
+        -:  513:parse_print_literal (ecma_compiled_code_t *compiled_code_p, /**< compiled code */
+        -:  514:                     uint16_t literal_index, /**< literal index */
+        -:  515:                     parser_list_t *literal_pool_p) /**< literal pool */
+        -:  516:{
+        -:  517:  parser_list_iterator_t literal_iterator;
+        -:  518:  uint16_t argument_end;
+        -:  519:  uint16_t register_end;
+        -:  520:  uint16_t ident_end;
+        -:  521:
+        -:  522:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_UINT16_ARGUMENTS)
+        -:  523:  {
+        -:  524:    cbc_uint16_arguments_t *args_p = (cbc_uint16_arguments_t *) compiled_code_p;
+        -:  525:    argument_end = args_p->argument_end;
+        -:  526:    register_end = args_p->register_end;
+        -:  527:    ident_end = args_p->ident_end;
+        -:  528:  }
+        -:  529:  else
+        -:  530:  {
+        -:  531:    cbc_uint8_arguments_t *args_p = (cbc_uint8_arguments_t *) compiled_code_p;
+        -:  532:    argument_end = args_p->argument_end;
+        -:  533:    register_end = args_p->register_end;
+        -:  534:    ident_end = args_p->ident_end;
+        -:  535:  }
+        -:  536:
+        -:  537:#if ENABLED (JERRY_ES2015)
+        -:  538:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_REST_PARAMETER)
+        -:  539:  {
+        -:  540:    argument_end++;
+        -:  541:  }
+        -:  542:#endif /* ENABLED (JERRY_ES2015) */
+        -:  543:
+        -:  544:  if (literal_index < argument_end)
+        -:  545:  {
+        -:  546:    JERRY_DEBUG_MSG (" arg:%d", literal_index);
+        -:  547:    return;
+        -:  548:  }
+        -:  549:
+        -:  550:  if (literal_index < register_end)
+        -:  551:  {
+        -:  552:    JERRY_DEBUG_MSG (" reg:%d", literal_index);
+        -:  553:    return;
+        -:  554:  }
+        -:  555:
+        -:  556:  parser_list_iterator_init (literal_pool_p, &literal_iterator);
+        -:  557:
+        -:  558:  while (true)
+        -:  559:  {
+        -:  560:    lexer_literal_t *literal_p = (lexer_literal_t *) parser_list_iterator_next (&literal_iterator);
+        -:  561:
+        -:  562:    JERRY_ASSERT (literal_p != NULL);
+        -:  563:
+        -:  564:    if (literal_p->prop.index == literal_index)
+        -:  565:    {
+        -:  566:      if (literal_index < ident_end)
+        -:  567:      {
+        -:  568:        JERRY_DEBUG_MSG (" ident:%d->", literal_index);
+        -:  569:      }
+        -:  570:      else
+        -:  571:      {
+        -:  572:        JERRY_DEBUG_MSG (" lit:%d->", literal_index);
+        -:  573:      }
+        -:  574:
+        -:  575:      util_print_literal (literal_p);
+        -:  576:      return;
+        -:  577:    }
+        -:  578:  }
+        -:  579:} /* parse_print_literal */
+        -:  580:
+        -:  581:#define PARSER_READ_IDENTIFIER_INDEX(name) \
+        -:  582:  name = *byte_code_p++; \
+        -:  583:  if (name >= encoding_limit) \
+        -:  584:  { \
+        -:  585:    name = (uint16_t) (((name << 8) | byte_code_p[0]) - encoding_delta); \
+        -:  586:    byte_code_p++; \
+        -:  587:  }
+        -:  588:
+        -:  589:/**
+        -:  590: * Print byte code.
+        -:  591: */
+        -:  592:static void
+        -:  593:parse_print_final_cbc (ecma_compiled_code_t *compiled_code_p, /**< compiled code */
+        -:  594:                       parser_list_t *literal_pool_p, /**< literal pool */
+        -:  595:                       size_t length) /**< length of byte code */
+        -:  596:{
+        -:  597:  uint8_t flags;
+        -:  598:  uint8_t *byte_code_start_p;
+        -:  599:  uint8_t *byte_code_end_p;
+        -:  600:  uint8_t *byte_code_p;
+        -:  601:  uint16_t encoding_limit;
+        -:  602:  uint16_t encoding_delta;
+        -:  603:  uint16_t stack_limit;
+        -:  604:  uint16_t argument_end;
+        -:  605:  uint16_t register_end;
+        -:  606:  uint16_t ident_end;
+        -:  607:  uint16_t const_literal_end;
+        -:  608:  uint16_t literal_end;
+        -:  609:
+        -:  610:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_UINT16_ARGUMENTS)
+        -:  611:  {
+        -:  612:    cbc_uint16_arguments_t *args = (cbc_uint16_arguments_t *) compiled_code_p;
+        -:  613:    stack_limit = args->stack_limit;
+        -:  614:    argument_end = args->argument_end;
+        -:  615:    register_end = args->register_end;
+        -:  616:    ident_end = args->ident_end;
+        -:  617:    const_literal_end = args->const_literal_end;
+        -:  618:    literal_end = args->literal_end;
+        -:  619:  }
+        -:  620:  else
+        -:  621:  {
+        -:  622:    cbc_uint8_arguments_t *args = (cbc_uint8_arguments_t *) compiled_code_p;
+        -:  623:    stack_limit = args->stack_limit;
+        -:  624:    argument_end = args->argument_end;
+        -:  625:    register_end = args->register_end;
+        -:  626:    ident_end = args->ident_end;
+        -:  627:    const_literal_end = args->const_literal_end;
+        -:  628:    literal_end = args->literal_end;
+        -:  629:  }
+        -:  630:
+        -:  631:  JERRY_DEBUG_MSG ("\nFinal byte code dump:\n\n  Maximum stack depth: %d\n  Flags: [",
+        -:  632:                   (int) (stack_limit + register_end));
+        -:  633:
+        -:  634:  if (!(compiled_code_p->status_flags & CBC_CODE_FLAGS_FULL_LITERAL_ENCODING))
+        -:  635:  {
+        -:  636:    JERRY_DEBUG_MSG ("small_lit_enc");
+        -:  637:    encoding_limit = CBC_SMALL_LITERAL_ENCODING_LIMIT;
+        -:  638:    encoding_delta = CBC_SMALL_LITERAL_ENCODING_DELTA;
+        -:  639:  }
+        -:  640:  else
+        -:  641:  {
+        -:  642:    JERRY_DEBUG_MSG ("full_lit_enc");
+        -:  643:    encoding_limit = CBC_FULL_LITERAL_ENCODING_LIMIT;
+        -:  644:    encoding_delta = CBC_FULL_LITERAL_ENCODING_DELTA;
+        -:  645:  }
+        -:  646:
+        -:  647:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_UINT16_ARGUMENTS)
+        -:  648:  {
+        -:  649:    JERRY_DEBUG_MSG (",uint16_arguments");
+        -:  650:  }
+        -:  651:
+        -:  652:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_STRICT_MODE)
+        -:  653:  {
+        -:  654:    JERRY_DEBUG_MSG (",strict_mode");
+        -:  655:  }
+        -:  656:
+        -:  657:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_MAPPED_ARGUMENTS_NEEDED)
+        -:  658:  {
+        -:  659:    JERRY_DEBUG_MSG (",mapped_arguments_needed");
+        -:  660:  }
+        -:  661:
+        -:  662:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_UNMAPPED_ARGUMENTS_NEEDED)
+        -:  663:  {
+        -:  664:    JERRY_DEBUG_MSG (",unmapped_arguments_needed");
+        -:  665:  }
+        -:  666:
+        -:  667:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_LEXICAL_ENV_NOT_NEEDED)
+        -:  668:  {
+        -:  669:    JERRY_DEBUG_MSG (",no_lexical_env");
+        -:  670:  }
+        -:  671:
+        -:  672:#if ENABLED (JERRY_ES2015)
+        -:  673:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_ARROW_FUNCTION)
+        -:  674:  {
+        -:  675:    JERRY_DEBUG_MSG (",arrow");
+        -:  676:  }
+        -:  677:
+        -:  678:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_CLASS_CONSTRUCTOR)
+        -:  679:  {
+        -:  680:    JERRY_DEBUG_MSG (",constructor");
+        -:  681:  }
+        -:  682:
+        -:  683:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_GENERATOR)
+        -:  684:  {
+        -:  685:    JERRY_DEBUG_MSG (",generator");
+        -:  686:  }
+        -:  687:#endif /* ENABLED (JERRY_ES2015) */
+        -:  688:
+        -:  689:  JERRY_DEBUG_MSG ("]\n");
+        -:  690:
+        -:  691:  JERRY_DEBUG_MSG ("  Argument range end: %d\n", (int) argument_end);
+        -:  692:  JERRY_DEBUG_MSG ("  Register range end: %d\n", (int) register_end);
+        -:  693:  JERRY_DEBUG_MSG ("  Identifier range end: %d\n", (int) ident_end);
+        -:  694:  JERRY_DEBUG_MSG ("  Const literal range end: %d\n", (int) const_literal_end);
+        -:  695:  JERRY_DEBUG_MSG ("  Literal range end: %d\n\n", (int) literal_end);
+        -:  696:
+        -:  697:  byte_code_start_p = (uint8_t *) compiled_code_p;
+        -:  698:
+        -:  699:  if (compiled_code_p->status_flags & CBC_CODE_FLAGS_UINT16_ARGUMENTS)
+        -:  700:  {
+        -:  701:    byte_code_start_p += sizeof (cbc_uint16_arguments_t);
+        -:  702:  }
+        -:  703:  else
+        -:  704:  {
+        -:  705:    byte_code_start_p += sizeof (cbc_uint8_arguments_t);
+        -:  706:  }
+        -:  707:
+        -:  708:  byte_code_start_p += (unsigned int) (literal_end - register_end) * sizeof (ecma_value_t);
+        -:  709:
+        -:  710:  byte_code_end_p = byte_code_start_p + length;
+        -:  711:  byte_code_p = byte_code_start_p;
+        -:  712:
+        -:  713:  while (byte_code_p < byte_code_end_p)
+        -:  714:  {
+        -:  715:    cbc_opcode_t opcode = (cbc_opcode_t) *byte_code_p;
+        -:  716:    cbc_ext_opcode_t ext_opcode = CBC_EXT_NOP;
+        -:  717:    size_t cbc_offset = (size_t) (byte_code_p - byte_code_start_p);
+        -:  718:
+        -:  719:    if (opcode != CBC_EXT_OPCODE)
+        -:  720:    {
+        -:  721:      flags = cbc_flags[opcode];
+        -:  722:      JERRY_DEBUG_MSG (" %3d : %s", (int) cbc_offset, cbc_names[opcode]);
+        -:  723:      byte_code_p++;
+        -:  724:    }
+        -:  725:    else
+        -:  726:    {
+        -:  727:      ext_opcode = (cbc_ext_opcode_t) byte_code_p[1];
+        -:  728:      flags = cbc_ext_flags[ext_opcode];
+        -:  729:      JERRY_DEBUG_MSG (" %3d : %s", (int) cbc_offset, cbc_ext_names[ext_opcode]);
+        -:  730:      byte_code_p += 2;
+        -:  731:
+        -:  732:#if ENABLED (JERRY_LINE_INFO)
+        -:  733:      if (ext_opcode == CBC_EXT_LINE)
+        -:  734:      {
+        -:  735:        uint32_t value = 0;
+        -:  736:        uint8_t byte;
+        -:  737:
+        -:  738:        do
+        -:  739:        {
+        -:  740:          byte = *byte_code_p++;
+        -:  741:          value = (value << 7) | (byte & CBC_LOWER_SEVEN_BIT_MASK);
+        -:  742:        }
+        -:  743:        while (byte & CBC_HIGHEST_BIT_MASK);
+        -:  744:
+        -:  745:        JERRY_DEBUG_MSG (" %d\n", (int) value);
+        -:  746:        continue;
+        -:  747:      }
+        -:  748:#endif /* ENABLED (JERRY_LINE_INFO) */
+        -:  749:    }
+        -:  750:
+        -:  751:    if (flags & (CBC_HAS_LITERAL_ARG | CBC_HAS_LITERAL_ARG2))
+        -:  752:    {
+        -:  753:      uint16_t literal_index;
+        -:  754:
+        -:  755:      PARSER_READ_IDENTIFIER_INDEX (literal_index);
+        -:  756:      parse_print_literal (compiled_code_p, literal_index, literal_pool_p);
+        -:  757:    }
+        -:  758:
+        -:  759:    if (flags & CBC_HAS_LITERAL_ARG2)
+        -:  760:    {
+        -:  761:      uint16_t literal_index;
+        -:  762:
+        -:  763:      PARSER_READ_IDENTIFIER_INDEX (literal_index);
+        -:  764:      parse_print_literal (compiled_code_p, literal_index, literal_pool_p);
+        -:  765:
+        -:  766:      if (!(flags & CBC_HAS_LITERAL_ARG))
+        -:  767:      {
+        -:  768:        PARSER_READ_IDENTIFIER_INDEX (literal_index);
+        -:  769:        parse_print_literal (compiled_code_p, literal_index, literal_pool_p);
+        -:  770:      }
+        -:  771:    }
+        -:  772:
+        -:  773:    if (flags & CBC_HAS_BYTE_ARG)
+        -:  774:    {
+        -:  775:      if (opcode == CBC_PUSH_NUMBER_POS_BYTE
+        -:  776:          || ext_opcode == CBC_EXT_PUSH_LITERAL_PUSH_NUMBER_POS_BYTE)
+        -:  777:      {
+        -:  778:        JERRY_DEBUG_MSG (" number:%d", (int) *byte_code_p + 1);
+        -:  779:      }
+        -:  780:      else if (opcode == CBC_PUSH_NUMBER_NEG_BYTE
+        -:  781:               || ext_opcode == CBC_EXT_PUSH_LITERAL_PUSH_NUMBER_NEG_BYTE)
+        -:  782:      {
+        -:  783:        JERRY_DEBUG_MSG (" number:%d", -((int) *byte_code_p + 1));
+        -:  784:      }
+        -:  785:      else
+        -:  786:      {
+        -:  787:        JERRY_DEBUG_MSG (" byte_arg:%d", *byte_code_p);
+        -:  788:      }
+        -:  789:      byte_code_p++;
+        -:  790:    }
+        -:  791:
+        -:  792:    if (flags & CBC_HAS_BRANCH_ARG)
+        -:  793:    {
+        -:  794:      size_t branch_offset_length = (opcode != CBC_EXT_OPCODE ? CBC_BRANCH_OFFSET_LENGTH (opcode)
+        -:  795:                                                              : CBC_BRANCH_OFFSET_LENGTH (ext_opcode));
+        -:  796:      size_t offset = 0;
+        -:  797:
+        -:  798:      do
+        -:  799:      {
+        -:  800:        offset = (offset << 8) | *byte_code_p++;
+        -:  801:      }
+        -:  802:      while (--branch_offset_length > 0);
+        -:  803:
+        -:  804:      JERRY_DEBUG_MSG (" offset:%d(->%d)",
+        -:  805:                       (int) offset,
+        -:  806:                       (int) (cbc_offset + (CBC_BRANCH_IS_FORWARD (flags) ? offset : -offset)));
+        -:  807:    }
+        -:  808:
+        -:  809:    JERRY_DEBUG_MSG ("\n");
+        -:  810:  }
+        -:  811:} /* parse_print_final_cbc */
+        -:  812:
+        -:  813:#undef PARSER_READ_IDENTIFIER_INDEX
+        -:  814:
+        -:  815:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -:  816:
+        -:  817:#if ENABLED (JERRY_DEBUGGER)
+        -:  818:
+        -:  819:/**
+        -:  820: * Send current breakpoint list.
+        -:  821: */
+        -:  822:static void
+        -:  823:parser_send_breakpoints (parser_context_t *context_p, /**< context */
+        -:  824:                         jerry_debugger_header_type_t type) /**< message type */
+        -:  825:{
+        -:  826:  JERRY_ASSERT (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED);
+        -:  827:  JERRY_ASSERT (context_p->breakpoint_info_count > 0);
+        -:  828:
+        -:  829:  jerry_debugger_send_data (type,
+        -:  830:                            context_p->breakpoint_info,
+        -:  831:                            context_p->breakpoint_info_count * sizeof (parser_breakpoint_info_t));
+        -:  832:
+        -:  833:  context_p->breakpoint_info_count = 0;
+        -:  834:} /* parser_send_breakpoints */
+        -:  835:
+        -:  836:/**
+        -:  837: * Append a breakpoint info.
+        -:  838: */
+        -:  839:void
+        -:  840:parser_append_breakpoint_info (parser_context_t *context_p, /**< context */
+        -:  841:                               jerry_debugger_header_type_t type, /**< message type */
+        -:  842:                               uint32_t value) /**< line or offset of the breakpoint */
+        -:  843:{
+        -:  844:  JERRY_ASSERT (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED);
+        -:  845:
+        -:  846:  context_p->status_flags |= PARSER_DEBUGGER_BREAKPOINT_APPENDED;
+        -:  847:
+        -:  848:  if (context_p->breakpoint_info_count >= JERRY_DEBUGGER_SEND_MAX (parser_breakpoint_info_t))
+        -:  849:  {
+        -:  850:    parser_send_breakpoints (context_p, type);
+        -:  851:  }
+        -:  852:
+        -:  853:  context_p->breakpoint_info[context_p->breakpoint_info_count].value = value;
+        -:  854:  context_p->breakpoint_info_count = (uint16_t) (context_p->breakpoint_info_count + 1);
+        -:  855:} /* parser_append_breakpoint_info */
+        -:  856:
+        -:  857:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -:  858:
+        -:  859:/**
+        -:  860: * Forward iterator: move to the next byte code
+        -:  861: *
+        -:  862: * @param page_p page
+        -:  863: * @param offset offset
+        -:  864: */
+        -:  865:#define PARSER_NEXT_BYTE(page_p, offset) \
+        -:  866:  do { \
+        -:  867:    if (++(offset) >= PARSER_CBC_STREAM_PAGE_SIZE) \
+        -:  868:    { \
+        -:  869:      offset = 0; \
+        -:  870:      page_p = page_p->next_p; \
+        -:  871:    } \
+        -:  872:  } while (0)
+        -:  873:
+        -:  874:/**
+        -:  875: * Forward iterator: move to the next byte code. Also updates the offset of the previous byte code.
+        -:  876: *
+        -:  877: * @param page_p page
+        -:  878: * @param offset offset
+        -:  879: * @param real_offset real offset
+        -:  880: */
+        -:  881:#define PARSER_NEXT_BYTE_UPDATE(page_p, offset, real_offset) \
+        -:  882:  do { \
+        -:  883:    page_p->bytes[offset] = real_offset; \
+        -:  884:    if (++(offset) >= PARSER_CBC_STREAM_PAGE_SIZE) \
+        -:  885:    { \
+        -:  886:      offset = 0; \
+        -:  887:      real_offset = 0; \
+        -:  888:      page_p = page_p->next_p; \
+        -:  889:    } \
+        -:  890:  } while (0)
+        -:  891:
+        -:  892:/**
+        -:  893: * Post processing main function.
+        -:  894: *
+        -:  895: * @return compiled code
+        -:  896: */
+        -:  897:static ecma_compiled_code_t *
+        3:  898:parser_post_processing (parser_context_t *context_p) /**< context */
+        -:  899:{
+        -:  900:  uint16_t literal_one_byte_limit;
+        3:  901:  uint16_t ident_end;
+        3:  902:  uint16_t const_literal_end;
+        -:  903:  parser_mem_page_t *page_p;
+        -:  904:  parser_mem_page_t *last_page_p;
+        -:  905:  size_t last_position;
+        -:  906:  size_t offset;
+        -:  907:  size_t length;
+        -:  908:  size_t literal_length;
+        -:  909:  size_t total_size;
+        -:  910:#if ENABLED (JERRY_SNAPSHOT_SAVE)
+        -:  911:  size_t total_size_used;
+        -:  912:#endif /* ENABLED (JERRY_SNAPSHOT_SAVE) */
+        -:  913:  uint8_t real_offset;
+        -:  914:  uint8_t *byte_code_p;
+        -:  915:  bool needs_uint16_arguments;
+        3:  916:  cbc_opcode_t last_opcode = CBC_EXT_OPCODE;
+        -:  917:  ecma_compiled_code_t *compiled_code_p;
+        -:  918:  ecma_value_t *literal_pool_p;
+        -:  919:  uint8_t *dst_p;
+        -:  920:
+        -:  921:#if ENABLED (JERRY_ES2015)
+        3:  922:  if ((context_p->status_flags & (PARSER_IS_FUNCTION | PARSER_LEXICAL_BLOCK_NEEDED))
+        -:  923:      == (PARSER_IS_FUNCTION | PARSER_LEXICAL_BLOCK_NEEDED))
+        -:  924:  {
+    #####:  925:    PARSER_MINUS_EQUAL_U16 (context_p->stack_depth, PARSER_BLOCK_CONTEXT_STACK_ALLOCATION);
+        -:  926:#ifndef JERRY_NDEBUG
+    #####:  927:    PARSER_MINUS_EQUAL_U16 (context_p->context_stack_depth, PARSER_BLOCK_CONTEXT_STACK_ALLOCATION);
+        -:  928:#endif /* !JERRY_NDEBUG */
+        -:  929:
+    #####:  930:    context_p->status_flags &= (uint32_t) ~PARSER_LEXICAL_BLOCK_NEEDED;
+        -:  931:
+    #####:  932:    parser_emit_cbc (context_p, CBC_CONTEXT_END);
+        -:  933:
+    #####:  934:    parser_branch_t branch;
+    #####:  935:    parser_stack_pop (context_p, &branch, sizeof (parser_branch_t));
+    #####:  936:    parser_set_branch_to_current_position (context_p, &branch);
+        -:  937:  }
+        -:  938:#endif /* ENABLED (JERRY_ES2015) */
+        -:  939:
+        3:  940:  JERRY_ASSERT (context_p->stack_depth == 0);
+        -:  941:#ifndef JERRY_NDEBUG
+        3:  942:  JERRY_ASSERT (context_p->context_stack_depth == 0);
+        -:  943:#endif /* !JERRY_NDEBUG */
+        -:  944:
+        3:  945:  if ((size_t) context_p->stack_limit + (size_t) context_p->register_count > PARSER_MAXIMUM_STACK_LIMIT)
+        -:  946:  {
+    #####:  947:    parser_raise_error (context_p, PARSER_ERR_STACK_LIMIT_REACHED);
+        -:  948:  }
+        -:  949:
+        3:  950:  JERRY_ASSERT (context_p->literal_count <= PARSER_MAXIMUM_NUMBER_OF_LITERALS);
+        -:  951:
+        -:  952:#if ENABLED (JERRY_DEBUGGER)
+        -:  953:  if ((JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -:  954:      && !(context_p->status_flags & PARSER_DEBUGGER_BREAKPOINT_APPENDED))
+        -:  955:  {
+        -:  956:    /* Always provide at least one breakpoint. */
+        -:  957:    parser_emit_cbc (context_p, CBC_BREAKPOINT_DISABLED);
+        -:  958:    parser_flush_cbc (context_p);
+        -:  959:
+        -:  960:    parser_append_breakpoint_info (context_p, JERRY_DEBUGGER_BREAKPOINT_LIST, context_p->token.line);
+        -:  961:
+        -:  962:    context_p->last_breakpoint_line = context_p->token.line;
+        -:  963:  }
+        -:  964:
+        -:  965:  if ((JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -:  966:      && context_p->breakpoint_info_count > 0)
+        -:  967:  {
+        -:  968:    parser_send_breakpoints (context_p, JERRY_DEBUGGER_BREAKPOINT_LIST);
+        -:  969:    JERRY_ASSERT (context_p->breakpoint_info_count == 0);
+        -:  970:  }
+        -:  971:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -:  972:
+        3:  973:  parser_compute_indicies (context_p, &ident_end, &const_literal_end);
+        -:  974:
+        3:  975:  if (context_p->literal_count <= CBC_MAXIMUM_SMALL_VALUE)
+        -:  976:  {
+        3:  977:    literal_one_byte_limit = CBC_MAXIMUM_BYTE_VALUE - 1;
+        -:  978:  }
+        -:  979:  else
+        -:  980:  {
+    #####:  981:    literal_one_byte_limit = CBC_LOWER_SEVEN_BIT_MASK;
+        -:  982:  }
+        -:  983:
+        3:  984:  last_page_p = context_p->byte_code.last_p;
+        3:  985:  last_position = context_p->byte_code.last_position;
+        -:  986:
+        3:  987:  if (last_position >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  988:  {
+    #####:  989:    last_page_p = NULL;
+    #####:  990:    last_position = 0;
+        -:  991:  }
+        -:  992:
+        3:  993:  page_p = context_p->byte_code.first_p;
+        3:  994:  offset = 0;
+        3:  995:  length = 0;
+        -:  996:
+       75:  997:  while (page_p != last_page_p || offset < last_position)
+        -:  998:  {
+        -:  999:    uint8_t *opcode_p;
+        -: 1000:    uint8_t flags;
+        -: 1001:    size_t branch_offset_length;
+        -: 1002:
+       69: 1003:    opcode_p = page_p->bytes + offset;
+       69: 1004:    last_opcode = (cbc_opcode_t) (*opcode_p);
+       69: 1005:    PARSER_NEXT_BYTE (page_p, offset);
+       69: 1006:    branch_offset_length = CBC_BRANCH_OFFSET_LENGTH (last_opcode);
+       69: 1007:    flags = cbc_flags[last_opcode];
+       69: 1008:    length++;
+        -: 1009:
+       69: 1010:    if (last_opcode == CBC_EXT_OPCODE)
+        -: 1011:    {
+        -: 1012:      cbc_ext_opcode_t ext_opcode;
+        -: 1013:
+        4: 1014:      ext_opcode = (cbc_ext_opcode_t) page_p->bytes[offset];
+        4: 1015:      branch_offset_length = CBC_BRANCH_OFFSET_LENGTH (ext_opcode);
+        4: 1016:      flags = cbc_ext_flags[ext_opcode];
+        4: 1017:      PARSER_NEXT_BYTE (page_p, offset);
+        4: 1018:      length++;
+        -: 1019:
+        -: 1020:#if ENABLED (JERRY_ES2015)
+        4: 1021:      if (ext_opcode == CBC_EXT_RETURN_PROMISE)
+        -: 1022:      {
+    #####: 1023:        last_opcode = CBC_RETURN;
+        -: 1024:      }
+        -: 1025:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1026:
+        -: 1027:#if ENABLED (JERRY_LINE_INFO)
+    #####: 1028:      if (ext_opcode == CBC_EXT_LINE)
+        -: 1029:      {
+    #####: 1030:        uint8_t last_byte = 0;
+        -: 1031:
+        -: 1032:        do
+        -: 1033:        {
+    #####: 1034:          last_byte = page_p->bytes[offset];
+    #####: 1035:          PARSER_NEXT_BYTE (page_p, offset);
+    #####: 1036:          length++;
+        -: 1037:        }
+    #####: 1038:        while (last_byte & CBC_HIGHEST_BIT_MASK);
+        -: 1039:
+    #####: 1040:        continue;
+        -: 1041:      }
+        -: 1042:#endif /* ENABLED (JERRY_LINE_INFO) */
+        -: 1043:    }
+        -: 1044:
+      161: 1045:    while (flags & (CBC_HAS_LITERAL_ARG | CBC_HAS_LITERAL_ARG2))
+        -: 1046:    {
+       72: 1047:      uint8_t *first_byte = page_p->bytes + offset;
+       72: 1048:      uint32_t literal_index = *first_byte;
+        -: 1049:
+       72: 1050:      PARSER_NEXT_BYTE (page_p, offset);
+       72: 1051:      length++;
+        -: 1052:
+       72: 1053:      literal_index |= ((uint32_t) page_p->bytes[offset]) << 8;
+        -: 1054:
+       72: 1055:      if (literal_index >= PARSER_REGISTER_START)
+        -: 1056:      {
+        3: 1057:        literal_index -= PARSER_REGISTER_START;
+        -: 1058:      }
+        -: 1059:      else
+        -: 1060:      {
+       69: 1061:        literal_index = (PARSER_GET_LITERAL (literal_index))->prop.index;
+        -: 1062:      }
+        -: 1063:
+       72: 1064:      if (literal_index <= literal_one_byte_limit)
+        -: 1065:      {
+       72: 1066:        *first_byte = (uint8_t) literal_index;
+        -: 1067:      }
+        -: 1068:      else
+        -: 1069:      {
+    #####: 1070:        if (context_p->literal_count <= CBC_MAXIMUM_SMALL_VALUE)
+        -: 1071:        {
+    #####: 1072:          JERRY_ASSERT (literal_index <= CBC_MAXIMUM_SMALL_VALUE);
+    #####: 1073:          *first_byte = CBC_MAXIMUM_BYTE_VALUE;
+    #####: 1074:          page_p->bytes[offset] = (uint8_t) (literal_index - CBC_MAXIMUM_BYTE_VALUE);
+    #####: 1075:          length++;
+        -: 1076:        }
+        -: 1077:        else
+        -: 1078:        {
+    #####: 1079:          JERRY_ASSERT (literal_index <= CBC_MAXIMUM_FULL_VALUE);
+    #####: 1080:          *first_byte = (uint8_t) ((literal_index >> 8) | CBC_HIGHEST_BIT_MASK);
+    #####: 1081:          page_p->bytes[offset] = (uint8_t) (literal_index & 0xff);
+    #####: 1082:          length++;
+        -: 1083:        }
+        -: 1084:      }
+       72: 1085:      PARSER_NEXT_BYTE (page_p, offset);
+        -: 1086:
+       72: 1087:      if (flags & CBC_HAS_LITERAL_ARG2)
+        -: 1088:      {
+       23: 1089:        if (flags & CBC_HAS_LITERAL_ARG)
+        -: 1090:        {
+       20: 1091:          flags = CBC_HAS_LITERAL_ARG;
+        -: 1092:        }
+        -: 1093:        else
+        -: 1094:        {
+        3: 1095:          flags = CBC_HAS_LITERAL_ARG | CBC_HAS_LITERAL_ARG2;
+        -: 1096:        }
+        -: 1097:      }
+        -: 1098:      else
+        -: 1099:      {
+       49: 1100:        break;
+        -: 1101:      }
+        -: 1102:    }
+        -: 1103:
+       69: 1104:    if (flags & CBC_HAS_BYTE_ARG)
+        -: 1105:    {
+        -: 1106:      /* This argument will be copied without modification. */
+        2: 1107:      PARSER_NEXT_BYTE (page_p, offset);
+        2: 1108:      length++;
+        -: 1109:    }
+        -: 1110:
+       69: 1111:    if (flags & CBC_HAS_BRANCH_ARG)
+        -: 1112:    {
+        2: 1113:      bool prefix_zero = true;
+        -: 1114:
+        -: 1115:      /* The leading zeroes are dropped from the stream.
+        -: 1116:       * Although dropping these zeroes for backward
+        -: 1117:       * branches are unnecessary, we use the same
+        -: 1118:       * code path for simplicity. */
+        2: 1119:      JERRY_ASSERT (branch_offset_length > 0 && branch_offset_length <= 3);
+        -: 1120:
+        6: 1121:      while (--branch_offset_length > 0)
+        -: 1122:      {
+        2: 1123:        uint8_t byte = page_p->bytes[offset];
+        2: 1124:        if (byte > 0 || !prefix_zero)
+        -: 1125:        {
+    #####: 1126:          prefix_zero = false;
+    #####: 1127:          length++;
+        -: 1128:        }
+        -: 1129:        else
+        -: 1130:        {
+        2: 1131:          JERRY_ASSERT (CBC_BRANCH_IS_FORWARD (flags));
+        -: 1132:        }
+        2: 1133:        PARSER_NEXT_BYTE (page_p, offset);
+        -: 1134:      }
+        -: 1135:
+        2: 1136:      if (last_opcode == (cbc_opcode_t) (CBC_JUMP_FORWARD + PARSER_MAX_BRANCH_LENGTH - 1)
+    #####: 1137:          && prefix_zero
+    #####: 1138:          && page_p->bytes[offset] == PARSER_MAX_BRANCH_LENGTH + 1)
+        -: 1139:      {
+        -: 1140:        /* Uncoditional jumps which jump right after the instruction
+        -: 1141:         * are effectively NOPs. These jumps are removed from the
+        -: 1142:         * stream. The 1 byte long CBC_JUMP_FORWARD form marks these
+        -: 1143:         * instructions, since this form is constructed during post
+        -: 1144:         * processing and cannot be emitted directly. */
+    #####: 1145:        *opcode_p = CBC_JUMP_FORWARD;
+    #####: 1146:        length--;
+        -: 1147:      }
+        -: 1148:      else
+        -: 1149:      {
+        -: 1150:        /* Other last bytes are always copied. */
+        2: 1151:        length++;
+        -: 1152:      }
+        -: 1153:
+        2: 1154:      PARSER_NEXT_BYTE (page_p, offset);
+        -: 1155:    }
+        -: 1156:  }
+        -: 1157:
+        3: 1158:  if (!(context_p->status_flags & PARSER_NO_END_LABEL)
+        3: 1159:      || !(PARSER_OPCODE_IS_RETURN (last_opcode)))
+        -: 1160:  {
+        3: 1161:    context_p->status_flags &= (uint32_t) ~PARSER_NO_END_LABEL;
+        -: 1162:
+        -: 1163:#if ENABLED (JERRY_ES2015)
+        3: 1164:    if (context_p->status_flags & PARSER_IS_ASYNC_FUNCTION)
+        -: 1165:    {
+    #####: 1166:      length += 2;
+        -: 1167:    }
+        -: 1168:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1169:
+        3: 1170:    length++;
+        -: 1171:  }
+        -: 1172:
+        3: 1173:  needs_uint16_arguments = false;
+        3: 1174:  total_size = sizeof (cbc_uint8_arguments_t);
+        -: 1175:
+        3: 1176:  if (context_p->stack_limit > CBC_MAXIMUM_BYTE_VALUE
+        3: 1177:      || context_p->register_count > CBC_MAXIMUM_BYTE_VALUE
+        3: 1178:      || context_p->literal_count > CBC_MAXIMUM_BYTE_VALUE)
+        -: 1179:  {
+    #####: 1180:    needs_uint16_arguments = true;
+    #####: 1181:    total_size = sizeof (cbc_uint16_arguments_t);
+        -: 1182:  }
+        -: 1183:
+        3: 1184:  literal_length = (size_t) (context_p->literal_count - context_p->register_count) * sizeof (ecma_value_t);
+        -: 1185:
+        3: 1186:  total_size += literal_length + length;
+        -: 1187:
+        3: 1188:  if (PARSER_NEEDS_MAPPED_ARGUMENTS (context_p->status_flags))
+        -: 1189:  {
+        1: 1190:    total_size += context_p->argument_count * sizeof (ecma_value_t);
+        -: 1191:  }
+        -: 1192:
+        -: 1193:#if ENABLED (JERRY_ES2015)
+        3: 1194:  if (context_p->tagged_template_literal_cp != JMEM_CP_NULL)
+        -: 1195:  {
+    #####: 1196:    total_size += sizeof (ecma_value_t);
+        -: 1197:  }
+        -: 1198:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1199:
+        -: 1200:#if ENABLED (JERRY_LINE_INFO) || ENABLED (JERRY_ES2015_MODULE_SYSTEM)
+        3: 1201:  if (JERRY_CONTEXT (resource_name) != ECMA_VALUE_UNDEFINED)
+        -: 1202:  {
+        3: 1203:    total_size += sizeof (ecma_value_t);
+        -: 1204:  }
+        -: 1205:#endif /* ENABLED (JERRY_LINE_INFO) || ENABLED (JERRY_ES2015_MODULE_SYSTEM) */
+        -: 1206:
+        -: 1207:#if ENABLED (JERRY_SNAPSHOT_SAVE)
+    #####: 1208:  total_size_used = total_size;
+        -: 1209:#endif /* ENABLED (JERRY_SNAPSHOT_SAVE) */
+        3: 1210:  total_size = JERRY_ALIGNUP (total_size, JMEM_ALIGNMENT);
+        -: 1211:
+        3: 1212:  compiled_code_p = (ecma_compiled_code_t *) parser_malloc (context_p, total_size);
+        -: 1213:
+        -: 1214:#if ENABLED (JERRY_SNAPSHOT_SAVE)
+        -: 1215:  // Avoid getting junk bytes at the end when bytes at the end remain unused:
+    #####: 1216:  if (total_size_used < total_size)
+        -: 1217:  {
+    #####: 1218:    memset (((uint8_t *) compiled_code_p) + total_size_used, 0, total_size - total_size_used);
+        -: 1219:  }
+        -: 1220:#endif /* ENABLED (JERRY_SNAPSHOT_SAVE) */
+        -: 1221:
+        -: 1222:#if ENABLED (JERRY_MEM_STATS)
+    #####: 1223:  jmem_stats_allocate_byte_code_bytes (total_size);
+        -: 1224:#endif /* ENABLED (JERRY_MEM_STATS) */
+        -: 1225:
+        3: 1226:  byte_code_p = (uint8_t *) compiled_code_p;
+        3: 1227:  compiled_code_p->size = (uint16_t) (total_size >> JMEM_ALIGNMENT_LOG);
+        3: 1228:  compiled_code_p->refs = 1;
+        3: 1229:  compiled_code_p->status_flags = CBC_CODE_FLAGS_FUNCTION;
+        -: 1230:
+        -: 1231:#if ENABLED (JERRY_ES2015)
+        3: 1232:  if (context_p->status_flags & PARSER_FUNCTION_HAS_REST_PARAM)
+        -: 1233:  {
+    #####: 1234:    JERRY_ASSERT (context_p->argument_count > 0);
+    #####: 1235:    context_p->argument_count--;
+        -: 1236:  }
+        -: 1237:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1238:
+        3: 1239:  if (needs_uint16_arguments)
+        -: 1240:  {
+    #####: 1241:    cbc_uint16_arguments_t *args_p = (cbc_uint16_arguments_t *) compiled_code_p;
+        -: 1242:
+    #####: 1243:    args_p->stack_limit = context_p->stack_limit;
+    #####: 1244:    args_p->argument_end = context_p->argument_count;
+    #####: 1245:    args_p->register_end = context_p->register_count;
+    #####: 1246:    args_p->ident_end = ident_end;
+    #####: 1247:    args_p->const_literal_end = const_literal_end;
+    #####: 1248:    args_p->literal_end = context_p->literal_count;
+        -: 1249:
+    #####: 1250:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_UINT16_ARGUMENTS;
+    #####: 1251:    byte_code_p += sizeof (cbc_uint16_arguments_t);
+        -: 1252:  }
+        -: 1253:  else
+        -: 1254:  {
+        3: 1255:    cbc_uint8_arguments_t *args_p = (cbc_uint8_arguments_t *) compiled_code_p;
+        -: 1256:
+        3: 1257:    args_p->stack_limit = (uint8_t) context_p->stack_limit;
+        3: 1258:    args_p->argument_end = (uint8_t) context_p->argument_count;
+        3: 1259:    args_p->register_end = (uint8_t) context_p->register_count;
+        3: 1260:    args_p->ident_end = (uint8_t) ident_end;
+        3: 1261:    args_p->const_literal_end = (uint8_t) const_literal_end;
+        3: 1262:    args_p->literal_end = (uint8_t) context_p->literal_count;
+        -: 1263:
+        3: 1264:    byte_code_p += sizeof (cbc_uint8_arguments_t);
+        -: 1265:  }
+        -: 1266:
+        -: 1267:  uint16_t encoding_limit;
+        -: 1268:  uint16_t encoding_delta;
+        -: 1269:
+        3: 1270:  if (context_p->literal_count > CBC_MAXIMUM_SMALL_VALUE)
+        -: 1271:  {
+    #####: 1272:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_FULL_LITERAL_ENCODING;
+    #####: 1273:    encoding_limit = CBC_FULL_LITERAL_ENCODING_LIMIT;
+    #####: 1274:    encoding_delta = CBC_FULL_LITERAL_ENCODING_DELTA;
+        -: 1275:  }
+        -: 1276:  else
+        -: 1277:  {
+        3: 1278:    encoding_limit = CBC_SMALL_LITERAL_ENCODING_LIMIT;
+        3: 1279:    encoding_delta = CBC_SMALL_LITERAL_ENCODING_DELTA;
+        -: 1280:  }
+        -: 1281:
+        3: 1282:  if (context_p->status_flags & PARSER_IS_STRICT)
+        -: 1283:  {
+        1: 1284:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_STRICT_MODE;
+        -: 1285:  }
+        -: 1286:
+        3: 1287:  if (context_p->status_flags & PARSER_ARGUMENTS_NEEDED)
+        -: 1288:  {
+        2: 1289:    if (PARSER_NEEDS_MAPPED_ARGUMENTS (context_p->status_flags))
+        -: 1290:    {
+        1: 1291:      compiled_code_p->status_flags |= CBC_CODE_FLAGS_MAPPED_ARGUMENTS_NEEDED;
+        -: 1292:    }
+        -: 1293:    else
+        -: 1294:    {
+        1: 1295:      compiled_code_p->status_flags |= CBC_CODE_FLAGS_UNMAPPED_ARGUMENTS_NEEDED;
+        -: 1296:    }
+        -: 1297:
+        -: 1298:    /* Arguments is stored in the lexical environment. */
+        2: 1299:    JERRY_ASSERT (context_p->status_flags & PARSER_LEXICAL_ENV_NEEDED);
+        -: 1300:  }
+        -: 1301:
+        3: 1302:  if (!(context_p->status_flags & PARSER_LEXICAL_ENV_NEEDED))
+        -: 1303:  {
+    #####: 1304:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_LEXICAL_ENV_NOT_NEEDED;
+        -: 1305:  }
+        -: 1306:
+        -: 1307:#if ENABLED (JERRY_ES2015)
+        3: 1308:  if (context_p->status_flags & (PARSER_IS_PROPERTY_GETTER | PARSER_IS_PROPERTY_SETTER))
+        -: 1309:  {
+    #####: 1310:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_ACCESSOR;
+        -: 1311:  }
+        -: 1312:
+        3: 1313:  if (context_p->status_flags & PARSER_IS_ARROW_FUNCTION)
+        -: 1314:  {
+    #####: 1315:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_ARROW_FUNCTION;
+        -: 1316:  }
+        -: 1317:
+        3: 1318:  if (context_p->status_flags & PARSER_CLASS_CONSTRUCTOR)
+        -: 1319:  {
+    #####: 1320:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_CLASS_CONSTRUCTOR;
+        -: 1321:  }
+        -: 1322:
+        3: 1323:  if (context_p->status_flags & PARSER_IS_GENERATOR_FUNCTION)
+        -: 1324:  {
+    #####: 1325:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_GENERATOR;
+        -: 1326:  }
+        -: 1327:
+        3: 1328:  if (context_p->status_flags & PARSER_FUNCTION_HAS_REST_PARAM)
+        -: 1329:  {
+    #####: 1330:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_REST_PARAMETER;
+        -: 1331:  }
+        -: 1332:
+        3: 1333:  if (context_p->tagged_template_literal_cp != JMEM_CP_NULL)
+        -: 1334:  {
+    #####: 1335:    compiled_code_p->status_flags |= CBC_CODE_FLAG_HAS_TAGGED_LITERALS;
+        -: 1336:  }
+        -: 1337:
+        3: 1338:  if (context_p->status_flags & PARSER_LEXICAL_BLOCK_NEEDED)
+        -: 1339:  {
+    #####: 1340:    JERRY_ASSERT (!(context_p->status_flags & PARSER_IS_FUNCTION));
+    #####: 1341:    compiled_code_p->status_flags |= CBC_CODE_FLAGS_LEXICAL_BLOCK_NEEDED;
+        -: 1342:  }
+        -: 1343:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1344:
+        3: 1345:  literal_pool_p = ((ecma_value_t *) byte_code_p) - context_p->register_count;
+        3: 1346:  byte_code_p += literal_length;
+        3: 1347:  dst_p = byte_code_p;
+        -: 1348:
+        3: 1349:  parser_init_literal_pool (context_p, literal_pool_p);
+        -: 1350:
+        3: 1351:  page_p = context_p->byte_code.first_p;
+        3: 1352:  offset = 0;
+        3: 1353:  real_offset = 0;
+        3: 1354:  uint8_t last_register_index = (uint8_t) JERRY_MIN (context_p->register_count,
+        -: 1355:                                                     (PARSER_MAXIMUM_NUMBER_OF_REGISTERS - 1));
+        -: 1356:
+       75: 1357:  while (page_p != last_page_p || offset < last_position)
+        -: 1358:  {
+        -: 1359:    uint8_t flags;
+        -: 1360:    uint8_t *opcode_p;
+        -: 1361:    uint8_t *branch_mark_p;
+        -: 1362:    cbc_opcode_t opcode;
+        -: 1363:    size_t branch_offset_length;
+        -: 1364:
+       69: 1365:    opcode_p = dst_p;
+       69: 1366:    branch_mark_p = page_p->bytes + offset;
+       69: 1367:    opcode = (cbc_opcode_t) (*branch_mark_p);
+       69: 1368:    branch_offset_length = CBC_BRANCH_OFFSET_LENGTH (opcode);
+        -: 1369:
+       69: 1370:    if (opcode == CBC_JUMP_FORWARD)
+        -: 1371:    {
+        -: 1372:      /* These opcodes are deleted from the stream. */
+    #####: 1373:      size_t counter = PARSER_MAX_BRANCH_LENGTH + 1;
+        -: 1374:
+        -: 1375:      do
+        -: 1376:      {
+    #####: 1377:        PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+        -: 1378:      }
+    #####: 1379:      while (--counter > 0);
+        -: 1380:
+    #####: 1381:      continue;
+        -: 1382:    }
+        -: 1383:
+        -: 1384:    /* Storing the opcode */
+       69: 1385:    *dst_p++ = (uint8_t) opcode;
+       69: 1386:    real_offset++;
+       69: 1387:    PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+       69: 1388:    flags = cbc_flags[opcode];
+        -: 1389:
+        -: 1390:#if ENABLED (JERRY_DEBUGGER)
+        -: 1391:    if (opcode == CBC_BREAKPOINT_DISABLED)
+        -: 1392:    {
+        -: 1393:      uint32_t bp_offset = (uint32_t) (((uint8_t *) dst_p) - ((uint8_t *) compiled_code_p) - 1);
+        -: 1394:      parser_append_breakpoint_info (context_p, JERRY_DEBUGGER_BREAKPOINT_OFFSET_LIST, bp_offset);
+        -: 1395:    }
+        -: 1396:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 1397:
+       69: 1398:    if (opcode == CBC_EXT_OPCODE)
+        -: 1399:    {
+        -: 1400:      cbc_ext_opcode_t ext_opcode;
+        -: 1401:
+        4: 1402:      ext_opcode = (cbc_ext_opcode_t) page_p->bytes[offset];
+        4: 1403:      flags = cbc_ext_flags[ext_opcode];
+        4: 1404:      branch_offset_length = CBC_BRANCH_OFFSET_LENGTH (ext_opcode);
+        -: 1405:
+        -: 1406:      /* Storing the extended opcode */
+        4: 1407:      *dst_p++ = (uint8_t) ext_opcode;
+        4: 1408:      opcode_p++;
+        4: 1409:      real_offset++;
+        4: 1410:      PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+        -: 1411:
+        -: 1412:#if ENABLED (JERRY_LINE_INFO)
+    #####: 1413:      if (ext_opcode == CBC_EXT_LINE)
+        -: 1414:      {
+    #####: 1415:        uint8_t last_byte = 0;
+        -: 1416:
+        -: 1417:        do
+        -: 1418:        {
+    #####: 1419:          last_byte = page_p->bytes[offset];
+    #####: 1420:          *dst_p++ = last_byte;
+        -: 1421:
+    #####: 1422:          real_offset++;
+    #####: 1423:          PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+        -: 1424:        }
+    #####: 1425:        while (last_byte & CBC_HIGHEST_BIT_MASK);
+        -: 1426:
+    #####: 1427:        continue;
+        -: 1428:      }
+        -: 1429:#endif /* ENABLED (JERRY_LINE_INFO) */
+        -: 1430:    }
+        -: 1431:
+        -: 1432:    /* Only literal and call arguments can be combined. */
+       69: 1433:    JERRY_ASSERT (!(flags & CBC_HAS_BRANCH_ARG)
+        -: 1434:                   || !(flags & (CBC_HAS_BYTE_ARG | CBC_HAS_LITERAL_ARG)));
+        -: 1435:
+      161: 1436:    while (flags & (CBC_HAS_LITERAL_ARG | CBC_HAS_LITERAL_ARG2))
+        -: 1437:    {
+       72: 1438:      uint16_t first_byte = page_p->bytes[offset];
+        -: 1439:
+       72: 1440:      uint8_t *opcode_pos_p = dst_p - 1;
+       72: 1441:      *dst_p++ = (uint8_t) first_byte;
+       72: 1442:      real_offset++;
+       72: 1443:      PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+        -: 1444:
+       72: 1445:      if (first_byte > literal_one_byte_limit)
+        -: 1446:      {
+    #####: 1447:        *dst_p++ = page_p->bytes[offset];
+        -: 1448:
+    #####: 1449:        if (first_byte > encoding_limit)
+        -: 1450:        {
+    #####: 1451:          first_byte = (uint16_t) (((first_byte << 8) | dst_p[-1]) - encoding_delta);
+        -: 1452:        }
+    #####: 1453:        real_offset++;
+        -: 1454:      }
+       72: 1455:      PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+        -: 1456:
+       72: 1457:      if (flags & CBC_HAS_LITERAL_ARG2)
+        -: 1458:      {
+       23: 1459:        if (flags & CBC_HAS_LITERAL_ARG)
+        -: 1460:        {
+       20: 1461:          flags = CBC_HAS_LITERAL_ARG;
+        -: 1462:        }
+        -: 1463:        else
+        -: 1464:        {
+        3: 1465:          flags = CBC_HAS_LITERAL_ARG | CBC_HAS_LITERAL_ARG2;
+        -: 1466:        }
+        -: 1467:      }
+        -: 1468:      else
+        -: 1469:      {
+       49: 1470:        if (opcode == CBC_ASSIGN_SET_IDENT && JERRY_LIKELY (first_byte < last_register_index))
+        -: 1471:        {
+    #####: 1472:          *opcode_pos_p = CBC_MOV_IDENT;
+        -: 1473:        }
+        -: 1474:
+       49: 1475:        break;
+        -: 1476:      }
+        -: 1477:    }
+        -: 1478:
+       69: 1479:    if (flags & CBC_HAS_BYTE_ARG)
+        -: 1480:    {
+        -: 1481:      /* This argument will be copied without modification. */
+        2: 1482:      *dst_p++ = page_p->bytes[offset];
+        2: 1483:      real_offset++;
+        2: 1484:      PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+        2: 1485:      continue;
+        -: 1486:    }
+        -: 1487:
+       67: 1488:    if (flags & CBC_HAS_BRANCH_ARG)
+        -: 1489:    {
+        2: 1490:      *branch_mark_p |= CBC_HIGHEST_BIT_MASK;
+        2: 1491:      bool prefix_zero = true;
+        -: 1492:
+        -: 1493:      /* The leading zeroes are dropped from the stream. */
+        2: 1494:      JERRY_ASSERT (branch_offset_length > 0 && branch_offset_length <= 3);
+        -: 1495:
+        6: 1496:      while (--branch_offset_length > 0)
+        -: 1497:      {
+        2: 1498:        uint8_t byte = page_p->bytes[offset];
+        2: 1499:        if (byte > 0 || !prefix_zero)
+        -: 1500:        {
+    #####: 1501:          prefix_zero = false;
+    #####: 1502:          *dst_p++ = page_p->bytes[offset];
+    #####: 1503:          real_offset++;
+        -: 1504:        }
+        -: 1505:        else
+        -: 1506:        {
+        -: 1507:          /* When a leading zero is dropped, the branch
+        -: 1508:           * offset length must be decreased as well. */
+        2: 1509:          (*opcode_p)--;
+        -: 1510:        }
+        2: 1511:        PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+        -: 1512:      }
+        -: 1513:
+        2: 1514:      *dst_p++ = page_p->bytes[offset];
+        2: 1515:      real_offset++;
+        2: 1516:      PARSER_NEXT_BYTE_UPDATE (page_p, offset, real_offset);
+        2: 1517:      continue;
+        -: 1518:    }
+        -: 1519:  }
+        -: 1520:
+        -: 1521:#if ENABLED (JERRY_DEBUGGER)
+        -: 1522:  if ((JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 1523:      && context_p->breakpoint_info_count > 0)
+        -: 1524:  {
+        -: 1525:    parser_send_breakpoints (context_p, JERRY_DEBUGGER_BREAKPOINT_OFFSET_LIST);
+        -: 1526:    JERRY_ASSERT (context_p->breakpoint_info_count == 0);
+        -: 1527:  }
+        -: 1528:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 1529:
+        3: 1530:  if (!(context_p->status_flags & PARSER_NO_END_LABEL))
+        -: 1531:  {
+        3: 1532:    *dst_p++ = CBC_RETURN_WITH_BLOCK;
+        -: 1533:
+        -: 1534:#if ENABLED (JERRY_ES2015)
+        3: 1535:    if (context_p->status_flags & PARSER_IS_ASYNC_FUNCTION)
+        -: 1536:    {
+    #####: 1537:      dst_p[-1] = CBC_PUSH_UNDEFINED;
+    #####: 1538:      dst_p[0] = CBC_EXT_OPCODE;
+    #####: 1539:      dst_p[1] = CBC_EXT_RETURN_PROMISE;
+    #####: 1540:      dst_p += 2;
+        -: 1541:    }
+        -: 1542:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1543:  }
+        3: 1544:  JERRY_ASSERT (dst_p == byte_code_p + length);
+        -: 1545:
+        3: 1546:  parse_update_branches (context_p, byte_code_p);
+        -: 1547:
+        3: 1548:  parser_cbc_stream_free (&context_p->byte_code);
+        -: 1549:
+        -: 1550:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 1551:  if (context_p->is_show_opcodes)
+        -: 1552:  {
+        -: 1553:    parser_list_iterator_t literal_iterator;
+        -: 1554:    lexer_literal_t *literal_p;
+        -: 1555:
+        -: 1556:    parse_print_final_cbc (compiled_code_p, &context_p->literal_pool, length);
+        -: 1557:    JERRY_DEBUG_MSG ("\nByte code size: %d bytes\n", (int) length);
+        -: 1558:    context_p->total_byte_code_size += (uint32_t) length;
+        -: 1559:
+        -: 1560:    parser_list_iterator_init (&context_p->literal_pool, &literal_iterator);
+        -: 1561:    while ((literal_p = (lexer_literal_t *) parser_list_iterator_next (&literal_iterator)))
+        -: 1562:    {
+        -: 1563:      if ((literal_p->type == LEXER_IDENT_LITERAL || literal_p->type == LEXER_STRING_LITERAL)
+        -: 1564:          && !(literal_p->status_flags & LEXER_FLAG_SOURCE_PTR))
+        -: 1565:      {
+        -: 1566:        jmem_heap_free_block ((void *) literal_p->u.char_p, literal_p->prop.length);
+        -: 1567:      }
+        -: 1568:    }
+        -: 1569:  }
+        -: 1570:#else /* !ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        3: 1571:  if (context_p->status_flags & PARSER_HAS_LATE_LIT_INIT)
+        -: 1572:  {
+        3: 1573:    parser_list_iterator_t literal_iterator;
+        -: 1574:    lexer_literal_t *literal_p;
+        3: 1575:    uint16_t register_count = context_p->register_count;
+        -: 1576:
+        3: 1577:    parser_list_iterator_init (&context_p->literal_pool, &literal_iterator);
+       40: 1578:    while ((literal_p = (lexer_literal_t *) parser_list_iterator_next (&literal_iterator)))
+        -: 1579:    {
+       34: 1580:      if ((literal_p->status_flags & LEXER_FLAG_LATE_INIT)
+       27: 1581:          && literal_p->prop.index >= register_count)
+        -: 1582:      {
+       27: 1583:        uint32_t source_data = literal_p->u.source_data;
+       27: 1584:        const uint8_t *char_p = context_p->source_end_p - (source_data & 0xfffff);
+       27: 1585:        ecma_value_t lit_value = ecma_find_or_create_literal_string (char_p,
+        -: 1586:                                                                     source_data >> 20);
+       27: 1587:        literal_pool_p[literal_p->prop.index] = lit_value;
+        -: 1588:      }
+        -: 1589:    }
+        -: 1590:  }
+        -: 1591:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 1592:
+        3: 1593:  if (PARSER_NEEDS_MAPPED_ARGUMENTS (context_p->status_flags))
+        -: 1594:  {
+        1: 1595:    parser_list_iterator_t literal_iterator;
+        1: 1596:    uint16_t argument_count = 0;
+        1: 1597:    uint16_t register_count = context_p->register_count;
+        1: 1598:    ecma_value_t *argument_base_p = (ecma_value_t *) (((uint8_t *) compiled_code_p) + total_size);
+        1: 1599:    argument_base_p -= context_p->argument_count;
+        -: 1600:
+        1: 1601:    parser_list_iterator_init (&context_p->literal_pool, &literal_iterator);
+        2: 1602:    while (argument_count < context_p->argument_count)
+        -: 1603:    {
+        -: 1604:      lexer_literal_t *literal_p;
+    #####: 1605:      literal_p = (lexer_literal_t *) parser_list_iterator_next (&literal_iterator);
+        -: 1606:
+    #####: 1607:      JERRY_ASSERT (literal_p != NULL);
+        -: 1608:
+    #####: 1609:      if (!(literal_p->status_flags & LEXER_FLAG_FUNCTION_ARGUMENT))
+        -: 1610:      {
+    #####: 1611:        continue;
+        -: 1612:      }
+        -: 1613:
+        -: 1614:      /* All arguments must be moved to initialized registers. */
+    #####: 1615:      if (literal_p->type == LEXER_UNUSED_LITERAL)
+        -: 1616:      {
+    #####: 1617:        argument_base_p[argument_count] = ECMA_VALUE_EMPTY;
+    #####: 1618:        argument_count++;
+    #####: 1619:        continue;
+        -: 1620:      }
+        -: 1621:
+    #####: 1622:      JERRY_ASSERT (literal_p->type == LEXER_IDENT_LITERAL);
+        -: 1623:
+    #####: 1624:      JERRY_ASSERT (literal_p->prop.index >= register_count);
+        -: 1625:
+    #####: 1626:      argument_base_p[argument_count] = literal_pool_p[literal_p->prop.index];
+    #####: 1627:      argument_count++;
+        -: 1628:    }
+        -: 1629:  }
+        -: 1630:
+        -: 1631:#if ENABLED (JERRY_ES2015)
+        3: 1632:  if (context_p->tagged_template_literal_cp != JMEM_CP_NULL)
+        -: 1633:  {
+    #####: 1634:    ecma_value_t *tagged_base_p = (ecma_value_t *) (((uint8_t *) compiled_code_p) + total_size);
+        -: 1635:
+    #####: 1636:    if (PARSER_NEEDS_MAPPED_ARGUMENTS (context_p->status_flags))
+        -: 1637:    {
+    #####: 1638:      tagged_base_p -= context_p->argument_count;
+        -: 1639:    }
+        -: 1640:
+    #####: 1641:    tagged_base_p[-1] = (ecma_value_t) context_p->tagged_template_literal_cp;
+        -: 1642:
+    #####: 1643:    ecma_collection_t *collection_p = ECMA_GET_INTERNAL_VALUE_POINTER (ecma_collection_t,
+        -: 1644:                                                                       context_p->tagged_template_literal_cp);
+        -: 1645:
+    #####: 1646:    for (uint32_t i = 0; i < collection_p->item_count; i++)
+        -: 1647:    {
+    #####: 1648:      ecma_free_value (collection_p->buffer_p[i]);
+        -: 1649:    }
+        -: 1650:  }
+        -: 1651:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1652:
+        -: 1653:#if ENABLED (JERRY_LINE_INFO) || ENABLED (JERRY_ES2015_MODULE_SYSTEM)
+        3: 1654:  if (JERRY_CONTEXT (resource_name) != ECMA_VALUE_UNDEFINED)
+        -: 1655:  {
+        3: 1656:    ecma_value_t *resource_name_p = (ecma_value_t *) (((uint8_t *) compiled_code_p) + total_size);
+        -: 1657:
+        3: 1658:    if (PARSER_NEEDS_MAPPED_ARGUMENTS (context_p->status_flags))
+        -: 1659:    {
+        1: 1660:      resource_name_p -= context_p->argument_count;
+        -: 1661:    }
+        -: 1662:
+        -: 1663:#if ENABLED (JERRY_ES2015)
+        3: 1664:    if (context_p->tagged_template_literal_cp != JMEM_CP_NULL)
+        -: 1665:    {
+    #####: 1666:      resource_name_p--;
+        -: 1667:    }
+        -: 1668:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1669:
+        3: 1670:    resource_name_p[-1] = JERRY_CONTEXT (resource_name);
+        -: 1671:  }
+        -: 1672:#endif /* ENABLED (JERRY_LINE_INFO) || ENABLED (JERRY_ES2015_MODULE_SYSTEM) */
+        -: 1673:
+        -: 1674:#if ENABLED (JERRY_DEBUGGER)
+        -: 1675:  if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 1676:  {
+        -: 1677:    jerry_debugger_send_function_cp (JERRY_DEBUGGER_BYTE_CODE_CP, compiled_code_p);
+        -: 1678:  }
+        -: 1679:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 1680:
+        3: 1681:  return compiled_code_p;
+        -: 1682:} /* parser_post_processing */
+        -: 1683:
+        -: 1684:#undef PARSER_NEXT_BYTE
+        -: 1685:#undef PARSER_NEXT_BYTE_UPDATE
+        -: 1686:
+        -: 1687:/**
+        -: 1688: * Free identifiers and literals.
+        -: 1689: */
+        -: 1690:static void
+     1297: 1691:parser_free_literals (parser_list_t *literal_pool_p) /**< literals */
+        -: 1692:{
+     1297: 1693:  parser_list_iterator_t literal_iterator;
+        -: 1694:  lexer_literal_t *literal_p;
+        -: 1695:
+     1297: 1696:  parser_list_iterator_init (literal_pool_p, &literal_iterator);
+     2594: 1697:  while ((literal_p = (lexer_literal_t *) parser_list_iterator_next (&literal_iterator)) != NULL)
+        -: 1698:  {
+    #####: 1699:    util_free_literal (literal_p);
+        -: 1700:  }
+        -: 1701:
+     1297: 1702:  parser_list_free (literal_pool_p);
+     1297: 1703:} /* parser_free_literals */
+        -: 1704:
+        -: 1705:/**
+        -: 1706: * Parse function arguments
+        -: 1707: */
+        -: 1708:static void
+        2: 1709:parser_parse_function_arguments (parser_context_t *context_p, /**< context */
+        -: 1710:                                 lexer_token_type_t end_type) /**< expected end type */
+        -: 1711:{
+        2: 1712:  JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_FUNCTION);
+        -: 1713:
+        -: 1714:#if ENABLED (JERRY_ES2015)
+        2: 1715:  JERRY_ASSERT (context_p->status_flags & PARSER_IS_FUNCTION);
+        2: 1716:  JERRY_ASSERT (!(context_p->status_flags & PARSER_LEXICAL_BLOCK_NEEDED));
+        -: 1717:
+        2: 1718:  bool has_duplicated_arg_names = false;
+        -: 1719:
+        -: 1720:  /* TODO: Currently async iterators are not supported, so generators ignore the async modifier. */
+        2: 1721:  uint32_t mask = (PARSER_IS_GENERATOR_FUNCTION | PARSER_IS_ASYNC_FUNCTION);
+        2: 1722:  if ((context_p->status_flags & mask) == mask)
+        -: 1723:  {
+    #####: 1724:    context_p->status_flags &= (uint32_t) ~PARSER_IS_ASYNC_FUNCTION;
+        -: 1725:  }
+        -: 1726:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1727:
+        2: 1728:  if (context_p->token.type == end_type)
+        -: 1729:  {
+        -: 1730:#if ENABLED (JERRY_ES2015)
+        1: 1731:    if (context_p->status_flags & PARSER_IS_GENERATOR_FUNCTION)
+        -: 1732:    {
+    #####: 1733:      parser_emit_cbc_ext (context_p, CBC_EXT_CREATE_GENERATOR);
+    #####: 1734:      parser_emit_cbc (context_p, CBC_POP);
+        -: 1735:    }
+        -: 1736:
+        1: 1737:    context_p->status_flags &= (uint32_t) ~PARSER_DISALLOW_AWAIT_YIELD;
+        -: 1738:#endif /* ENABLED (JERRY_ES2015) */
+        1: 1739:    scanner_create_variables (context_p, SCANNER_CREATE_VARS_NO_OPTS);
+        1: 1740:    return;
+        -: 1741:  }
+        -: 1742:
+        -: 1743:#if ENABLED (JERRY_ES2015)
+        1: 1744:  bool has_mapped_arguments = (context_p->next_scanner_info_p->u8_arg & SCANNER_FUNCTION_MAPPED_ARGUMENTS) != 0;
+        -: 1745:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1746:
+        1: 1747:  scanner_create_variables (context_p, SCANNER_CREATE_VARS_IS_FUNCTION_ARGS);
+        1: 1748:  scanner_set_active (context_p);
+        -: 1749:
+        -: 1750:#if ENABLED (JERRY_ES2015)
+        1: 1751:  context_p->status_flags |= PARSER_FUNCTION_IS_PARSING_ARGS;
+        -: 1752:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1753:
+        -: 1754:  while (true)
+        2: 1755:  {
+        -: 1756:#if ENABLED (JERRY_ES2015)
+        3: 1757:    if (context_p->status_flags & PARSER_FUNCTION_HAS_REST_PARAM)
+        -: 1758:    {
+    #####: 1759:      parser_raise_error (context_p, PARSER_ERR_FORMAL_PARAM_AFTER_REST_PARAMETER);
+        -: 1760:    }
+        3: 1761:    else if (context_p->token.type == LEXER_THREE_DOTS)
+        -: 1762:    {
+    #####: 1763:      if (context_p->status_flags & PARSER_IS_PROPERTY_SETTER)
+        -: 1764:      {
+    #####: 1765:        parser_raise_error (context_p, PARSER_ERR_SETTER_REST_PARAMETER);
+        -: 1766:      }
+    #####: 1767:      lexer_next_token (context_p);
+        -: 1768:
+    #####: 1769:      if (has_duplicated_arg_names)
+        -: 1770:      {
+    #####: 1771:        parser_raise_error (context_p, PARSER_ERR_DUPLICATED_ARGUMENT_NAMES);
+        -: 1772:      }
+        -: 1773:
+    #####: 1774:      context_p->status_flags |= PARSER_FUNCTION_HAS_REST_PARAM | PARSER_FUNCTION_HAS_NON_SIMPLE_PARAM;
+        -: 1775:    }
+        -: 1776:
+        3: 1777:    if (context_p->token.type == LEXER_LEFT_SQUARE || context_p->token.type == LEXER_LEFT_BRACE)
+        -: 1778:    {
+    #####: 1779:      if (has_duplicated_arg_names)
+        -: 1780:      {
+    #####: 1781:        parser_raise_error (context_p, PARSER_ERR_DUPLICATED_ARGUMENT_NAMES);
+        -: 1782:      }
+        -: 1783:
+    #####: 1784:      context_p->status_flags |= PARSER_FUNCTION_HAS_NON_SIMPLE_PARAM;
+        -: 1785:
+    #####: 1786:      parser_emit_cbc_literal (context_p,
+        -: 1787:                               CBC_PUSH_LITERAL,
+    #####: 1788:                               (uint16_t) (PARSER_REGISTER_START + context_p->argument_count));
+        -: 1789:
+    #####: 1790:      uint32_t flags = (PARSER_PATTERN_BINDING
+        -: 1791:                        | PARSER_PATTERN_TARGET_ON_STACK
+        -: 1792:                        | PARSER_PATTERN_LOCAL
+        -: 1793:                        | PARSER_PATTERN_ARGUMENTS);
+        -: 1794:
+    #####: 1795:      if (context_p->next_scanner_info_p->source_p == context_p->source_p)
+        -: 1796:      {
+    #####: 1797:        JERRY_ASSERT (context_p->next_scanner_info_p->type == SCANNER_TYPE_INITIALIZER);
+        -: 1798:
+    #####: 1799:        if (context_p->status_flags & PARSER_FUNCTION_HAS_REST_PARAM)
+        -: 1800:        {
+    #####: 1801:          parser_raise_error (context_p, PARSER_ERR_REST_PARAMETER_DEFAULT_INITIALIZER);
+        -: 1802:        }
+        -: 1803:
+    #####: 1804:        flags |= PARSER_PATTERN_TARGET_DEFAULT;
+        -: 1805:      }
+        -: 1806:
+    #####: 1807:      parser_parse_initializer (context_p, flags);
+        -: 1808:
+    #####: 1809:      context_p->argument_count++;
+    #####: 1810:      if (context_p->argument_count >= PARSER_MAXIMUM_NUMBER_OF_REGISTERS)
+        -: 1811:      {
+    #####: 1812:        parser_raise_error (context_p, PARSER_ERR_ARGUMENT_LIMIT_REACHED);
+        -: 1813:      }
+        -: 1814:
+    #####: 1815:      if (context_p->token.type != LEXER_COMMA)
+        -: 1816:      {
+    #####: 1817:        break;
+        -: 1818:      }
+        -: 1819:
+    #####: 1820:      lexer_next_token (context_p);
+    #####: 1821:      continue;
+        -: 1822:    }
+        -: 1823:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1824:
+        3: 1825:    if (context_p->token.type != LEXER_LITERAL
+        3: 1826:        || context_p->token.lit_location.type != LEXER_IDENT_LITERAL)
+        -: 1827:    {
+    #####: 1828:      parser_raise_error (context_p, PARSER_ERR_IDENTIFIER_EXPECTED);
+        -: 1829:    }
+        -: 1830:
+        3: 1831:    lexer_construct_literal_object (context_p,
+        3: 1832:                                    &context_p->token.lit_location,
+        -: 1833:                                    LEXER_IDENT_LITERAL);
+        -: 1834:
+        3: 1835:    if (context_p->token.keyword_type >= LEXER_FIRST_NON_STRICT_ARGUMENTS)
+        -: 1836:    {
+    #####: 1837:      context_p->status_flags |= PARSER_HAS_NON_STRICT_ARG;
+        -: 1838:    }
+        -: 1839:
+        3: 1840:    if (JERRY_UNLIKELY (context_p->lit_object.literal_p->status_flags & LEXER_FLAG_FUNCTION_ARGUMENT))
+        -: 1841:    {
+        -: 1842:#if ENABLED (JERRY_ES2015)
+    #####: 1843:      if ((context_p->status_flags & PARSER_FUNCTION_HAS_NON_SIMPLE_PARAM)
+    #####: 1844:          || (context_p->status_flags & PARSER_IS_ARROW_FUNCTION))
+        -: 1845:      {
+    #####: 1846:        parser_raise_error (context_p, PARSER_ERR_DUPLICATED_ARGUMENT_NAMES);
+        -: 1847:      }
+    #####: 1848:      has_duplicated_arg_names = true;
+        -: 1849:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1850:
+    #####: 1851:      context_p->status_flags |= PARSER_HAS_NON_STRICT_ARG;
+        -: 1852:    }
+        -: 1853:    else
+        -: 1854:    {
+        3: 1855:      context_p->lit_object.literal_p->status_flags |= LEXER_FLAG_FUNCTION_ARGUMENT;
+        -: 1856:    }
+        -: 1857:
+        3: 1858:    lexer_next_token (context_p);
+        -: 1859:
+        -: 1860:#if ENABLED (JERRY_ES2015)
+        3: 1861:    uint16_t literal_index = context_p->lit_object.index;
+        -: 1862:
+        3: 1863:    if (context_p->token.type == LEXER_ASSIGN)
+        -: 1864:    {
+    #####: 1865:      JERRY_ASSERT (!has_mapped_arguments);
+        -: 1866:
+    #####: 1867:      if (context_p->status_flags & PARSER_FUNCTION_HAS_REST_PARAM)
+        -: 1868:      {
+    #####: 1869:        parser_raise_error (context_p, PARSER_ERR_REST_PARAMETER_DEFAULT_INITIALIZER);
+        -: 1870:      }
+        -: 1871:
+    #####: 1872:      parser_branch_t skip_init;
+        -: 1873:
+    #####: 1874:      if (has_duplicated_arg_names)
+        -: 1875:      {
+    #####: 1876:        parser_raise_error (context_p, PARSER_ERR_DUPLICATED_ARGUMENT_NAMES);
+        -: 1877:      }
+        -: 1878:
+    #####: 1879:      context_p->status_flags |= PARSER_FUNCTION_HAS_NON_SIMPLE_PARAM;
+        -: 1880:
+        -: 1881:      /* LEXER_ASSIGN does not overwrite lit_object. */
+    #####: 1882:      parser_emit_cbc_literal (context_p,
+        -: 1883:                               CBC_PUSH_LITERAL,
+    #####: 1884:                               (uint16_t) (PARSER_REGISTER_START + context_p->argument_count));
+    #####: 1885:      parser_emit_cbc_ext_forward_branch (context_p, CBC_EXT_DEFAULT_INITIALIZER, &skip_init);
+        -: 1886:
+    #####: 1887:      lexer_next_token (context_p);
+    #####: 1888:      parser_parse_expression (context_p, PARSE_EXPR_NO_COMMA);
+        -: 1889:
+    #####: 1890:      parser_set_branch_to_current_position (context_p, &skip_init);
+        -: 1891:
+    #####: 1892:      uint16_t opcode = CBC_ASSIGN_LET_CONST;
+        -: 1893:
+    #####: 1894:      if (literal_index >= PARSER_REGISTER_START)
+        -: 1895:      {
+    #####: 1896:        opcode = CBC_ASSIGN_SET_IDENT;
+        -: 1897:      }
+    #####: 1898:      else if (!scanner_literal_is_created (context_p, literal_index))
+        -: 1899:      {
+    #####: 1900:        opcode = CBC_INIT_ARG_OR_CATCH;
+        -: 1901:      }
+        -: 1902:
+    #####: 1903:      parser_emit_cbc_literal (context_p, opcode, literal_index);
+        -: 1904:    }
+        3: 1905:    else if (!has_mapped_arguments && literal_index < PARSER_REGISTER_START)
+        -: 1906:    {
+        3: 1907:      uint16_t opcode = CBC_INIT_ARG_OR_FUNC;
+        -: 1908:
+        3: 1909:      if (scanner_literal_is_created (context_p, literal_index))
+        -: 1910:      {
+    #####: 1911:        opcode = CBC_ASSIGN_LET_CONST_LITERAL;
+        -: 1912:      }
+        -: 1913:
+        6: 1914:      parser_emit_cbc_literal_value (context_p,
+        -: 1915:                                     opcode,
+        3: 1916:                                     (uint16_t) (PARSER_REGISTER_START + context_p->argument_count),
+        -: 1917:                                     literal_index);
+        -: 1918:    }
+        -: 1919:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1920:
+        3: 1921:    context_p->argument_count++;
+        3: 1922:    if (context_p->argument_count >= PARSER_MAXIMUM_NUMBER_OF_REGISTERS)
+        -: 1923:    {
+    #####: 1924:      parser_raise_error (context_p, PARSER_ERR_ARGUMENT_LIMIT_REACHED);
+        -: 1925:    }
+        -: 1926:
+        3: 1927:    if (context_p->token.type != LEXER_COMMA)
+        -: 1928:    {
+        1: 1929:      break;
+        -: 1930:    }
+        -: 1931:
+        2: 1932:    lexer_next_token (context_p);
+        -: 1933:  }
+        -: 1934:
+        1: 1935:  if (context_p->token.type != end_type)
+        -: 1936:  {
+    #####: 1937:    parser_error_t error = ((end_type == LEXER_RIGHT_PAREN) ? PARSER_ERR_RIGHT_PAREN_EXPECTED
+    #####: 1938:                                                            : PARSER_ERR_IDENTIFIER_EXPECTED);
+        -: 1939:
+    #####: 1940:    parser_raise_error (context_p, error);
+        -: 1941:  }
+        -: 1942:
+        1: 1943:  scanner_revert_active (context_p);
+        -: 1944:
+        -: 1945:#if ENABLED (JERRY_ES2015)
+        1: 1946:  JERRY_ASSERT (!has_mapped_arguments || !(context_p->status_flags & PARSER_FUNCTION_HAS_NON_SIMPLE_PARAM));
+        -: 1947:
+        1: 1948:  if (context_p->status_flags & PARSER_IS_GENERATOR_FUNCTION)
+        -: 1949:  {
+    #####: 1950:    parser_emit_cbc_ext (context_p, CBC_EXT_CREATE_GENERATOR);
+    #####: 1951:    parser_emit_cbc (context_p, CBC_POP);
+        -: 1952:  }
+        -: 1953:
+        1: 1954:  if (context_p->status_flags & PARSER_LEXICAL_BLOCK_NEEDED)
+        -: 1955:  {
+    #####: 1956:    if ((context_p->next_scanner_info_p->u8_arg & SCANNER_FUNCTION_LEXICAL_ENV_NEEDED)
+    #####: 1957:        || scanner_is_context_needed (context_p, PARSER_CHECK_FUNCTION_CONTEXT))
+    #####: 1958:    {
+    #####: 1959:      context_p->status_flags |= PARSER_LEXICAL_ENV_NEEDED;
+        -: 1960:
+    #####: 1961:      parser_branch_t branch;
+    #####: 1962:      parser_emit_cbc_forward_branch (context_p, CBC_BLOCK_CREATE_CONTEXT, &branch);
+    #####: 1963:      parser_stack_push (context_p, &branch, sizeof (parser_branch_t));
+        -: 1964:
+        -: 1965:#ifndef JERRY_NDEBUG
+    #####: 1966:      context_p->context_stack_depth = PARSER_BLOCK_CONTEXT_STACK_ALLOCATION;
+        -: 1967:#endif /* !JERRY_NDEBUG */
+        -: 1968:    }
+        -: 1969:    else
+        -: 1970:    {
+    #####: 1971:      context_p->status_flags &= (uint32_t) ~PARSER_LEXICAL_BLOCK_NEEDED;
+        -: 1972:    }
+        -: 1973:  }
+        -: 1974:
+        1: 1975:  context_p->status_flags &= (uint32_t) ~(PARSER_DISALLOW_AWAIT_YIELD | PARSER_FUNCTION_IS_PARSING_ARGS);
+        -: 1976:#endif /* ENABLED (JERRY_ES2015) */
+        -: 1977:
+        1: 1978:  scanner_create_variables (context_p, SCANNER_CREATE_VARS_IS_FUNCTION_BODY);
+        -: 1979:} /* parser_parse_function_arguments */
+        -: 1980:
+        -: 1981:#ifndef JERRY_NDEBUG
+        -: 1982:JERRY_STATIC_ASSERT (PARSER_SCANNING_SUCCESSFUL == PARSER_HAS_LATE_LIT_INIT,
+        -: 1983:                     parser_scanning_successful_should_share_the_bit_position_with_parser_has_late_lit_init);
+        -: 1984:#endif /* !JERRY_NDEBUG */
+        -: 1985:
+        -: 1986:/**
+        -: 1987: * Parse and compile EcmaScript source code
+        -: 1988: *
+        -: 1989: * Note: source must be a valid UTF-8 string
+        -: 1990: *
+        -: 1991: * @return compiled code
+        -: 1992: */
+        -: 1993:static ecma_compiled_code_t *
+     1310: 1994:parser_parse_source (const uint8_t *arg_list_p, /**< function argument list */
+        -: 1995:                     size_t arg_list_size, /**< size of function argument list */
+        -: 1996:                     const uint8_t *source_p, /**< valid UTF-8 source code */
+        -: 1997:                     size_t source_size, /**< size of the source code */
+        -: 1998:                     uint32_t parse_opts, /**< ecma_parse_opts_t option bits */
+        -: 1999:                     parser_error_location_t *error_location_p) /**< error location */
+        -: 2000:{
+     1310: 2001:  parser_context_t context;
+        -: 2002:  ecma_compiled_code_t *compiled_code_p;
+        -: 2003:
+     1310: 2004:  context.error = PARSER_ERR_NO_ERROR;
+        -: 2005:
+     1310: 2006:  if (error_location_p != NULL)
+        -: 2007:  {
+     1310: 2008:    error_location_p->error = PARSER_ERR_NO_ERROR;
+        -: 2009:  }
+        -: 2010:
+     1310: 2011:  context.status_flags = parse_opts & PARSER_STRICT_MODE_MASK;
+     1310: 2012:  context.global_status_flags = parse_opts;
+        -: 2013:
+     1310: 2014:  if (arg_list_p != NULL)
+        -: 2015:  {
+    #####: 2016:    context.status_flags |= PARSER_IS_FUNCTION;
+        -: 2017:#if ENABLED (JERRY_ES2015)
+    #####: 2018:    if (parse_opts & ECMA_PARSE_GENERATOR_FUNCTION)
+        -: 2019:    {
+    #####: 2020:      context.status_flags |= PARSER_IS_GENERATOR_FUNCTION;
+        -: 2021:    }
+        -: 2022:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2023:  }
+        -: 2024:
+        -: 2025:#if ENABLED (JERRY_ES2015)
+     1310: 2026:  context.status_flags |= PARSER_GET_SAVED_FLAGS (parse_opts);
+     1310: 2027:  context.tagged_template_literal_cp = JMEM_CP_NULL;
+        -: 2028:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2029:
+     1310: 2030:  context.stack_depth = 0;
+     1310: 2031:  context.stack_limit = 0;
+     1310: 2032:  context.last_context_p = NULL;
+     1310: 2033:  context.last_statement.current_p = NULL;
+        -: 2034:
+     1310: 2035:  context.token.flags = 0;
+     1310: 2036:  context.line = 1;
+     1310: 2037:  context.column = 1;
+        -: 2038:
+     1310: 2039:  scanner_info_t scanner_info_end;
+     1310: 2040:  scanner_info_end.next_p = NULL;
+     1310: 2041:  scanner_info_end.source_p = NULL;
+     1310: 2042:  scanner_info_end.type = SCANNER_TYPE_END;
+     1310: 2043:  context.next_scanner_info_p = &scanner_info_end;
+     1310: 2044:  context.active_scanner_info_p = NULL;
+     1310: 2045:  context.skipped_scanner_info_p = NULL;
+     1310: 2046:  context.skipped_scanner_info_end_p = NULL;
+        -: 2047:
+     1310: 2048:  context.last_cbc_opcode = PARSER_CBC_UNAVAILABLE;
+        -: 2049:
+     1310: 2050:  context.argument_count = 0;
+     1310: 2051:  context.register_count = 0;
+     1310: 2052:  context.literal_count = 0;
+        -: 2053:
+     1310: 2054:  parser_cbc_stream_init (&context.byte_code);
+     1310: 2055:  context.byte_code_size = 0;
+     1310: 2056:  parser_list_init (&context.literal_pool,
+        -: 2057:                    sizeof (lexer_literal_t),
+        -: 2058:                    (uint32_t) ((128 - sizeof (void *)) / sizeof (lexer_literal_t)));
+     1310: 2059:  context.scope_stack_p = NULL;
+     1310: 2060:  context.scope_stack_size = 0;
+     1310: 2061:  context.scope_stack_top = 0;
+     1310: 2062:  context.scope_stack_reg_top = 0;
+        -: 2063:#if ENABLED (JERRY_ES2015)
+     1310: 2064:  context.scope_stack_global_end = 0;
+     1310: 2065:  context.tagged_template_literal_cp = JMEM_CP_NULL;
+        -: 2066:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2067:
+        -: 2068:#ifndef JERRY_NDEBUG
+     1310: 2069:  context.context_stack_depth = 0;
+        -: 2070:#endif /* !JERRY_NDEBUG */
+        -: 2071:
+        -: 2072:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 2073:  context.is_show_opcodes = (JERRY_CONTEXT (jerry_init_flags) & ECMA_INIT_SHOW_OPCODES);
+        -: 2074:  context.total_byte_code_size = 0;
+        -: 2075:
+        -: 2076:  if (context.is_show_opcodes)
+        -: 2077:  {
+        -: 2078:    JERRY_DEBUG_MSG ("\n--- %s parsing start ---\n\n",
+        -: 2079:                     (arg_list_p == NULL) ? "Script"
+        -: 2080:                                          : "Function");
+        -: 2081:  }
+        -: 2082:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 2083:
+     1310: 2084:  scanner_scan_all (&context,
+        -: 2085:                    arg_list_p,
+        -: 2086:                    arg_list_p + arg_list_size,
+        -: 2087:                    source_p,
+        -: 2088:                    source_p + source_size);
+        -: 2089:
+     1309: 2090:  if (JERRY_UNLIKELY (context.error != PARSER_ERR_NO_ERROR))
+        -: 2091:  {
+       11: 2092:    JERRY_ASSERT (context.error == PARSER_ERR_OUT_OF_MEMORY);
+        -: 2093:
+       11: 2094:    if (error_location_p != NULL)
+        -: 2095:    {
+       11: 2096:      error_location_p->error = context.error;
+       11: 2097:      error_location_p->line = context.token.line;
+       11: 2098:      error_location_p->column = context.token.column;
+        -: 2099:    }
+       11: 2100:    return NULL;
+        -: 2101:  }
+        -: 2102:
+     1298: 2103:  if (arg_list_p == NULL)
+        -: 2104:  {
+     1298: 2105:    context.source_p = source_p;
+     1298: 2106:    context.source_end_p = source_p + source_size;
+        -: 2107:  }
+        -: 2108:  else
+        -: 2109:  {
+    #####: 2110:    context.source_p = arg_list_p;
+    #####: 2111:    context.source_end_p = arg_list_p + arg_list_size;
+        -: 2112:  }
+        -: 2113:
+     1298: 2114:  context.u.allocated_buffer_p = NULL;
+     1298: 2115:  context.line = 1;
+     1298: 2116:  context.column = 1;
+     1298: 2117:  context.token.flags = 0;
+        -: 2118:
+     1298: 2119:  parser_stack_init (&context);
+        -: 2120:
+        -: 2121:#if ENABLED (JERRY_DEBUGGER)
+        -: 2122:  context.breakpoint_info_count = 0;
+        -: 2123:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 2124:
+        -: 2125:#if ENABLED (JERRY_ES2015_MODULE_SYSTEM)
+     1298: 2126:  if (context.global_status_flags & ECMA_PARSE_MODULE)
+        -: 2127:  {
+    #####: 2128:    context.status_flags |= PARSER_IS_STRICT;
+        -: 2129:  }
+        -: 2130:
+     1298: 2131:  context.module_current_node_p = NULL;
+        -: 2132:#endif /* ENABLED (JERRY_ES2015_MODULE_SYSTEM) */
+        -: 2133:
+     2595: 2134:  PARSER_TRY (context.try_buffer)
+        -: 2135:  {
+        -: 2136:    /* Pushing a dummy value ensures the stack is never empty.
+        -: 2137:     * This simplifies the stack management routines. */
+     1298: 2138:    parser_stack_push_uint8 (&context, CBC_MAXIMUM_BYTE_VALUE);
+        -: 2139:    /* The next token must always be present to make decisions
+        -: 2140:     * in the parser. Therefore when a token is consumed, the
+        -: 2141:     * lexer_next_token() must be immediately called. */
+     1298: 2142:    lexer_next_token (&context);
+        -: 2143:
+     1298: 2144:    if (arg_list_p != NULL)
+        -: 2145:    {
+    #####: 2146:      parser_parse_function_arguments (&context, LEXER_EOS);
+        -: 2147:
+    #####: 2148:      JERRY_ASSERT (context.next_scanner_info_p->type == SCANNER_TYPE_END_ARGUMENTS);
+    #####: 2149:      scanner_release_next (&context, sizeof (scanner_info_t));
+        -: 2150:
+    #####: 2151:      context.source_p = source_p;
+    #####: 2152:      context.source_end_p = source_p + source_size;
+    #####: 2153:      context.line = 1;
+    #####: 2154:      context.column = 1;
+        -: 2155:
+    #####: 2156:      lexer_next_token (&context);
+        -: 2157:    }
+        -: 2158:#if ENABLED (JERRY_ES2015_MODULE_SYSTEM)
+     1298: 2159:    else if (parse_opts & ECMA_PARSE_MODULE)
+        -: 2160:    {
+    #####: 2161:      scanner_create_variables (&context, SCANNER_CREATE_VARS_NO_OPTS);
+        -: 2162:    }
+        -: 2163:#endif /* ENABLED (JERRY_ES2015_MODULE_SYSTEM) */
+        -: 2164:    else
+        -: 2165:    {
+     1298: 2166:      JERRY_ASSERT (context.next_scanner_info_p->source_p == source_p
+        -: 2167:                    && context.next_scanner_info_p->type == SCANNER_TYPE_FUNCTION);
+        -: 2168:
+        -: 2169:#if ENABLED (JERRY_ES2015)
+     1298: 2170:      if (scanner_is_context_needed (&context, PARSER_CHECK_GLOBAL_CONTEXT))
+        -: 2171:      {
+    #####: 2172:        context.status_flags |= PARSER_LEXICAL_BLOCK_NEEDED;
+        -: 2173:      }
+        -: 2174:
+     1298: 2175:      if ((parse_opts & ECMA_PARSE_EVAL) == 0)
+        -: 2176:      {
+        1: 2177:        scanner_check_variables (&context);
+        -: 2178:      }
+        -: 2179:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2180:
+     1298: 2181:      scanner_create_variables (&context, SCANNER_CREATE_VARS_IS_SCRIPT);
+        -: 2182:    }
+        -: 2183:
+     1298: 2184:    parser_parse_statements (&context);
+        -: 2185:
+        1: 2186:    JERRY_ASSERT (context.last_statement.current_p == NULL);
+        -: 2187:
+        1: 2188:    JERRY_ASSERT (context.last_cbc_opcode == PARSER_CBC_UNAVAILABLE);
+        1: 2189:    JERRY_ASSERT (context.u.allocated_buffer_p == NULL);
+        -: 2190:
+        -: 2191:#ifndef JERRY_NDEBUG
+        1: 2192:    JERRY_ASSERT (context.status_flags & PARSER_SCANNING_SUCCESSFUL);
+        1: 2193:    JERRY_ASSERT (!(context.global_status_flags & ECMA_PARSE_INTERNAL_FOR_IN_OFF_CONTEXT_ERROR));
+        1: 2194:    context.status_flags &= (uint32_t) ~PARSER_SCANNING_SUCCESSFUL;
+        -: 2195:#endif /* !JERRY_NDEBUG */
+        -: 2196:
+        1: 2197:    JERRY_ASSERT (!(context.status_flags & PARSER_HAS_LATE_LIT_INIT));
+        -: 2198:
+        1: 2199:    compiled_code_p = parser_post_processing (&context);
+        1: 2200:    parser_list_free (&context.literal_pool);
+        -: 2201:
+        -: 2202:    /* When parsing is successful, only the dummy value can be remained on the stack. */
+        1: 2203:    JERRY_ASSERT (context.stack_top_uint8 == CBC_MAXIMUM_BYTE_VALUE
+        -: 2204:                  && context.stack.last_position == 1
+        -: 2205:                  && context.stack.first_p != NULL
+        -: 2206:                  && context.stack.first_p->next_p == NULL
+        -: 2207:                  && context.stack.last_p == NULL);
+        -: 2208:
+        1: 2209:    JERRY_ASSERT (arg_list_p != NULL || !(context.status_flags & PARSER_ARGUMENTS_NEEDED));
+        -: 2210:
+        -: 2211:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 2212:    if (context.is_show_opcodes)
+        -: 2213:    {
+        -: 2214:      JERRY_DEBUG_MSG ("\n%s parsing successfully completed. Total byte code size: %d bytes\n",
+        -: 2215:                       (arg_list_p == NULL) ? "Script"
+        -: 2216:                                            : "Function",
+        -: 2217:                       (int) context.total_byte_code_size);
+        -: 2218:    }
+        -: 2219:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 2220:  }
+        -: 2221:  PARSER_CATCH
+        -: 2222:  {
+     1297: 2223:    if (context.last_statement.current_p != NULL)
+        -: 2224:    {
+     1297: 2225:      parser_free_jumps (context.last_statement);
+        -: 2226:    }
+        -: 2227:
+     1297: 2228:    parser_free_allocated_buffer (&context);
+        -: 2229:
+     1297: 2230:    scanner_cleanup (&context);
+        -: 2231:
+        -: 2232:#if ENABLED (JERRY_ES2015_MODULE_SYSTEM)
+     1297: 2233:    if (context.module_current_node_p != NULL)
+        -: 2234:    {
+    #####: 2235:      ecma_module_release_module_nodes (context.module_current_node_p);
+        -: 2236:    }
+        -: 2237:#endif
+        -: 2238:
+     1297: 2239:    if (error_location_p != NULL)
+        -: 2240:    {
+     1297: 2241:      error_location_p->error = context.error;
+     1297: 2242:      error_location_p->line = context.token.line;
+     1297: 2243:      error_location_p->column = context.token.column;
+        -: 2244:    }
+        -: 2245:
+     1297: 2246:    compiled_code_p = NULL;
+     1297: 2247:    parser_free_literals (&context.literal_pool);
+     1297: 2248:    parser_cbc_stream_free (&context.byte_code);
+        -: 2249:  }
+        -: 2250:  PARSER_TRY_END
+        -: 2251:
+     1298: 2252:  if (context.scope_stack_p != NULL)
+        -: 2253:  {
+        1: 2254:    parser_free (context.scope_stack_p, context.scope_stack_size * sizeof (parser_scope_stack_t));
+        -: 2255:  }
+        -: 2256:
+        -: 2257:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 2258:  if (context.is_show_opcodes)
+        -: 2259:  {
+        -: 2260:    JERRY_DEBUG_MSG ("\n--- %s parsing end ---\n\n",
+        -: 2261:                     (arg_list_p == NULL) ? "Script"
+        -: 2262:                                          : "Function");
+        -: 2263:  }
+        -: 2264:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 2265:
+     1298: 2266:  parser_stack_free (&context);
+        -: 2267:
+     1298: 2268:  return compiled_code_p;
+        -: 2269:} /* parser_parse_source */
+        -: 2270:
+        -: 2271:/**
+        -: 2272: * Save parser context before function parsing.
+        -: 2273: */
+        -: 2274:static void
+        2: 2275:parser_save_context (parser_context_t *context_p, /**< context */
+        -: 2276:                     parser_saved_context_t *saved_context_p) /**< target for saving the context */
+        -: 2277:{
+        2: 2278:  JERRY_ASSERT (context_p->last_cbc_opcode == PARSER_CBC_UNAVAILABLE);
+        -: 2279:
+        -: 2280:#if ENABLED (JERRY_DEBUGGER)
+        -: 2281:  if ((JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 2282:      && context_p->breakpoint_info_count > 0)
+        -: 2283:  {
+        -: 2284:    parser_send_breakpoints (context_p, JERRY_DEBUGGER_BREAKPOINT_LIST);
+        -: 2285:    context_p->breakpoint_info_count = 0;
+        -: 2286:  }
+        -: 2287:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 2288:
+        -: 2289:#if ENABLED (JERRY_ES2015)
+        2: 2290:  if (context_p->status_flags & PARSER_FUNCTION_IS_PARSING_ARGS)
+        -: 2291:  {
+    #####: 2292:    context_p->status_flags |= PARSER_LEXICAL_BLOCK_NEEDED;
+        -: 2293:  }
+        -: 2294:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2295:
+        -: 2296:  /* Save private part of the context. */
+        -: 2297:
+        2: 2298:  saved_context_p->status_flags = context_p->status_flags;
+        2: 2299:  saved_context_p->stack_depth = context_p->stack_depth;
+        2: 2300:  saved_context_p->stack_limit = context_p->stack_limit;
+        2: 2301:  saved_context_p->prev_context_p = context_p->last_context_p;
+        2: 2302:  saved_context_p->last_statement = context_p->last_statement;
+        -: 2303:
+        2: 2304:  saved_context_p->argument_count = context_p->argument_count;
+        2: 2305:  saved_context_p->register_count = context_p->register_count;
+        2: 2306:  saved_context_p->literal_count = context_p->literal_count;
+        -: 2307:
+        2: 2308:  saved_context_p->byte_code = context_p->byte_code;
+        2: 2309:  saved_context_p->byte_code_size = context_p->byte_code_size;
+        2: 2310:  saved_context_p->literal_pool_data = context_p->literal_pool.data;
+        2: 2311:  saved_context_p->scope_stack_p = context_p->scope_stack_p;
+        2: 2312:  saved_context_p->scope_stack_size = context_p->scope_stack_size;
+        2: 2313:  saved_context_p->scope_stack_top = context_p->scope_stack_top;
+        2: 2314:  saved_context_p->scope_stack_reg_top = context_p->scope_stack_reg_top;
+        -: 2315:#if ENABLED (JERRY_ES2015)
+        2: 2316:  saved_context_p->scope_stack_global_end = context_p->scope_stack_global_end;
+        2: 2317:  saved_context_p->tagged_template_literal_cp = context_p->tagged_template_literal_cp;
+        -: 2318:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2319:
+        -: 2320:#ifndef JERRY_NDEBUG
+        2: 2321:  saved_context_p->context_stack_depth = context_p->context_stack_depth;
+        -: 2322:#endif /* !JERRY_NDEBUG */
+        -: 2323:
+        -: 2324:  /* Reset private part of the context. */
+        -: 2325:
+        2: 2326:  context_p->status_flags &= PARSER_IS_STRICT;
+        2: 2327:  context_p->stack_depth = 0;
+        2: 2328:  context_p->stack_limit = 0;
+        2: 2329:  context_p->last_context_p = saved_context_p;
+        2: 2330:  context_p->last_statement.current_p = NULL;
+        -: 2331:
+        2: 2332:  context_p->argument_count = 0;
+        2: 2333:  context_p->register_count = 0;
+        2: 2334:  context_p->literal_count = 0;
+        -: 2335:
+        2: 2336:  parser_cbc_stream_init (&context_p->byte_code);
+        2: 2337:  context_p->byte_code_size = 0;
+        2: 2338:  parser_list_reset (&context_p->literal_pool);
+        2: 2339:  context_p->scope_stack_p = NULL;
+        2: 2340:  context_p->scope_stack_size = 0;
+        2: 2341:  context_p->scope_stack_top = 0;
+        2: 2342:  context_p->scope_stack_reg_top = 0;
+        -: 2343:#if ENABLED (JERRY_ES2015)
+        2: 2344:  context_p->scope_stack_global_end = 0;
+        2: 2345:  context_p->tagged_template_literal_cp = JMEM_CP_NULL;
+        -: 2346:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2347:
+        -: 2348:#ifndef JERRY_NDEBUG
+        2: 2349:  context_p->context_stack_depth = 0;
+        -: 2350:#endif /* !JERRY_NDEBUG */
+        2: 2351:} /* parser_save_context */
+        -: 2352:
+        -: 2353:/**
+        -: 2354: * Restore parser context after function parsing.
+        -: 2355: */
+        -: 2356:static void
+        2: 2357:parser_restore_context (parser_context_t *context_p, /**< context */
+        -: 2358:                        parser_saved_context_t *saved_context_p) /**< target for saving the context */
+        -: 2359:{
+        2: 2360:  parser_list_free (&context_p->literal_pool);
+        -: 2361:
+        2: 2362:  if (context_p->scope_stack_p != NULL)
+        -: 2363:  {
+        2: 2364:    parser_free (context_p->scope_stack_p, context_p->scope_stack_size * sizeof (parser_scope_stack_t));
+        -: 2365:  }
+        -: 2366:
+        -: 2367:  /* Restore private part of the context. */
+        -: 2368:
+        2: 2369:  JERRY_ASSERT (context_p->last_cbc_opcode == PARSER_CBC_UNAVAILABLE);
+        -: 2370:
+        2: 2371:  context_p->status_flags = saved_context_p->status_flags;
+        2: 2372:  context_p->stack_depth = saved_context_p->stack_depth;
+        2: 2373:  context_p->stack_limit = saved_context_p->stack_limit;
+        2: 2374:  context_p->last_context_p = saved_context_p->prev_context_p;
+        2: 2375:  context_p->last_statement = saved_context_p->last_statement;
+        -: 2376:
+        2: 2377:  context_p->argument_count = saved_context_p->argument_count;
+        2: 2378:  context_p->register_count = saved_context_p->register_count;
+        2: 2379:  context_p->literal_count = saved_context_p->literal_count;
+        -: 2380:
+        2: 2381:  context_p->byte_code = saved_context_p->byte_code;
+        2: 2382:  context_p->byte_code_size = saved_context_p->byte_code_size;
+        2: 2383:  context_p->literal_pool.data = saved_context_p->literal_pool_data;
+        2: 2384:  context_p->scope_stack_p = saved_context_p->scope_stack_p;
+        2: 2385:  context_p->scope_stack_size = saved_context_p->scope_stack_size;
+        2: 2386:  context_p->scope_stack_top = saved_context_p->scope_stack_top;
+        2: 2387:  context_p->scope_stack_reg_top = saved_context_p->scope_stack_reg_top;
+        -: 2388:#if ENABLED (JERRY_ES2015)
+        2: 2389:  context_p->scope_stack_global_end = saved_context_p->scope_stack_global_end;
+        2: 2390:  context_p->tagged_template_literal_cp = saved_context_p->tagged_template_literal_cp;
+        -: 2391:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2392:
+        -: 2393:#ifndef JERRY_NDEBUG
+        2: 2394:  context_p->context_stack_depth = saved_context_p->context_stack_depth;
+        -: 2395:#endif /* !JERRY_NDEBUG */
+        2: 2396:} /* parser_restore_context */
+        -: 2397:
+        -: 2398:/**
+        -: 2399: * Parse function code
+        -: 2400: *
+        -: 2401: * @return compiled code
+        -: 2402: */
+        -: 2403:ecma_compiled_code_t *
+        2: 2404:parser_parse_function (parser_context_t *context_p, /**< context */
+        -: 2405:                       uint32_t status_flags) /**< extra status flags */
+        -: 2406:{
+        2: 2407:  parser_saved_context_t saved_context;
+        -: 2408:  ecma_compiled_code_t *compiled_code_p;
+        -: 2409:
+        2: 2410:  JERRY_ASSERT (status_flags & PARSER_IS_FUNCTION);
+        2: 2411:  parser_save_context (context_p, &saved_context);
+        2: 2412:  context_p->status_flags |= status_flags;
+        -: 2413:#if ENABLED (JERRY_ES2015)
+        2: 2414:  context_p->status_flags |= PARSER_ALLOW_NEW_TARGET;
+        -: 2415:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2416:
+        -: 2417:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 2418:  if (context_p->is_show_opcodes)
+        -: 2419:  {
+        -: 2420:#if ENABLED (JERRY_ES2015)
+        -: 2421:    JERRY_DEBUG_MSG ("\n--- %s parsing start ---\n\n",
+        -: 2422:                     (context_p->status_flags & PARSER_CLASS_CONSTRUCTOR) ? "Class constructor"
+        -: 2423:                                                                          : "Function");
+        -: 2424:#else /* !ENABLED (JERRY_ES2015) */
+        -: 2425:    JERRY_DEBUG_MSG ("\n--- Function parsing start ---\n\n");
+        -: 2426:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2427:  }
+        -: 2428:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 2429:
+        -: 2430:#if ENABLED (JERRY_DEBUGGER)
+        -: 2431:  if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 2432:  {
+        -: 2433:    jerry_debugger_send_parse_function (context_p->token.line, context_p->token.column);
+        -: 2434:  }
+        -: 2435:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 2436:
+        2: 2437:  lexer_next_token (context_p);
+        -: 2438:
+        2: 2439:  if (context_p->token.type != LEXER_LEFT_PAREN)
+        -: 2440:  {
+    #####: 2441:    parser_raise_error (context_p, PARSER_ERR_ARGUMENT_LIST_EXPECTED);
+        -: 2442:  }
+        -: 2443:
+        2: 2444:  lexer_next_token (context_p);
+        -: 2445:
+        2: 2446:  parser_parse_function_arguments (context_p, LEXER_RIGHT_PAREN);
+        2: 2447:  lexer_next_token (context_p);
+        -: 2448:
+        2: 2449:  if ((context_p->status_flags & PARSER_IS_PROPERTY_GETTER)
+    #####: 2450:      && context_p->argument_count != 0)
+        -: 2451:  {
+    #####: 2452:    parser_raise_error (context_p, PARSER_ERR_NO_ARGUMENTS_EXPECTED);
+        -: 2453:  }
+        -: 2454:
+        2: 2455:  if ((context_p->status_flags & PARSER_IS_PROPERTY_SETTER)
+    #####: 2456:      && context_p->argument_count != 1)
+        -: 2457:  {
+    #####: 2458:    parser_raise_error (context_p, PARSER_ERR_ONE_ARGUMENT_EXPECTED);
+        -: 2459:  }
+        -: 2460:
+        -: 2461:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 2462:  if (context_p->is_show_opcodes
+        -: 2463:      && (context_p->status_flags & PARSER_HAS_NON_STRICT_ARG))
+        -: 2464:  {
+        -: 2465:    JERRY_DEBUG_MSG ("  Note: legacy (non-strict) argument definition\n\n");
+        -: 2466:  }
+        -: 2467:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 2468:
+        2: 2469:  if (context_p->token.type != LEXER_LEFT_BRACE)
+        -: 2470:  {
+    #####: 2471:    parser_raise_error (context_p, PARSER_ERR_LEFT_BRACE_EXPECTED);
+        -: 2472:  }
+        -: 2473:
+        2: 2474:  lexer_next_token (context_p);
+        2: 2475:  parser_parse_statements (context_p);
+        2: 2476:  compiled_code_p = parser_post_processing (context_p);
+        -: 2477:
+        -: 2478:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 2479:  if (context_p->is_show_opcodes)
+        -: 2480:  {
+        -: 2481:#if ENABLED (JERRY_ES2015)
+        -: 2482:    JERRY_DEBUG_MSG ("\n--- %s parsing end ---\n\n",
+        -: 2483:                     (context_p->status_flags & PARSER_CLASS_CONSTRUCTOR) ? "Class constructor"
+        -: 2484:                                                                          : "Function");
+        -: 2485:#else /* !ENABLED (JERRY_ES2015) */
+        -: 2486:    JERRY_DEBUG_MSG ("\n--- Function parsing end ---\n\n");
+        -: 2487:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2488:  }
+        -: 2489:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 2490:
+        2: 2491:  parser_restore_context (context_p, &saved_context);
+        -: 2492:
+        2: 2493:  return compiled_code_p;
+        -: 2494:} /* parser_parse_function */
+        -: 2495:
+        -: 2496:#if ENABLED (JERRY_ES2015)
+        -: 2497:
+        -: 2498:/**
+        -: 2499: * Parse arrow function code
+        -: 2500: *
+        -: 2501: * @return compiled code
+        -: 2502: */
+        -: 2503:ecma_compiled_code_t *
+    #####: 2504:parser_parse_arrow_function (parser_context_t *context_p, /**< context */
+        -: 2505:                             uint32_t status_flags) /**< extra status flags */
+        -: 2506:{
+    #####: 2507:  parser_saved_context_t saved_context;
+        -: 2508:  ecma_compiled_code_t *compiled_code_p;
+        -: 2509:
+    #####: 2510:  JERRY_ASSERT (status_flags & PARSER_IS_FUNCTION);
+    #####: 2511:  JERRY_ASSERT (status_flags & PARSER_IS_ARROW_FUNCTION);
+    #####: 2512:  parser_save_context (context_p, &saved_context);
+    #####: 2513:  context_p->status_flags |= status_flags;
+    #####: 2514:  context_p->status_flags |= saved_context.status_flags & (PARSER_ALLOW_NEW_TARGET
+        -: 2515:                                                           | PARSER_ALLOW_SUPER
+        -: 2516:                                                           | PARSER_ALLOW_SUPER_CALL);
+        -: 2517:
+        -: 2518:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 2519:  if (context_p->is_show_opcodes)
+        -: 2520:  {
+        -: 2521:    JERRY_DEBUG_MSG ("\n--- Arrow function parsing start ---\n\n");
+        -: 2522:  }
+        -: 2523:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 2524:
+        -: 2525:#if ENABLED (JERRY_DEBUGGER)
+        -: 2526:  if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 2527:  {
+        -: 2528:    jerry_debugger_send_parse_function (context_p->token.line, context_p->token.column);
+        -: 2529:  }
+        -: 2530:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 2531:
+    #####: 2532:  if (context_p->token.type == LEXER_LEFT_PAREN)
+        -: 2533:  {
+    #####: 2534:    lexer_next_token (context_p);
+    #####: 2535:    parser_parse_function_arguments (context_p, LEXER_RIGHT_PAREN);
+    #####: 2536:    lexer_next_token (context_p);
+        -: 2537:  }
+        -: 2538:  else
+        -: 2539:  {
+    #####: 2540:    parser_parse_function_arguments (context_p, LEXER_ARROW);
+        -: 2541:  }
+        -: 2542:
+    #####: 2543:  JERRY_ASSERT (context_p->token.type == LEXER_ARROW);
+        -: 2544:
+    #####: 2545:  lexer_next_token (context_p);
+        -: 2546:
+    #####: 2547:  if (context_p->token.type == LEXER_LEFT_BRACE)
+        -: 2548:  {
+    #####: 2549:    lexer_next_token (context_p);
+        -: 2550:
+    #####: 2551:    context_p->status_flags |= PARSER_IS_CLOSURE;
+    #####: 2552:    parser_parse_statements (context_p);
+        -: 2553:
+        -: 2554:    /* Unlike normal function, arrow functions consume their close brace. */
+    #####: 2555:    JERRY_ASSERT (context_p->token.type == LEXER_RIGHT_BRACE);
+    #####: 2556:    lexer_next_token (context_p);
+        -: 2557:  }
+        -: 2558:  else
+        -: 2559:  {
+    #####: 2560:    if (context_p->status_flags & PARSER_IS_STRICT
+    #####: 2561:        && context_p->status_flags & PARSER_HAS_NON_STRICT_ARG)
+        -: 2562:    {
+    #####: 2563:      parser_raise_error (context_p, PARSER_ERR_NON_STRICT_ARG_DEFINITION);
+        -: 2564:    }
+        -: 2565:
+    #####: 2566:    parser_parse_expression (context_p, PARSE_EXPR_NO_COMMA);
+        -: 2567:
+    #####: 2568:    if (context_p->status_flags & PARSER_IS_ASYNC_FUNCTION)
+        -: 2569:    {
+    #####: 2570:      parser_emit_cbc_ext (context_p, CBC_EXT_RETURN_PROMISE);
+        -: 2571:    }
+        -: 2572:    else
+        -: 2573:    {
+    #####: 2574:      if (context_p->last_cbc_opcode == CBC_PUSH_LITERAL)
+        -: 2575:      {
+    #####: 2576:        context_p->last_cbc_opcode = CBC_RETURN_WITH_LITERAL;
+        -: 2577:      }
+        -: 2578:      else
+        -: 2579:      {
+    #####: 2580:        parser_emit_cbc (context_p, CBC_RETURN);
+        -: 2581:      }
+        -: 2582:    }
+    #####: 2583:    parser_flush_cbc (context_p);
+        -: 2584:
+    #####: 2585:    lexer_update_await_yield (context_p, saved_context.status_flags);
+        -: 2586:  }
+        -: 2587:
+    #####: 2588:  compiled_code_p = parser_post_processing (context_p);
+        -: 2589:
+        -: 2590:#if ENABLED (JERRY_PARSER_DUMP_BYTE_CODE)
+        -: 2591:  if (context_p->is_show_opcodes)
+        -: 2592:  {
+        -: 2593:    JERRY_DEBUG_MSG ("\n--- Arrow function parsing end ---\n\n");
+        -: 2594:  }
+        -: 2595:#endif /* ENABLED (JERRY_PARSER_DUMP_BYTE_CODE) */
+        -: 2596:
+    #####: 2597:  parser_restore_context (context_p, &saved_context);
+        -: 2598:
+    #####: 2599:  return compiled_code_p;
+        -: 2600:} /* parser_parse_arrow_function */
+        -: 2601:
+        -: 2602:#endif /* ENABLED (JERRY_ES2015) */
+        -: 2603:
+        -: 2604:/**
+        -: 2605: * Raise a parse error.
+        -: 2606: */
+        -: 2607:void
+     1308: 2608:parser_raise_error (parser_context_t *context_p, /**< context */
+        -: 2609:                    parser_error_t error) /**< error code */
+        -: 2610:{
+        -: 2611:  /* Must be compatible with the scanner because
+        -: 2612:   * the lexer might throws errors during prescanning. */
+     1308: 2613:  parser_saved_context_t *saved_context_p = context_p->last_context_p;
+        -: 2614:
+     2616: 2615:  while (saved_context_p != NULL)
+        -: 2616:  {
+    #####: 2617:    parser_cbc_stream_free (&saved_context_p->byte_code);
+        -: 2618:
+        -: 2619:    /* First the current literal pool is freed, and then it is replaced
+        -: 2620:     * by the literal pool coming from the saved context. Since literals
+        -: 2621:     * are not used anymore, this is a valid replacement. The last pool
+        -: 2622:     * is freed by parser_parse_source. */
+        -: 2623:
+    #####: 2624:    parser_free_literals (&context_p->literal_pool);
+    #####: 2625:    context_p->literal_pool.data = saved_context_p->literal_pool_data;
+        -: 2626:
+    #####: 2627:    if (context_p->scope_stack_p != NULL)
+        -: 2628:    {
+    #####: 2629:      parser_free (context_p->scope_stack_p, context_p->scope_stack_size * sizeof (parser_scope_stack_t));
+        -: 2630:    }
+    #####: 2631:    context_p->scope_stack_p = saved_context_p->scope_stack_p;
+    #####: 2632:    context_p->scope_stack_size = saved_context_p->scope_stack_size;
+        -: 2633:
+    #####: 2634:    if (saved_context_p->last_statement.current_p != NULL)
+        -: 2635:    {
+    #####: 2636:      parser_free_jumps (saved_context_p->last_statement);
+        -: 2637:    }
+        -: 2638:
+        -: 2639:#if ENABLED (JERRY_ES2015)
+    #####: 2640:    if (saved_context_p->tagged_template_literal_cp != JMEM_CP_NULL)
+        -: 2641:    {
+    #####: 2642:      ecma_collection_free (ECMA_GET_INTERNAL_VALUE_POINTER (ecma_collection_t,
+        -: 2643:                                                             saved_context_p->tagged_template_literal_cp));
+        -: 2644:    }
+        -: 2645:#endif /* ENABLED (JERRY_ES2015)  */
+        -: 2646:
+    #####: 2647:    saved_context_p = saved_context_p->prev_context_p;
+        -: 2648:  }
+        -: 2649:
+        -: 2650:#if ENABLED (JERRY_ES2015)
+     1308: 2651:  if (context_p->tagged_template_literal_cp != JMEM_CP_NULL)
+        -: 2652:  {
+    #####: 2653:    ecma_collection_free (ECMA_GET_INTERNAL_VALUE_POINTER (ecma_collection_t,
+        -: 2654:                                                           context_p->tagged_template_literal_cp));
+        -: 2655:  }
+        -: 2656:#endif /* ENABLED (JERRY_ES2015)  */
+        -: 2657:
+     1308: 2658:  context_p->error = error;
+     1308: 2659:  PARSER_THROW (context_p->try_buffer);
+        -: 2660:  /* Should never been reached. */
+        -: 2661:  JERRY_ASSERT (0);
+        -: 2662:} /* parser_raise_error */
+        -: 2663:
+        -: 2664:#endif /* ENABLED (JERRY_PARSER) */
+        -: 2665:
+        -: 2666:/**
+        -: 2667: * Parse EcmaScript source code
+        -: 2668: *
+        -: 2669: * Note:
+        -: 2670: *      if arg_list_p is not NULL, a function body is parsed
+        -: 2671: *      returned value must be freed with ecma_free_value
+        -: 2672: *
+        -: 2673: * @return true - if success
+        -: 2674: *         syntax error - otherwise
+        -: 2675: */
+        -: 2676:ecma_value_t
+     1310: 2677:parser_parse_script (const uint8_t *arg_list_p, /**< function argument list */
+        -: 2678:                     size_t arg_list_size, /**< size of function argument list */
+        -: 2679:                     const uint8_t *source_p, /**< source code */
+        -: 2680:                     size_t source_size, /**< size of the source code */
+        -: 2681:                     uint32_t parse_opts, /**< ecma_parse_opts_t option bits */
+        -: 2682:                     ecma_compiled_code_t **bytecode_data_p) /**< [out] JS bytecode */
+        -: 2683:{
+        -: 2684:#if ENABLED (JERRY_PARSER)
+     1310: 2685:  parser_error_location_t parser_error;
+        -: 2686:
+        -: 2687:#if ENABLED (JERRY_DEBUGGER)
+        -: 2688:  if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 2689:  {
+        -: 2690:    jerry_debugger_send_string (JERRY_DEBUGGER_SOURCE_CODE,
+        -: 2691:                                JERRY_DEBUGGER_NO_SUBTYPE,
+        -: 2692:                                source_p,
+        -: 2693:                                source_size);
+        -: 2694:  }
+        -: 2695:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 2696:
+     1310: 2697:  *bytecode_data_p = parser_parse_source (arg_list_p,
+        -: 2698:                                          arg_list_size,
+        -: 2699:                                          source_p,
+        -: 2700:                                          source_size,
+        -: 2701:                                          parse_opts,
+        -: 2702:                                          &parser_error);
+        -: 2703:
+     1309: 2704:  if (!*bytecode_data_p)
+        -: 2705:  {
+        -: 2706:#if ENABLED (JERRY_ES2015_MODULE_SYSTEM)
+     1308: 2707:    if (JERRY_CONTEXT (module_top_context_p) != NULL)
+        -: 2708:    {
+    #####: 2709:      ecma_module_cleanup ();
+        -: 2710:    }
+        -: 2711:#endif
+        -: 2712:#if ENABLED (JERRY_DEBUGGER)
+        -: 2713:    if (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED)
+        -: 2714:    {
+        -: 2715:      jerry_debugger_send_type (JERRY_DEBUGGER_PARSE_ERROR);
+        -: 2716:    }
+        -: 2717:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 2718:
+     1308: 2719:    if (parser_error.error == PARSER_ERR_OUT_OF_MEMORY)
+        -: 2720:    {
+        -: 2721:      /* It is unlikely that memory can be allocated in an out-of-memory
+        -: 2722:       * situation. However, a simple value can still be thrown. */
+       11: 2723:      jcontext_raise_exception (ECMA_VALUE_NULL);
+       11: 2724:      return ECMA_VALUE_ERROR;
+        -: 2725:    }
+        -: 2726:
+     1297: 2727:    if (parser_error.error == PARSER_ERR_INVALID_REGEXP)
+        -: 2728:    {
+        -: 2729:      /* The RegExp compiler has already raised an exception. */
+    #####: 2730:      JERRY_ASSERT (jcontext_has_pending_exception ());
+    #####: 2731:      return ECMA_VALUE_ERROR;
+        -: 2732:    }
+        -: 2733:
+        -: 2734:#if ENABLED (JERRY_ERROR_MESSAGES)
+     1297: 2735:    const lit_utf8_byte_t *err_bytes_p = (const lit_utf8_byte_t *) parser_error_to_string (parser_error.error);
+     1297: 2736:    lit_utf8_size_t err_bytes_size = lit_zt_utf8_string_size (err_bytes_p);
+        -: 2737:
+     1297: 2738:    ecma_string_t *err_str_p = ecma_new_ecma_string_from_utf8 (err_bytes_p, err_bytes_size);
+     1297: 2739:    ecma_value_t err_str_val = ecma_make_string_value (err_str_p);
+     1297: 2740:    ecma_value_t line_str_val = ecma_make_uint32_value (parser_error.line);
+     1297: 2741:    ecma_value_t col_str_val = ecma_make_uint32_value (parser_error.column);
+        -: 2742:
+     1297: 2743:    ecma_value_t error_value = ecma_raise_standard_error_with_format (ECMA_ERROR_SYNTAX,
+        -: 2744:                                                                      "% [%:%:%]",
+        -: 2745:                                                                      err_str_val,
+        -: 2746:                                                                      JERRY_CONTEXT (resource_name),
+        -: 2747:                                                                      line_str_val,
+        -: 2748:                                                                      col_str_val);
+        -: 2749:
+     1297: 2750:    ecma_free_value (col_str_val);
+     1297: 2751:    ecma_free_value (line_str_val);
+     1297: 2752:    ecma_free_value (err_str_val);
+        -: 2753:
+     1297: 2754:    return error_value;
+        -: 2755:#else /* !ENABLED (JERRY_ERROR_MESSAGES) */
+        -: 2756:    return ecma_raise_syntax_error ("");
+        -: 2757:#endif /* ENABLED (JERRY_ERROR_MESSAGES) */
+        -: 2758:  }
+        -: 2759:
+        -: 2760:#if ENABLED (JERRY_ES2015_MODULE_SYSTEM)
+        1: 2761:  if (JERRY_CONTEXT (module_top_context_p) != NULL)
+        -: 2762:  {
+    #####: 2763:    ecma_value_t ret_value = ecma_module_parse_modules ();
+        -: 2764:
+    #####: 2765:    if (ECMA_IS_VALUE_ERROR (ret_value))
+        -: 2766:    {
+    #####: 2767:      ecma_bytecode_deref (*bytecode_data_p);
+    #####: 2768:      *bytecode_data_p = NULL;
+    #####: 2769:      ecma_module_cleanup ();
+        -: 2770:
+    #####: 2771:      return ret_value;
+        -: 2772:    }
+        -: 2773:  }
+        -: 2774:#endif /* ENABLED (JERRY_ES2015_MODULE_SYSTEM) */
+        -: 2775:
+        -: 2776:#if ENABLED (JERRY_DEBUGGER)
+        -: 2777:  if ((JERRY_CONTEXT (debugger_flags) & (JERRY_DEBUGGER_CONNECTED | JERRY_DEBUGGER_PARSER_WAIT))
+        -: 2778:      == (JERRY_DEBUGGER_CONNECTED | JERRY_DEBUGGER_PARSER_WAIT))
+        -: 2779:  {
+        -: 2780:    JERRY_DEBUGGER_SET_FLAGS (JERRY_DEBUGGER_PARSER_WAIT_MODE);
+        -: 2781:    jerry_debugger_send_type (JERRY_DEBUGGER_WAITING_AFTER_PARSE);
+        -: 2782:
+        -: 2783:    while (JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_PARSER_WAIT_MODE)
+        -: 2784:    {
+        -: 2785:      jerry_debugger_receive (NULL);
+        -: 2786:
+        -: 2787:      if (!(JERRY_CONTEXT (debugger_flags) & JERRY_DEBUGGER_CONNECTED))
+        -: 2788:      {
+        -: 2789:        break;
+        -: 2790:      }
+        -: 2791:
+        -: 2792:      jerry_debugger_transport_sleep ();
+        -: 2793:    }
+        -: 2794:  }
+        -: 2795:#endif /* ENABLED (JERRY_DEBUGGER) */
+        -: 2796:
+        1: 2797:  return ECMA_VALUE_TRUE;
+        -: 2798:#else /* !ENABLED (JERRY_PARSER) */
+        -: 2799:  JERRY_UNUSED (arg_list_p);
+        -: 2800:  JERRY_UNUSED (arg_list_size);
+        -: 2801:  JERRY_UNUSED (source_p);
+        -: 2802:  JERRY_UNUSED (source_size);
+        -: 2803:  JERRY_UNUSED (parse_opts);
+        -: 2804:  JERRY_UNUSED (bytecode_data_p);
+        -: 2805:
+        -: 2806:  return ecma_raise_syntax_error (ECMA_ERR_MSG ("The parser has been disabled."));
+        -: 2807:#endif /* ENABLED (JERRY_PARSER) */
+        -: 2808:} /* parser_parse_script */
+        -: 2809:
+        -: 2810:/**
+        -: 2811: * @}
+        -: 2812: * @}
+        -: 2813: * @}
+        -: 2814: */

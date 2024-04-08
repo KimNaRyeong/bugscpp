@@ -1,0 +1,223 @@
+        -:    0:Source:/home/workspace/jerry-core/ecma/base/ecma-lcache.c
+        -:    0:Programs:299
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "ecma-lcache.h"
+        -:   17:
+        -:   18:#include "ecma-gc.h"
+        -:   19:#include "ecma-globals.h"
+        -:   20:#include "ecma-helpers.h"
+        -:   21:
+        -:   22:#include "jcontext.h"
+        -:   23:
+        -:   24:/** \addtogroup ecma ECMA
+        -:   25: * @{
+        -:   26: *
+        -:   27: * \addtogroup ecmalcache Property lookup cache
+        -:   28: * @{
+        -:   29: */
+        -:   30:
+        -:   31:#if JERRY_LCACHE
+        -:   32:
+        -:   33:/**
+        -:   34: * Bitshift index for calculating hash.
+        -:   35: */
+        -:   36:#if JERRY_CPOINTER_32_BIT
+        -:   37:#define ECMA_LCACHE_HASH_BITSHIFT_INDEX (2 * JMEM_ALIGNMENT_LOG)
+        -:   38:#else /* !JERRY_CPOINTER_32_BIT */
+        -:   39:#define ECMA_LCACHE_HASH_BITSHIFT_INDEX 0
+        -:   40:#endif /* JERRY_CPOINTER_32_BIT */
+        -:   41:
+        -:   42:/**
+        -:   43: * Mask for hash bits
+        -:   44: */
+        -:   45:#define ECMA_LCACHE_HASH_MASK ((ECMA_LCACHE_HASH_ROWS_COUNT - 1) << ECMA_LCACHE_HASH_BITSHIFT_INDEX)
+        -:   46:
+        -:   47:/**
+        -:   48: * Bitshift index for creating property identifier
+        -:   49: */
+        -:   50:#define ECMA_LCACHE_HASH_ENTRY_ID_SHIFT (8 * sizeof (jmem_cpointer_t))
+        -:   51:
+        -:   52:/**
+        -:   53: * Create property identifier
+        -:   54: */
+        -:   55:#define ECMA_LCACHE_CREATE_ID(object_cp, name_cp) \
+        -:   56:  (((ecma_lcache_hash_entry_id_t) (object_cp) << ECMA_LCACHE_HASH_ENTRY_ID_SHIFT) | (name_cp))
+        -:   57:
+        -:   58:/**
+        -:   59: * Invalidate specified LCache entry
+        -:   60: */
+        -:   61:static inline void JERRY_ATTR_ALWAYS_INLINE
+        -:   62:ecma_lcache_invalidate_entry (ecma_lcache_hash_entry_t *entry_p) /**< entry to invalidate */
+        -:   63:{
+        1:   64:  JERRY_ASSERT (entry_p != NULL);
+        1:   65:  JERRY_ASSERT (entry_p->id != 0);
+        1:   66:  JERRY_ASSERT (entry_p->prop_p != NULL);
+        -:   67:
+        1:   68:  entry_p->id = 0;
+        1:   69:  ecma_set_property_lcached (entry_p->prop_p, false);
+        -:   70:} /* ecma_lcache_invalidate_entry */
+        -:   71:
+        -:   72:/**
+        -:   73: * Compute the row index of object / property name pair
+        -:   74: *
+        -:   75: * @return row index
+        -:   76: */
+        -:   77:static inline size_t JERRY_ATTR_ALWAYS_INLINE
+        -:   78:ecma_lcache_row_index (jmem_cpointer_t object_cp, /**< compressed pointer to object */
+        -:   79:                       jmem_cpointer_t name_cp) /**< compressed pointer to property name */
+        -:   80:{
+        -:   81:  /* Randomize the property name with the object pointer using a xor operation,
+        -:   82:   * so properties of different objects with the same name can be cached effectively. */
+      199:   83:  return (size_t) (((name_cp ^ object_cp) & ECMA_LCACHE_HASH_MASK) >> ECMA_LCACHE_HASH_BITSHIFT_INDEX);
+        -:   84:} /* ecma_lcache_row_index */
+        -:   85:
+        -:   86:/**
+        -:   87: * Insert an entry into LCache
+        -:   88: */
+        -:   89:void
+       24:   90:ecma_lcache_insert (const ecma_object_t *object_p, /**< object */
+        -:   91:                    const jmem_cpointer_t name_cp, /**< property name */
+        -:   92:                    ecma_property_t *prop_p) /**< property */
+        -:   93:{
+       24:   94:  JERRY_ASSERT (object_p != NULL);
+       24:   95:  JERRY_ASSERT (prop_p != NULL && !ecma_is_property_lcached (prop_p));
+       24:   96:  JERRY_ASSERT (ECMA_PROPERTY_IS_NAMED_PROPERTY (*prop_p));
+        -:   97:
+        -:   98:  jmem_cpointer_t object_cp;
+        -:   99:
+       24:  100:  ECMA_SET_NON_NULL_POINTER (object_cp, object_p);
+        -:  101:
+       24:  102:  size_t row_index = ecma_lcache_row_index (object_cp, name_cp);
+       24:  103:  ecma_lcache_hash_entry_t *entry_p = JERRY_CONTEXT (lcache)[row_index];
+       24:  104:  ecma_lcache_hash_entry_t *entry_end_p = entry_p + ECMA_LCACHE_HASH_ROW_LENGTH;
+        -:  105:
+        -:  106:  do
+        -:  107:  {
+       28:  108:    if (entry_p->id == 0)
+        -:  109:    {
+       23:  110:      goto insert;
+        -:  111:    }
+        -:  112:
+        5:  113:    entry_p++;
+        5:  114:  } while (entry_p < entry_end_p);
+        -:  115:
+        -:  116:  /* Invalidate the last entry. */
+        1:  117:  ecma_lcache_invalidate_entry (--entry_p);
+        -:  118:
+        -:  119:  /* Shift other entries towards the end. */
+        2:  120:  for (uint32_t i = 0; i < ECMA_LCACHE_HASH_ROW_LENGTH - 1; i++)
+        -:  121:  {
+        1:  122:    entry_p->id = entry_p[-1].id;
+        1:  123:    entry_p->prop_p = entry_p[-1].prop_p;
+        1:  124:    entry_p--;
+        -:  125:  }
+        -:  126:
+        1:  127:insert:
+       24:  128:  entry_p->prop_p = prop_p;
+       24:  129:  entry_p->id = ECMA_LCACHE_CREATE_ID (object_cp, name_cp);
+        -:  130:
+       24:  131:  ecma_set_property_lcached (entry_p->prop_p, true);
+       24:  132:} /* ecma_lcache_insert */
+        -:  133:
+        -:  134:/**
+        -:  135: * Lookup property in the LCache
+        -:  136: *
+        -:  137: * @return a pointer to an ecma_property_t if the lookup is successful
+        -:  138: *         NULL otherwise
+        -:  139: */
+        -:  140:extern inline ecma_property_t *JERRY_ATTR_ALWAYS_INLINE
+      175:  141:ecma_lcache_lookup (const ecma_object_t *object_p, /**< object */
+        -:  142:                    const ecma_string_t *prop_name_p) /**< property's name */
+        -:  143:{
+      175:  144:  JERRY_ASSERT (object_p != NULL);
+      175:  145:  JERRY_ASSERT (prop_name_p != NULL);
+        -:  146:
+        -:  147:  jmem_cpointer_t object_cp;
+      175:  148:  ECMA_SET_NON_NULL_POINTER (object_cp, object_p);
+        -:  149:
+      175:  150:  ecma_property_t prop_name_type = ECMA_DIRECT_STRING_PTR;
+        -:  151:  jmem_cpointer_t prop_name_cp;
+        -:  152:
+      175:  153:  if (JERRY_UNLIKELY (ECMA_IS_DIRECT_STRING (prop_name_p)))
+        -:  154:  {
+       81:  155:    prop_name_type = (ecma_property_t) ECMA_GET_DIRECT_STRING_TYPE (prop_name_p);
+       81:  156:    prop_name_cp = (jmem_cpointer_t) ECMA_GET_DIRECT_STRING_VALUE (prop_name_p);
+        -:  157:  }
+        -:  158:  else
+        -:  159:  {
+       94:  160:    ECMA_SET_NON_NULL_POINTER (prop_name_cp, prop_name_p);
+        -:  161:  }
+        -:  162:
+      175:  163:  size_t row_index = ecma_lcache_row_index (object_cp, prop_name_cp);
+        -:  164:
+      175:  165:  ecma_lcache_hash_entry_t *entry_p = JERRY_CONTEXT (lcache)[row_index];
+      175:  166:  ecma_lcache_hash_entry_t *entry_end_p = entry_p + ECMA_LCACHE_HASH_ROW_LENGTH;
+      175:  167:  ecma_lcache_hash_entry_id_t id = ECMA_LCACHE_CREATE_ID (object_cp, prop_name_cp);
+        -:  168:
+        -:  169:  do
+        -:  170:  {
+      333:  171:    if (entry_p->id == id && JERRY_LIKELY (ECMA_PROPERTY_GET_NAME_TYPE (*entry_p->prop_p) == prop_name_type))
+        -:  172:    {
+       17:  173:      JERRY_ASSERT (entry_p->prop_p != NULL && ecma_is_property_lcached (entry_p->prop_p));
+       17:  174:      return entry_p->prop_p;
+        -:  175:    }
+      316:  176:    entry_p++;
+      316:  177:  } while (entry_p < entry_end_p);
+        -:  178:
+      158:  179:  return NULL;
+        -:  180:} /* ecma_lcache_lookup */
+        -:  181:
+        -:  182:/**
+        -:  183: * Invalidate LCache entries associated with given object and property name / property
+        -:  184: */
+        -:  185:void
+    #####:  186:ecma_lcache_invalidate (const ecma_object_t *object_p, /**< object */
+        -:  187:                        const jmem_cpointer_t name_cp, /**< property name */
+        -:  188:                        ecma_property_t *prop_p) /**< property */
+        -:  189:{
+    #####:  190:  JERRY_ASSERT (object_p != NULL);
+    #####:  191:  JERRY_ASSERT (prop_p != NULL && ecma_is_property_lcached (prop_p));
+    #####:  192:  JERRY_ASSERT (ECMA_PROPERTY_IS_NAMED_PROPERTY (*prop_p));
+        -:  193:
+        -:  194:  jmem_cpointer_t object_cp;
+    #####:  195:  ECMA_SET_NON_NULL_POINTER (object_cp, object_p);
+        -:  196:
+    #####:  197:  size_t row_index = ecma_lcache_row_index (object_cp, name_cp);
+    #####:  198:  ecma_lcache_hash_entry_t *entry_p = JERRY_CONTEXT (lcache)[row_index];
+        -:  199:
+        -:  200:  while (true)
+        -:  201:  {
+        -:  202:    /* The property must be present. */
+    #####:  203:    JERRY_ASSERT (entry_p - JERRY_CONTEXT (lcache)[row_index] < ECMA_LCACHE_HASH_ROW_LENGTH);
+        -:  204:
+    #####:  205:    if (entry_p->id != 0 && entry_p->prop_p == prop_p)
+        -:  206:    {
+    #####:  207:      JERRY_ASSERT (entry_p->id == ECMA_LCACHE_CREATE_ID (object_cp, name_cp));
+        -:  208:
+    #####:  209:      ecma_lcache_invalidate_entry (entry_p);
+    #####:  210:      return;
+        -:  211:    }
+    #####:  212:    entry_p++;
+        -:  213:  }
+        -:  214:} /* ecma_lcache_invalidate */
+        -:  215:
+        -:  216:#endif /* JERRY_LCACHE */
+        -:  217:
+        -:  218:/**
+        -:  219: * @}
+        -:  220: * @}
+        -:  221: */

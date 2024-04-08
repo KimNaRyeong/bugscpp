@@ -1,0 +1,1077 @@
+        -:    0:Source:/home/workspace/jerry-core/ecma/base/ecma-helpers-number.c
+        -:    0:Programs:291
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include <math.h>
+        -:   17:
+        -:   18:#include "ecma-conversion.h"
+        -:   19:#include "lit-char-helpers.h"
+        -:   20:
+        -:   21:/** \addtogroup ecma ECMA
+        -:   22: * @{
+        -:   23: *
+        -:   24: * \addtogroup ecmahelpers Helpers for operations with ECMA data types
+        -:   25: * @{
+        -:   26: */
+        -:   27:
+        -:   28:JERRY_STATIC_ASSERT (sizeof (ecma_value_t) == sizeof (ecma_integer_value_t),
+        -:   29:                     size_of_ecma_value_t_must_be_equal_to_the_size_of_ecma_integer_value_t);
+        -:   30:
+        -:   31:JERRY_STATIC_ASSERT (ECMA_DIRECT_SHIFT == ECMA_VALUE_SHIFT + 1,
+        -:   32:                     currently_directly_encoded_values_has_one_extra_flag);
+        -:   33:
+        -:   34:JERRY_STATIC_ASSERT (((1 << (ECMA_DIRECT_SHIFT - 1)) | ECMA_TYPE_DIRECT) == ECMA_DIRECT_TYPE_SIMPLE_VALUE,
+        -:   35:                     currently_directly_encoded_values_start_after_direct_type_simple_value);
+        -:   36:/**
+        -:   37: * Position of the sign bit in ecma-numbers
+        -:   38: */
+        -:   39:#define ECMA_NUMBER_SIGN_POS (ECMA_NUMBER_FRACTION_WIDTH + \
+        -:   40:                              ECMA_NUMBER_BIASED_EXP_WIDTH)
+        -:   41:
+        -:   42:#if !JERRY_NUMBER_TYPE_FLOAT64
+        -:   43:JERRY_STATIC_ASSERT (sizeof (ecma_number_t) == sizeof (uint32_t),
+        -:   44:                     size_of_ecma_number_t_must_be_equal_to_4_bytes);
+        -:   45:
+        -:   46:/**
+        -:   47: * Packing sign, fraction and biased exponent to ecma-number
+        -:   48: *
+        -:   49: * @return ecma-number with specified sign, biased_exponent and fraction
+        -:   50: */
+        -:   51:ecma_number_t
+        -:   52:ecma_number_pack (bool sign, /**< sign */
+        -:   53:                  uint32_t biased_exp, /**< biased exponent */
+        -:   54:                  uint64_t fraction) /**< fraction */
+        -:   55:{
+        -:   56:  JERRY_ASSERT ((biased_exp & ~((1u << ECMA_NUMBER_BIASED_EXP_WIDTH) - 1)) == 0);
+        -:   57:  JERRY_ASSERT ((fraction & ~((1ull << ECMA_NUMBER_FRACTION_WIDTH) - 1)) == 0);
+        -:   58:
+        -:   59:  uint32_t packed_value = (((sign ? 1u : 0u) << ECMA_NUMBER_SIGN_POS) |
+        -:   60:                           (biased_exp << ECMA_NUMBER_FRACTION_WIDTH) |
+        -:   61:                           ((uint32_t) fraction));
+        -:   62:
+        -:   63:  ecma_number_accessor_t u;
+        -:   64:  u.as_uint32_t = packed_value;
+        -:   65:  return u.as_ecma_number_t;
+        -:   66:} /* ecma_number_pack */
+        -:   67:
+        -:   68:/**
+        -:   69: * Unpacking sign, fraction and biased exponent from ecma-number
+        -:   70: */
+        -:   71:void
+        -:   72:ecma_number_unpack (ecma_number_t num, /**< ecma-number */
+        -:   73:                    bool *sign_p, /**< [out] sign (optional) */
+        -:   74:                    uint32_t *biased_exp_p, /**< [out] biased exponent (optional) */
+        -:   75:                    uint64_t *fraction_p) /**< [out] fraction (optional) */
+        -:   76:{
+        -:   77:  ecma_number_accessor_t u;
+        -:   78:  u.as_ecma_number_t = num;
+        -:   79:  uint32_t packed_value = u.as_uint32_t;
+        -:   80:
+        -:   81:  if (sign_p != NULL)
+        -:   82:  {
+        -:   83:    *sign_p = ((packed_value >> ECMA_NUMBER_SIGN_POS) != 0);
+        -:   84:  }
+        -:   85:
+        -:   86:  if (biased_exp_p != NULL)
+        -:   87:  {
+        -:   88:    *biased_exp_p = (((packed_value) & ~(1u << ECMA_NUMBER_SIGN_POS)) >> ECMA_NUMBER_FRACTION_WIDTH);
+        -:   89:  }
+        -:   90:
+        -:   91:  if (fraction_p != NULL)
+        -:   92:  {
+        -:   93:    *fraction_p = (packed_value & ((1u << ECMA_NUMBER_FRACTION_WIDTH) - 1));
+        -:   94:  }
+        -:   95:} /* ecma_number_unpack */
+        -:   96:
+        -:   97:/**
+        -:   98: * Value used to calculate exponent from biased exponent
+        -:   99: *
+        -:  100: * See also:
+        -:  101: *          IEEE-754 2008, 3.6, Table 3.5
+        -:  102: */
+        -:  103:const int32_t ecma_number_exponent_bias = 127;
+        -:  104:
+        -:  105:#elif JERRY_NUMBER_TYPE_FLOAT64
+        -:  106:JERRY_STATIC_ASSERT (sizeof (ecma_number_t) == sizeof (uint64_t),
+        -:  107:                     size_of_ecma_number_t_must_be_equal_to_8_bytes);
+        -:  108:
+        -:  109:/**
+        -:  110: * Packing sign, fraction and biased exponent to ecma-number
+        -:  111: *
+        -:  112: * @return ecma-number with specified sign, biased_exponent and fraction
+        -:  113: */
+        -:  114:ecma_number_t
+        1:  115:ecma_number_pack (bool sign, /**< sign */
+        -:  116:                  uint32_t biased_exp, /**< biased exponent */
+        -:  117:                  uint64_t fraction) /**< fraction */
+        -:  118:{
+        2:  119:  uint64_t packed_value = (((sign ? 1ull : 0ull) << ECMA_NUMBER_SIGN_POS) |
+        1:  120:                           (((uint64_t) biased_exp) << ECMA_NUMBER_FRACTION_WIDTH) |
+        -:  121:                           fraction);
+        -:  122:
+        1:  123:  JERRY_ASSERT ((biased_exp & ~((1u << ECMA_NUMBER_BIASED_EXP_WIDTH) - 1)) == 0);
+        1:  124:  JERRY_ASSERT ((fraction & ~((1ull << ECMA_NUMBER_FRACTION_WIDTH) - 1)) == 0);
+        -:  125:
+        -:  126:  ecma_number_accessor_t u;
+        1:  127:  u.as_uint64_t = packed_value;
+        1:  128:  return u.as_ecma_number_t;
+        -:  129:} /* ecma_number_pack */
+        -:  130:
+        -:  131:/**
+        -:  132: * Unpacking sign, fraction and biased exponent from ecma-number
+        -:  133: */
+        -:  134:void
+        8:  135:ecma_number_unpack (ecma_number_t num, /**< ecma-number */
+        -:  136:                    bool *sign_p, /**< [out] sign (optional) */
+        -:  137:                    uint32_t *biased_exp_p, /**< [out] biased exponent (optional) */
+        -:  138:                    uint64_t *fraction_p) /**< [out] fraction (optional) */
+        -:  139:{
+        -:  140:  ecma_number_accessor_t u;
+        8:  141:  u.as_ecma_number_t = num;
+        8:  142:  uint64_t packed_value = u.as_uint64_t;
+        -:  143:
+        8:  144:  if (sign_p != NULL)
+        -:  145:  {
+        1:  146:    *sign_p = ((packed_value >> ECMA_NUMBER_SIGN_POS) != 0);
+        -:  147:  }
+        -:  148:
+        8:  149:  if (biased_exp_p != NULL)
+        -:  150:  {
+        3:  151:    *biased_exp_p = (uint32_t) (((packed_value) & ~(1ull << ECMA_NUMBER_SIGN_POS)) >> ECMA_NUMBER_FRACTION_WIDTH);
+        -:  152:  }
+        -:  153:
+        8:  154:  if (fraction_p != NULL)
+        -:  155:  {
+        4:  156:    *fraction_p = (packed_value & ((1ull << ECMA_NUMBER_FRACTION_WIDTH) - 1));
+        -:  157:  }
+        8:  158:} /* ecma_number_unpack */
+        -:  159:
+        -:  160:/**
+        -:  161: * Value used to calculate exponent from biased exponent
+        -:  162: *
+        -:  163: * See also:
+        -:  164: *          IEEE-754 2008, 3.6, Table 3.5
+        -:  165: */
+        -:  166:const int32_t ecma_number_exponent_bias = 1023;
+        -:  167:
+        -:  168:#endif /* JERRY_NUMBER_TYPE_FLOAT64 */
+        -:  169:
+        -:  170:/**
+        -:  171: * Get fraction of number
+        -:  172: *
+        -:  173: * @return normalized fraction field of number
+        -:  174: */
+        -:  175:static uint64_t
+        4:  176:ecma_number_get_fraction_field (ecma_number_t num) /**< ecma-number */
+        -:  177:{
+        4:  178:  uint64_t fraction;
+        -:  179:
+        4:  180:  ecma_number_unpack (num, NULL, NULL, &fraction);
+        -:  181:
+        4:  182:  return fraction;
+        -:  183:} /* ecma_number_get_fraction_field */
+        -:  184:
+        -:  185:/**
+        -:  186: * Get exponent of number
+        -:  187: *
+        -:  188: * @return exponent corresponding to normalized fraction of number
+        -:  189: */
+        -:  190:static uint32_t
+        3:  191:ecma_number_get_biased_exponent_field (ecma_number_t num) /**< ecma-number */
+        -:  192:{
+        3:  193:  uint32_t biased_exp;
+        -:  194:
+        3:  195:  ecma_number_unpack (num, NULL, &biased_exp, NULL);
+        -:  196:
+        3:  197:  return biased_exp;
+        -:  198:} /* ecma_number_get_biased_exponent_field */
+        -:  199:
+        -:  200:/**
+        -:  201: * Get sign bit of number
+        -:  202: *
+        -:  203: * @return 0 or 1 - value of sign bit
+        -:  204: */
+        -:  205:static uint32_t
+        1:  206:ecma_number_get_sign_field (ecma_number_t num) /**< ecma-number */
+        -:  207:{
+        1:  208:  bool sign;
+        -:  209:
+        1:  210:  ecma_number_unpack (num, &sign, NULL, NULL);
+        -:  211:
+        1:  212:  return sign;
+        -:  213:} /* ecma_number_get_sign_field */
+        -:  214:
+        -:  215:/**
+        -:  216: * Check if ecma-number is NaN
+        -:  217: *
+        -:  218: * @return true - if biased exponent is filled with 1 bits and
+        -:  219:                  fraction is filled with anything but not all zero bits,
+        -:  220: *         false - otherwise
+        -:  221: */
+        -:  222:extern inline bool JERRY_ATTR_ALWAYS_INLINE
+        1:  223:ecma_number_is_nan (ecma_number_t num) /**< ecma-number */
+        -:  224:{
+        2:  225:  bool is_nan = (num != num);
+        -:  226:
+        -:  227:#ifndef JERRY_NDEBUG
+        2:  228:  uint32_t biased_exp = ecma_number_get_biased_exponent_field (num);
+        2:  229:  uint64_t fraction = ecma_number_get_fraction_field (num);
+        -:  230:
+        -:  231:   /* IEEE-754 2008, 3.4, a */
+        2:  232:  bool is_nan_ieee754 = ((biased_exp == (1u << ECMA_NUMBER_BIASED_EXP_WIDTH) - 1)
+        2:  233:                         && (fraction != 0));
+        -:  234:
+        2:  235:  JERRY_ASSERT (is_nan == is_nan_ieee754);
+        -:  236:#endif /* !JERRY_NDEBUG */
+        -:  237:
+        2:  238:  return is_nan;
+        -:  239:} /* ecma_number_is_nan */
+        -:  240:
+        -:  241:/**
+        -:  242: * Make a NaN.
+        -:  243: *
+        -:  244: * @return NaN value
+        -:  245: */
+        -:  246:ecma_number_t
+    #####:  247:ecma_number_make_nan (void)
+        -:  248:{
+        -:  249:  /* IEEE754 QNaN = sign bit: 0, exponent: all 1 bits, fraction: 1....0 */
+        -:  250:  ecma_number_accessor_t f;
+        -:  251:#if JERRY_NUMBER_TYPE_FLOAT64
+    #####:  252:  f.as_uint64_t = 0x7ff8000000000000ull; /* double QNaN, same as the C99 nan("") returns. */
+        -:  253:#else /* !JERRY_NUMBER_TYPE_FLOAT64 */
+        -:  254:  f.as_uint32_t = 0x7fc00000u;  /* float QNaN, same as the C99 nanf("") returns. */
+        -:  255:#endif /* JERRY_NUMBER_TYPE_FLOAT64 */
+    #####:  256:  return f.as_ecma_number_t;
+        -:  257:} /* ecma_number_make_nan */
+        -:  258:
+        -:  259:/**
+        -:  260: * Make an Infinity.
+        -:  261: *
+        -:  262: * @return if !sign - +Infinity value,
+        -:  263: *         else - -Infinity value.
+        -:  264: */
+        -:  265:ecma_number_t
+    #####:  266:ecma_number_make_infinity (bool sign) /**< true - for negative Infinity,
+        -:  267:                                           false - for positive Infinity */
+        -:  268:{
+        -:  269:  /* IEEE754 INF = sign bit: sign, exponent: all 1 bits, fraction: 0....0 */
+        -:  270:  ecma_number_accessor_t f;
+        -:  271:#if JERRY_NUMBER_TYPE_FLOAT64
+    #####:  272:  f.as_uint64_t = sign ? 0xfff0000000000000ull : 0x7ff0000000000000ull;
+        -:  273:#else /* !JERRY_NUMBER_TYPE_FLOAT64 */
+        -:  274:  f.as_uint32_t = sign ? 0xff800000u : 0x7f800000u;
+        -:  275:#endif /* JERRY_NUMBER_TYPE_FLOAT64 */
+    #####:  276:  return f.as_ecma_number_t;
+        -:  277:} /* ecma_number_make_infinity */
+        -:  278:
+        -:  279:/**
+        -:  280: * Check if ecma-number is negative
+        -:  281: *
+        -:  282: * @return true - if sign bit of ecma-number is set
+        -:  283: *         false - otherwise
+        -:  284: */
+        -:  285:extern inline bool JERRY_ATTR_ALWAYS_INLINE
+        1:  286:ecma_number_is_negative (ecma_number_t num) /**< ecma-number */
+        -:  287:{
+        1:  288:  JERRY_ASSERT (!ecma_number_is_nan (num));
+        -:  289:
+        -:  290:  /* IEEE-754 2008, 3.4 */
+        1:  291:  return (ecma_number_get_sign_field (num) != 0);
+        -:  292:} /* ecma_number_is_negative */
+        -:  293:
+        -:  294:/**
+        -:  295: * Check if ecma-number is zero
+        -:  296: *
+        -:  297: * @return true - if fraction is zero and biased exponent is zero,
+        -:  298: *         false - otherwise
+        -:  299: */
+        -:  300:bool
+        1:  301:ecma_number_is_zero (ecma_number_t num) /**< ecma-number */
+        -:  302:{
+        1:  303:  bool is_zero = (num == ECMA_NUMBER_ZERO);
+        -:  304:
+        -:  305:#ifndef JERRY_NDEBUG
+        -:  306:  /* IEEE-754 2008, 3.4, e */
+        2:  307:  bool is_zero_ieee754 = (ecma_number_get_fraction_field (num) == 0
+        1:  308:                          && ecma_number_get_biased_exponent_field (num) == 0);
+        -:  309:
+        1:  310:  JERRY_ASSERT (is_zero == is_zero_ieee754);
+        -:  311:#endif /* !JERRY_NDEBUG */
+        -:  312:
+        1:  313:  return is_zero;
+        -:  314:} /* ecma_number_is_zero */
+        -:  315:
+        -:  316:/**
+        -:  317: * Check if number is infinity
+        -:  318: *
+        -:  319: * @return true - if biased exponent is filled with 1 bits and
+        -:  320: *                fraction is filled with zero bits,
+        -:  321: *         false - otherwise
+        -:  322: */
+        -:  323:bool
+        1:  324:ecma_number_is_infinity (ecma_number_t num) /**< ecma-number */
+        -:  325:{
+        1:  326:  uint32_t biased_exp = ecma_number_get_biased_exponent_field (num);
+        1:  327:  uint64_t fraction = ecma_number_get_fraction_field (num);
+        -:  328:
+        -:  329:  /* IEEE-754 2008, 3.4, b */
+    #####:  330:  return ((biased_exp  == (1u << ECMA_NUMBER_BIASED_EXP_WIDTH) - 1)
+        1:  331:          && (fraction == 0));
+        -:  332:} /* ecma_number_is_infinity */
+        -:  333:
+        -:  334:/**
+        -:  335: * Check if number is finite
+        -:  336: *
+        -:  337: * @return true  - if number is finite
+        -:  338: *         false - if number is NaN or infinity
+        -:  339: */
+        -:  340:extern inline bool JERRY_ATTR_ALWAYS_INLINE
+    #####:  341:ecma_number_is_finite (ecma_number_t num) /**< ecma-number */
+        -:  342:{
+        -:  343:#if defined (__GNUC__) || defined (__clang__)
+    #####:  344:  return __builtin_isfinite (num);
+        -:  345:#elif defined (_WIN32)
+        -:  346:  return isfinite (num);
+        -:  347:#else
+        -:  348:  return !ecma_number_is_nan (num) && !ecma_number_is_infinity (num);
+        -:  349:#endif /* defined (__GNUC__) || defined (__clang__) */
+        -:  350:} /* ecma_number_is_finite */
+        -:  351:
+        -:  352:/**
+        -:  353: * Get fraction and exponent of the number
+        -:  354: *
+        -:  355: * @return shift of dot in the fraction
+        -:  356: */
+        -:  357:static int32_t
+    #####:  358:ecma_number_get_fraction_and_exponent (ecma_number_t num, /**< ecma-number */
+        -:  359:                                       uint64_t *out_fraction_p, /**< [out] fraction of the number */
+        -:  360:                                       int32_t *out_exponent_p) /**< [out] exponent of the number */
+        -:  361:{
+    #####:  362:  JERRY_ASSERT (!ecma_number_is_nan (num));
+        -:  363:
+    #####:  364:  uint32_t biased_exp = ecma_number_get_biased_exponent_field (num);
+    #####:  365:  uint64_t fraction = ecma_number_get_fraction_field (num);
+        -:  366:  int32_t exponent;
+        -:  367:
+    #####:  368:  if (JERRY_UNLIKELY (biased_exp == 0))
+        -:  369:  {
+        -:  370:    /* IEEE-754 2008, 3.4, d */
+    #####:  371:    if (ecma_number_is_zero (num))
+        -:  372:    {
+    #####:  373:      exponent = -ecma_number_exponent_bias;
+        -:  374:    }
+        -:  375:    else
+        -:  376:    {
+    #####:  377:      exponent = 1 - ecma_number_exponent_bias;
+        -:  378:
+    #####:  379:      while (!(fraction & (1ull << ECMA_NUMBER_FRACTION_WIDTH)))
+        -:  380:      {
+    #####:  381:        JERRY_ASSERT (fraction != 0);
+        -:  382:
+    #####:  383:        fraction <<= 1;
+    #####:  384:        exponent--;
+        -:  385:      }
+        -:  386:    }
+        -:  387:  }
+    #####:  388:  else if (ecma_number_is_infinity (num))
+        -:  389:  {
+        -:  390:    /* The fraction and exponent should round to infinity */
+    #####:  391:    exponent = (int32_t) biased_exp - ecma_number_exponent_bias;
+        -:  392:
+    #####:  393:    JERRY_ASSERT ((fraction & (1ull << ECMA_NUMBER_FRACTION_WIDTH)) == 0);
+    #####:  394:    fraction |= 1ull << ECMA_NUMBER_FRACTION_WIDTH;
+        -:  395:  }
+        -:  396:  else
+        -:  397:  {
+        -:  398:    /* IEEE-754 2008, 3.4, c */
+    #####:  399:    exponent = (int32_t) biased_exp - ecma_number_exponent_bias;
+        -:  400:
+    #####:  401:    JERRY_ASSERT (biased_exp > 0 && biased_exp < (1u << ECMA_NUMBER_BIASED_EXP_WIDTH) - 1);
+    #####:  402:    JERRY_ASSERT ((fraction & (1ull << ECMA_NUMBER_FRACTION_WIDTH)) == 0);
+    #####:  403:    fraction |= 1ull << ECMA_NUMBER_FRACTION_WIDTH;
+        -:  404:  }
+        -:  405:
+    #####:  406:  *out_fraction_p = fraction;
+    #####:  407:  *out_exponent_p = exponent;
+    #####:  408:  return ECMA_NUMBER_FRACTION_WIDTH;
+        -:  409:} /* ecma_number_get_fraction_and_exponent */
+        -:  410:
+        -:  411:/**
+        -:  412: * Make normalised positive Number from given fraction and exponent
+        -:  413: *
+        -:  414: * @return ecma-number
+        -:  415: */
+        -:  416:static ecma_number_t
+    #####:  417:ecma_number_make_normal_positive_from_fraction_and_exponent (uint64_t fraction, /**< fraction */
+        -:  418:                                                             int32_t exponent) /**< exponent */
+        -:  419:{
+    #####:  420:  uint32_t biased_exp = (uint32_t) (exponent + ecma_number_exponent_bias);
+    #####:  421:  JERRY_ASSERT (biased_exp > 0 && biased_exp < (1u << ECMA_NUMBER_BIASED_EXP_WIDTH) - 1);
+    #####:  422:  JERRY_ASSERT ((fraction & ~((1ull << (ECMA_NUMBER_FRACTION_WIDTH + 1)) - 1)) == 0);
+    #####:  423:  JERRY_ASSERT ((fraction & (1ull << ECMA_NUMBER_FRACTION_WIDTH)) != 0);
+        -:  424:
+    #####:  425:  return ecma_number_pack (false,
+        -:  426:                           biased_exp,
+        -:  427:                           fraction & ~(1ull << ECMA_NUMBER_FRACTION_WIDTH));
+        -:  428:} /* ecma_number_make_normal_positive_from_fraction_and_exponent */
+        -:  429:
+        -:  430:/**
+        -:  431: * Make Number of given sign from given mantissa value and binary exponent
+        -:  432: *
+        -:  433: * @return ecma-number (possibly Infinity of specified sign)
+        -:  434: */
+        -:  435:ecma_number_t
+        1:  436:ecma_number_make_from_sign_mantissa_and_exponent (bool sign, /**< true - for negative sign,
+        -:  437:                                                                  false - for positive sign */
+        -:  438:                                                  uint64_t mantissa, /**< mantissa */
+        -:  439:                                                  int32_t exponent) /**< binary exponent */
+        -:  440:{
+        -:  441:  /* Rounding mantissa to fit into fraction field width */
+        1:  442:  if (mantissa & ~((1ull << (ECMA_NUMBER_FRACTION_WIDTH + 1)) - 1))
+        -:  443:  {
+        -:  444:    /* Rounded mantissa looks like the following: |00...0|1|fraction_width mantissa bits| */
+    #####:  445:    while ((mantissa & ~((1ull << (ECMA_NUMBER_FRACTION_WIDTH + 1)) - 1)) != 0)
+        -:  446:    {
+    #####:  447:      uint64_t rightmost_bit = (mantissa & 1);
+        -:  448:
+    #####:  449:      exponent++;
+    #####:  450:      mantissa >>= 1;
+        -:  451:
+    #####:  452:      if ((mantissa & ~((1ull << (ECMA_NUMBER_FRACTION_WIDTH + 1)) - 1)) == 0)
+        -:  453:      {
+        -:  454:        /* Rounding to nearest value */
+    #####:  455:        mantissa += rightmost_bit;
+        -:  456:
+        -:  457:        /* In the first case loop is finished,
+        -:  458:           and in the second - just one shift follows and then loop finishes */
+    #####:  459:        JERRY_ASSERT (((mantissa & ~((1ull << (ECMA_NUMBER_FRACTION_WIDTH + 1)) - 1)) == 0)
+        -:  460:                      || (mantissa == (1ull << (ECMA_NUMBER_FRACTION_WIDTH + 1))));
+        -:  461:      }
+        -:  462:    }
+        -:  463:  }
+        -:  464:
+        -:  465:  /* Normalizing mantissa */
+        2:  466:  while (mantissa != 0
+        1:  467:         && ((mantissa & (1ull << ECMA_NUMBER_FRACTION_WIDTH)) == 0))
+        -:  468:  {
+    #####:  469:    exponent--;
+    #####:  470:    mantissa <<= 1;
+        -:  471:  }
+        -:  472:
+        -:  473:  /* Moving floating point */
+        1:  474:  exponent += ECMA_NUMBER_FRACTION_WIDTH - 1;
+        -:  475:
+        1:  476:  int32_t biased_exp_signed = exponent + ecma_number_exponent_bias;
+        -:  477:
+        1:  478:  if (biased_exp_signed < 1)
+        -:  479:  {
+        -:  480:    /* Denormalizing mantissa if biased_exponent is less than zero */
+    #####:  481:    while (biased_exp_signed < 0)
+        -:  482:    {
+    #####:  483:      biased_exp_signed++;
+    #####:  484:      mantissa >>= 1;
+        -:  485:    }
+        -:  486:
+        -:  487:    /* Rounding to nearest value */
+    #####:  488:    mantissa += 1;
+    #####:  489:    mantissa >>= 1;
+        -:  490:
+        -:  491:    /* Encoding denormalized exponent */
+    #####:  492:    biased_exp_signed = 0;
+        -:  493:  }
+        -:  494:  else
+        -:  495:  {
+        -:  496:    /* Clearing highest mantissa bit that should have been non-zero if mantissa is non-zero */
+        1:  497:    mantissa &= ~(1ull << ECMA_NUMBER_FRACTION_WIDTH);
+        -:  498:  }
+        -:  499:
+        1:  500:  uint32_t biased_exp = (uint32_t) biased_exp_signed;
+        -:  501:
+        1:  502:  if (biased_exp >= ((1u << ECMA_NUMBER_BIASED_EXP_WIDTH) - 1))
+        -:  503:  {
+    #####:  504:    return ecma_number_make_infinity (sign);
+        -:  505:  }
+        -:  506:
+        1:  507:  JERRY_ASSERT (biased_exp < (1u << ECMA_NUMBER_BIASED_EXP_WIDTH) - 1);
+        1:  508:  JERRY_ASSERT ((mantissa & ~((1ull << ECMA_NUMBER_FRACTION_WIDTH) - 1)) == 0);
+        -:  509:
+        1:  510:  return ecma_number_pack (sign,
+        -:  511:                           biased_exp,
+        -:  512:                           mantissa);
+        -:  513:} /* ecma_number_make_from_sign_mantissa_and_exponent */
+        -:  514:
+        -:  515:/**
+        -:  516: * Get previous representable ecma-number
+        -:  517: *
+        -:  518: * @return maximum ecma-number that is less compared to passed argument
+        -:  519: */
+        -:  520:ecma_number_t
+    #####:  521:ecma_number_get_prev (ecma_number_t num) /**< ecma-number */
+        -:  522:{
+    #####:  523:  JERRY_ASSERT (!ecma_number_is_nan (num));
+    #####:  524:  JERRY_ASSERT (!ecma_number_is_zero (num));
+        -:  525:
+    #####:  526:  if (ecma_number_is_negative (num))
+        -:  527:  {
+    #####:  528:    return -ecma_number_get_next (num);
+        -:  529:  }
+        -:  530:
+    #####:  531:  uint32_t biased_exp = ecma_number_get_biased_exponent_field (num);
+    #####:  532:  uint64_t fraction = ecma_number_get_fraction_field (num);
+        -:  533:
+    #####:  534:  if (fraction == 0 && biased_exp != 0)
+        -:  535:  {
+    #####:  536:    fraction = (1ull << ECMA_NUMBER_FRACTION_WIDTH) - 1;
+        -:  537:
+    #####:  538:    biased_exp--;
+        -:  539:  }
+        -:  540:  else
+        -:  541:  {
+    #####:  542:    fraction--;
+        -:  543:  }
+        -:  544:
+    #####:  545:  return ecma_number_pack (false,
+        -:  546:                           biased_exp,
+        -:  547:                           fraction);
+        -:  548:} /* ecma_number_get_prev */
+        -:  549:
+        -:  550:/**
+        -:  551: * Get next representable ecma-number
+        -:  552: *
+        -:  553: * @return minimum ecma-number that is greater compared to passed argument
+        -:  554: */
+        -:  555:ecma_number_t
+    #####:  556:ecma_number_get_next (ecma_number_t num) /**< ecma-number */
+        -:  557:{
+    #####:  558:  JERRY_ASSERT (!ecma_number_is_nan (num));
+    #####:  559:  JERRY_ASSERT (!ecma_number_is_infinity (num));
+        -:  560:
+    #####:  561:  if (ecma_number_is_negative (num))
+        -:  562:  {
+    #####:  563:    return -ecma_number_get_prev (num);
+        -:  564:  }
+        -:  565:
+    #####:  566:  uint32_t biased_exp = ecma_number_get_biased_exponent_field (num);
+    #####:  567:  uint64_t fraction = ecma_number_get_fraction_field (num);
+        -:  568:
+    #####:  569:  fraction |= (1ull << ECMA_NUMBER_FRACTION_WIDTH);
+        -:  570:
+    #####:  571:  fraction++;
+        -:  572:
+    #####:  573:  if ((fraction & (1ull << ECMA_NUMBER_FRACTION_WIDTH)) == 0)
+        -:  574:  {
+    #####:  575:    fraction >>= 1;
+        -:  576:
+    #####:  577:    biased_exp++;
+        -:  578:  }
+        -:  579:
+    #####:  580:  JERRY_ASSERT (fraction & (1ull << ECMA_NUMBER_FRACTION_WIDTH));
+        -:  581:
+    #####:  582:  fraction &= ~(1ull << ECMA_NUMBER_FRACTION_WIDTH);
+        -:  583:
+    #####:  584:  return ecma_number_pack (false,
+        -:  585:                           biased_exp,
+        -:  586:                           fraction);
+        -:  587:} /* ecma_number_get_next */
+        -:  588:
+        -:  589:/**
+        -:  590: * Truncate fractional part of the number
+        -:  591: *
+        -:  592: * @return integer part of the number
+        -:  593: */
+        -:  594:ecma_number_t
+    #####:  595:ecma_number_trunc (ecma_number_t num) /**< ecma-number */
+        -:  596:{
+    #####:  597:  JERRY_ASSERT (!ecma_number_is_nan (num));
+        -:  598:
+    #####:  599:  uint64_t fraction;
+    #####:  600:  int32_t exponent;
+    #####:  601:  const int32_t dot_shift = ecma_number_get_fraction_and_exponent (num, &fraction, &exponent);
+    #####:  602:  const bool sign = ecma_number_is_negative (num);
+        -:  603:
+    #####:  604:  if (exponent < 0)
+        -:  605:  {
+    #####:  606:    return ECMA_NUMBER_ZERO;
+        -:  607:  }
+    #####:  608:  else if (exponent < dot_shift)
+        -:  609:  {
+    #####:  610:    fraction &= ~((1ull << (dot_shift - exponent)) - 1);
+        -:  611:
+    #####:  612:    ecma_number_t tmp = ecma_number_make_normal_positive_from_fraction_and_exponent (fraction,
+        -:  613:                                                                                     exponent);
+    #####:  614:    if (sign)
+        -:  615:    {
+    #####:  616:      return -tmp;
+        -:  617:    }
+        -:  618:    else
+        -:  619:    {
+    #####:  620:      return tmp;
+        -:  621:    }
+        -:  622:  }
+        -:  623:  else
+        -:  624:  {
+    #####:  625:    return num;
+        -:  626:  }
+        -:  627:} /* ecma_number_trunc */
+        -:  628:
+        -:  629:/**
+        -:  630: * Calculate remainder of division of two numbers,
+        -:  631: * as specified in ECMA-262 v5, 11.5.3, item 6.
+        -:  632: *
+        -:  633: * Note:
+        -:  634: *      operands shouldn't contain NaN, Infinity, or zero.
+        -:  635: *
+        -:  636: * @return number - calculated remainder.
+        -:  637: */
+        -:  638:ecma_number_t
+    #####:  639:ecma_number_calc_remainder (ecma_number_t left_num, /**< left operand */
+        -:  640:                            ecma_number_t right_num) /**< right operand */
+        -:  641:{
+    #####:  642:  JERRY_ASSERT (!ecma_number_is_nan (left_num)
+        -:  643:                && !ecma_number_is_zero (left_num)
+        -:  644:                && !ecma_number_is_infinity (left_num));
+    #####:  645:  JERRY_ASSERT (!ecma_number_is_nan (right_num)
+        -:  646:                && !ecma_number_is_zero (right_num)
+        -:  647:                && !ecma_number_is_infinity (right_num));
+        -:  648:
+    #####:  649:  const ecma_number_t q = ecma_number_trunc (left_num / right_num);
+    #####:  650:  ecma_number_t r = left_num - right_num * q;
+        -:  651:
+    #####:  652:  if (ecma_number_is_zero (r)
+    #####:  653:      && ecma_number_is_negative (left_num))
+        -:  654:  {
+    #####:  655:    r = -r;
+        -:  656:  }
+        -:  657:
+    #####:  658:  return r;
+        -:  659:} /* ecma_number_calc_remainder */
+        -:  660:
+        -:  661:/**
+        -:  662: * Compute power operation according to the ES standard.
+        -:  663: *
+        -:  664: * @return x ** y
+        -:  665: */
+        -:  666:ecma_number_t
+    #####:  667:ecma_number_pow (ecma_number_t x, /**< left operand */
+        -:  668:                 ecma_number_t y) /**< right operand */
+        -:  669:{
+    #####:  670:  if (ecma_number_is_nan (y) ||
+    #####:  671:      (ecma_number_is_infinity (y) && (x == 1.0 || x == -1.0)))
+        -:  672:  {
+        -:  673:    /* Handle differences between ES5.1 and ISO C standards for pow. */
+    #####:  674:    return ecma_number_make_nan ();
+        -:  675:  }
+        -:  676:
+    #####:  677:  if (ecma_number_is_zero (y))
+        -:  678:  {
+        -:  679:    /* Handle differences between ES5.1 and ISO C standards for pow. */
+    #####:  680:    return (ecma_number_t) 1.0;
+        -:  681:  }
+        -:  682:
+    #####:  683:  return DOUBLE_TO_ECMA_NUMBER_T (pow (x, y));
+        -:  684:} /* ecma_number_pow */
+        -:  685:
+        -:  686:/**
+        -:  687: * ECMA-integer number multiplication.
+        -:  688: *
+        -:  689: * @return number - result of multiplication.
+        -:  690: */
+        -:  691:extern inline ecma_value_t JERRY_ATTR_ALWAYS_INLINE
+    #####:  692:ecma_integer_multiply (ecma_integer_value_t left_integer, /**< left operand */
+        -:  693:                       ecma_integer_value_t right_integer) /**< right operand */
+        -:  694:{
+        -:  695:#if defined (__GNUC__) || defined (__clang__)
+        -:  696:  /* Check if left_integer is power of 2 */
+    #####:  697:  if (JERRY_UNLIKELY ((left_integer & (left_integer - 1)) == 0))
+        -:  698:  {
+        -:  699:    /* Right shift right_integer with log2 (left_integer) */
+    #####:  700:    return ecma_make_integer_value (right_integer << (__builtin_ctz ((unsigned int) left_integer)));
+        -:  701:  }
+    #####:  702:  else if (JERRY_UNLIKELY ((right_integer & (right_integer - 1)) == 0))
+        -:  703:  {
+        -:  704:    /* Right shift left_integer with log2 (right_integer) */
+    #####:  705:    return ecma_make_integer_value (left_integer << (__builtin_ctz ((unsigned int) right_integer)));
+        -:  706:  }
+        -:  707:#endif /* defined (__GNUC__) || defined (__clang__) */
+    #####:  708:  return ecma_make_integer_value (left_integer * right_integer);
+        -:  709:} /* ecma_integer_multiply */
+        -:  710:
+        -:  711:/**
+        -:  712: * The Number object's 'parseInt' routine
+        -:  713: *
+        -:  714: * See also:
+        -:  715: *          ECMA-262 v5, 15.1.2.2
+        -:  716: *
+        -:  717: * @return ecma value
+        -:  718: *         Returned value must be freed with ecma_free_value.
+        -:  719: */
+        -:  720:ecma_value_t
+    #####:  721:ecma_number_parse_int (const lit_utf8_byte_t *string_buff, /**< routine's first argument's
+        -:  722:                                                            *   string buffer */
+        -:  723:                        lit_utf8_size_t string_buff_size, /**< routine's first argument's
+        -:  724:                                                           *   string buffer's size */
+        -:  725:                        ecma_value_t radix) /**< routine's second argument */
+        -:  726:{
+    #####:  727:  if (string_buff_size == 0)
+        -:  728:  {
+    #####:  729:    return ecma_make_nan_value ();
+        -:  730:  }
+        -:  731:
+        -:  732:   /* 2. Remove leading whitespace. */
+        -:  733:
+    #####:  734:  const lit_utf8_byte_t *string_end_p = string_buff + string_buff_size;
+    #####:  735:  const lit_utf8_byte_t *start_p = ecma_string_trim_front (string_buff, string_end_p);
+    #####:  736:  const lit_utf8_byte_t *string_curr_p = start_p;
+    #####:  737:  const lit_utf8_byte_t *end_p = string_end_p;
+        -:  738:
+    #####:  739:  if (string_curr_p >= string_end_p)
+        -:  740:  {
+    #####:  741:    return ecma_make_nan_value ();
+        -:  742:  }
+        -:  743:
+        -:  744:  /* 3. */
+    #####:  745:  int sign = 1;
+        -:  746:
+        -:  747:  /* 4. */
+    #####:  748:  ecma_char_t current = lit_cesu8_read_next (&string_curr_p);
+    #####:  749:  if (current == LIT_CHAR_MINUS)
+        -:  750:  {
+    #####:  751:    sign = -1;
+        -:  752:  }
+        -:  753:
+        -:  754:  /* 5. */
+    #####:  755:  if (current == LIT_CHAR_MINUS || current == LIT_CHAR_PLUS)
+        -:  756:  {
+    #####:  757:    start_p = string_curr_p;
+    #####:  758:    if (string_curr_p < string_end_p)
+        -:  759:    {
+    #####:  760:      current = lit_cesu8_read_next (&string_curr_p);
+        -:  761:    }
+        -:  762:  }
+        -:  763:
+        -:  764:  /* 6. */
+    #####:  765:  ecma_number_t radix_num;
+    #####:  766:  radix = ecma_op_to_number (radix, &radix_num);
+        -:  767:
+    #####:  768:  if (ECMA_IS_VALUE_ERROR (radix))
+        -:  769:  {
+    #####:  770:    return ECMA_VALUE_ERROR;
+        -:  771:  }
+        -:  772:
+    #####:  773:  int32_t rad = ecma_number_to_int32 (radix_num);
+        -:  774:
+        -:  775:  /* 7.*/
+    #####:  776:  bool strip_prefix = true;
+        -:  777:
+        -:  778:  /* 8. */
+    #####:  779:  if (rad != 0)
+        -:  780:  {
+        -:  781:    /* 8.a */
+    #####:  782:    if (rad < 2 || rad > 36)
+        -:  783:    {
+    #####:  784:      return ecma_make_nan_value ();
+        -:  785:    }
+        -:  786:    /* 8.b */
+    #####:  787:    else if (rad != 16)
+        -:  788:    {
+    #####:  789:      strip_prefix = false;
+        -:  790:    }
+        -:  791:  }
+        -:  792:  /* 9. */
+        -:  793:  else
+        -:  794:  {
+    #####:  795:    rad = 10;
+        -:  796:  }
+        -:  797:
+        -:  798:  /* 10. */
+    #####:  799:  if (strip_prefix
+    #####:  800:      && ((end_p - start_p) >= 2)
+    #####:  801:      && (current == LIT_CHAR_0))
+        -:  802:  {
+    #####:  803:    ecma_char_t next = *string_curr_p;
+    #####:  804:    if (next == LIT_CHAR_LOWERCASE_X || next == LIT_CHAR_UPPERCASE_X)
+        -:  805:    {
+        -:  806:      /* Skip the 'x' or 'X' characters. */
+    #####:  807:      start_p = ++string_curr_p;
+    #####:  808:      rad = 16;
+        -:  809:    }
+        -:  810:  }
+        -:  811:
+        -:  812:  /* 11. Check if characters are in [0, Radix - 1]. We also convert them to number values in the process. */
+    #####:  813:  string_curr_p = start_p;
+    #####:  814:  while (string_curr_p < string_end_p)
+        -:  815:  {
+    #####:  816:    ecma_char_t current_char = *string_curr_p++;
+        -:  817:    int32_t current_number;
+        -:  818:
+    #####:  819:    if ((current_char >= LIT_CHAR_LOWERCASE_A && current_char <= LIT_CHAR_LOWERCASE_Z))
+        -:  820:    {
+    #####:  821:      current_number = current_char - LIT_CHAR_LOWERCASE_A + 10;
+        -:  822:    }
+    #####:  823:    else if ((current_char >= LIT_CHAR_UPPERCASE_A && current_char <= LIT_CHAR_UPPERCASE_Z))
+        -:  824:    {
+    #####:  825:      current_number = current_char - LIT_CHAR_UPPERCASE_A + 10;
+        -:  826:    }
+    #####:  827:    else if (lit_char_is_decimal_digit (current_char))
+        -:  828:    {
+    #####:  829:      current_number = current_char - LIT_CHAR_0;
+        -:  830:    }
+        -:  831:    else
+        -:  832:    {
+        -:  833:      /* Not a valid number char, set value to radix so it fails to pass as a valid character. */
+    #####:  834:      current_number = rad;
+        -:  835:    }
+        -:  836:
+    #####:  837:    if (!(current_number < rad))
+        -:  838:    {
+    #####:  839:      end_p = --string_curr_p;
+    #####:  840:      break;
+        -:  841:    }
+        -:  842:  }
+        -:  843:
+        -:  844:  /* 12. */
+    #####:  845:  if (end_p == start_p)
+        -:  846:  {
+    #####:  847:    return ecma_make_nan_value ();
+        -:  848:  }
+        -:  849:
+    #####:  850:  ecma_number_t value = ECMA_NUMBER_ZERO;
+    #####:  851:  ecma_number_t multiplier = 1.0f;
+        -:  852:
+        -:  853:  /* 13. and 14. */
+    #####:  854:  string_curr_p = end_p;
+        -:  855:
+    #####:  856:  while (string_curr_p > start_p)
+        -:  857:  {
+    #####:  858:    ecma_char_t current_char = *(--string_curr_p);
+    #####:  859:    ecma_number_t current_number = ECMA_NUMBER_MINUS_ONE;
+        -:  860:
+    #####:  861:    if ((current_char >= LIT_CHAR_LOWERCASE_A && current_char <= LIT_CHAR_LOWERCASE_Z))
+        -:  862:    {
+    #####:  863:      current_number = (ecma_number_t) current_char - LIT_CHAR_LOWERCASE_A + 10;
+        -:  864:    }
+    #####:  865:    else if ((current_char >= LIT_CHAR_UPPERCASE_A && current_char <= LIT_CHAR_UPPERCASE_Z))
+        -:  866:    {
+    #####:  867:      current_number = (ecma_number_t) current_char - LIT_CHAR_UPPERCASE_A + 10;
+        -:  868:    }
+        -:  869:    else
+        -:  870:    {
+    #####:  871:      JERRY_ASSERT (lit_char_is_decimal_digit (current_char));
+    #####:  872:      current_number = (ecma_number_t) current_char - LIT_CHAR_0;
+        -:  873:    }
+        -:  874:
+    #####:  875:    value += current_number * multiplier;
+    #####:  876:    multiplier *= (ecma_number_t) rad;
+        -:  877:  }
+        -:  878:
+        -:  879:  /* 15. */
+    #####:  880:  if (sign < 0)
+        -:  881:  {
+    #####:  882:    value *= (ecma_number_t) sign;
+        -:  883:  }
+    #####:  884:  return ecma_make_number_value (value);
+        -:  885:} /* ecma_number_parse_int */
+        -:  886:
+        -:  887:/**
+        -:  888: * The Number object's 'parseFloat' routine
+        -:  889: *
+        -:  890: * See also:
+        -:  891: *          ECMA-262 v5, 15.1.2.2
+        -:  892: *
+        -:  893: * @return ecma value
+        -:  894: *         Returned value must be freed with ecma_free_value.
+        -:  895: */
+        -:  896:ecma_value_t
+    #####:  897:ecma_number_parse_float (const lit_utf8_byte_t *string_buff, /**< routine's first argument's
+        -:  898:                                                              *   string buffer */
+        -:  899:                          lit_utf8_size_t string_buff_size) /**< routine's first argument's
+        -:  900:                                                             *   string buffer's size */
+        -:  901:{
+    #####:  902:  if (string_buff_size == 0)
+        -:  903:  {
+    #####:  904:    return ecma_make_nan_value ();
+        -:  905:  }
+        -:  906:
+        -:  907:  /* 2. Remove leading whitespace. */
+        -:  908:
+    #####:  909:  const lit_utf8_byte_t *str_end_p = string_buff + string_buff_size;
+    #####:  910:  const lit_utf8_byte_t *start_p = ecma_string_trim_front (string_buff, str_end_p);
+    #####:  911:  const lit_utf8_byte_t *str_curr_p = start_p;
+    #####:  912:  const lit_utf8_byte_t *end_p = str_end_p;
+        -:  913:
+    #####:  914:  bool sign = false;
+        -:  915:  ecma_char_t current;
+        -:  916:
+    #####:  917:  if (str_curr_p < str_end_p)
+        -:  918:  {
+        -:  919:    /* Check if sign is present. */
+    #####:  920:    current = *str_curr_p;
+    #####:  921:    if (current == LIT_CHAR_MINUS)
+        -:  922:    {
+    #####:  923:      sign = true;
+        -:  924:    }
+        -:  925:
+    #####:  926:    if (current == LIT_CHAR_MINUS || current == LIT_CHAR_PLUS)
+        -:  927:    {
+        -:  928:      /* Set starting position to be after the sign character. */
+    #####:  929:      start_p = ++str_curr_p;
+        -:  930:    }
+        -:  931:  }
+        -:  932:
+        -:  933:  /* Check if string is equal to "Infinity". */
+    #####:  934:  const lit_utf8_byte_t *infinity_str_p = lit_get_magic_string_utf8 (LIT_MAGIC_STRING_INFINITY_UL);
+    #####:  935:  const lit_utf8_size_t infinity_length = lit_get_magic_string_size (LIT_MAGIC_STRING_INFINITY_UL);
+        -:  936:
+        -:  937:  /* The input string should be at least the length of "Infinity" to be correctly processed as
+        -:  938:   * the infinity value.
+        -:  939:   */
+    #####:  940:  if ((str_end_p - str_curr_p) >= (int) infinity_length
+    #####:  941:      && memcmp (infinity_str_p, str_curr_p, infinity_length) == 0)
+        -:  942:  {
+        -:  943:    /* String matched Infinity. */
+    #####:  944:    return ecma_make_number_value (ecma_number_make_infinity (sign));
+        -:  945:  }
+        -:  946:
+        -:  947:  /* Reset to starting position. */
+    #####:  948:  str_curr_p = start_p;
+        -:  949:
+        -:  950:  /* String ended after sign character, or was empty after removing leading whitespace. */
+    #####:  951:  if (str_curr_p >= str_end_p)
+        -:  952:  {
+    #####:  953:    return ecma_make_nan_value ();
+        -:  954:  }
+        -:  955:
+        -:  956:  /* Reset to starting position. */
+    #####:  957:  str_curr_p = start_p;
+        -:  958:
+    #####:  959:  current = *str_curr_p;
+        -:  960:
+    #####:  961:  bool has_whole_part = false;
+    #####:  962:  bool has_fraction_part = false;
+        -:  963:
+        -:  964:  /* Check digits of whole part. */
+    #####:  965:  if (lit_char_is_decimal_digit (current))
+        -:  966:  {
+    #####:  967:    has_whole_part = true;
+    #####:  968:    str_curr_p++;
+        -:  969:
+    #####:  970:    while (str_curr_p < str_end_p)
+        -:  971:    {
+    #####:  972:      current = *str_curr_p++;
+    #####:  973:      if (!lit_char_is_decimal_digit (current))
+        -:  974:      {
+    #####:  975:        str_curr_p--;
+    #####:  976:        break;
+        -:  977:      }
+        -:  978:    }
+        -:  979:  }
+        -:  980:
+        -:  981:  /* Set end position to the end of whole part. */
+    #####:  982:  end_p = str_curr_p;
+    #####:  983:  if (str_curr_p < str_end_p)
+        -:  984:  {
+    #####:  985:    current = *str_curr_p;
+        -:  986:
+        -:  987:    /* Check decimal point. */
+    #####:  988:    if (current == LIT_CHAR_DOT)
+        -:  989:    {
+    #####:  990:      str_curr_p++;
+        -:  991:
+    #####:  992:      if (str_curr_p < str_end_p)
+        -:  993:      {
+    #####:  994:        current = *str_curr_p;
+        -:  995:
+    #####:  996:        if (lit_char_is_decimal_digit (current))
+        -:  997:        {
+    #####:  998:          has_fraction_part = true;
+        -:  999:
+        -: 1000:          /* Check digits of fractional part. */
+    #####: 1001:          while (str_curr_p < str_end_p)
+        -: 1002:          {
+    #####: 1003:            current = *str_curr_p++;
+    #####: 1004:            if (!lit_char_is_decimal_digit (current))
+        -: 1005:            {
+    #####: 1006:              str_curr_p--;
+    #####: 1007:              break;
+        -: 1008:            }
+        -: 1009:          }
+        -: 1010:
+        -: 1011:          /* Set end position to end of fraction part. */
+    #####: 1012:          end_p = str_curr_p;
+        -: 1013:        }
+        -: 1014:      }
+        -: 1015:    }
+        -: 1016:  }
+        -: 1017:
+    #####: 1018:  if (str_curr_p < str_end_p)
+        -: 1019:  {
+    #####: 1020:    current = *str_curr_p++;
+        -: 1021:  }
+        -: 1022:
+        -: 1023:  /* Check exponent. */
+    #####: 1024:  if ((current == LIT_CHAR_LOWERCASE_E || current == LIT_CHAR_UPPERCASE_E)
+    #####: 1025:      && (has_whole_part || has_fraction_part)
+    #####: 1026:      && str_curr_p < str_end_p)
+        -: 1027:  {
+    #####: 1028:    current = *str_curr_p++;
+        -: 1029:
+        -: 1030:    /* Check sign of exponent. */
+    #####: 1031:    if ((current == LIT_CHAR_PLUS || current == LIT_CHAR_MINUS)
+    #####: 1032:         && str_curr_p < str_end_p)
+        -: 1033:    {
+    #####: 1034:      current = *str_curr_p++;
+        -: 1035:    }
+        -: 1036:
+    #####: 1037:    if (lit_char_is_decimal_digit (current))
+        -: 1038:    {
+        -: 1039:      /* Check digits of exponent part. */
+    #####: 1040:      while (str_curr_p < str_end_p)
+        -: 1041:      {
+    #####: 1042:        current = *str_curr_p++;
+    #####: 1043:        if (!lit_char_is_decimal_digit (current))
+        -: 1044:        {
+    #####: 1045:          str_curr_p--;
+    #####: 1046:          break;
+        -: 1047:        }
+        -: 1048:      }
+        -: 1049:
+        -: 1050:      /* Set end position to end of exponent part. */
+    #####: 1051:      end_p = str_curr_p;
+        -: 1052:    }
+        -: 1053:  }
+        -: 1054:
+        -: 1055:  /* String did not contain a valid number. */
+    #####: 1056:  if (start_p == end_p)
+        -: 1057:  {
+    #####: 1058:    return ecma_make_nan_value ();
+        -: 1059:  }
+        -: 1060:
+        -: 1061:  /* 5. */
+    #####: 1062:  ecma_number_t ret_num = ecma_utf8_string_to_number (start_p, (lit_utf8_size_t) (end_p - start_p), 0);
+        -: 1063:
+    #####: 1064:  if (sign)
+        -: 1065:  {
+    #####: 1066:    ret_num *= ECMA_NUMBER_MINUS_ONE;
+        -: 1067:  }
+        -: 1068:
+    #####: 1069:  return ecma_make_number_value (ret_num);
+        -: 1070:} /* ecma_number_parse_float */
+        -: 1071:
+        -: 1072:/**
+        -: 1073: * @}
+        -: 1074: * @}
+        -: 1075: */

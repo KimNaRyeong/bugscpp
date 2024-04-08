@@ -1,0 +1,324 @@
+        -:    0:Source:/home/workspace/jerry-ext/module/module.c
+        -:    0:Programs:299
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "jerryscript-ext/module.h"
+        -:   17:
+        -:   18:#include <string.h>
+        -:   19:
+        -:   20:#include "jerryscript.h"
+        -:   21:
+        -:   22:static const char *module_name_property_name = "moduleName";
+        -:   23:static const char *module_not_found = "Module not found";
+        -:   24:static const char *module_name_not_string = "Module name is not a string";
+        -:   25:
+        -:   26:/**
+        -:   27: * Create an error related to modules
+        -:   28: *
+        -:   29: * Creates an error object of the requested type with the additional property "moduleName" the value of which is a
+        -:   30: * string containing the name of the module that was requested when the error occurred.
+        -:   31: *
+        -:   32: * @return the error
+        -:   33: */
+        -:   34:static jerry_value_t
+    #####:   35:jerryx_module_create_error (jerry_error_t error_type, /**< the type of error to create */
+        -:   36:                            const char *message, /**< the error message */
+        -:   37:                            const jerry_value_t module_name) /**< the module name */
+        -:   38:{
+    #####:   39:  jerry_value_t error_object = jerry_error_sz (error_type, message);
+    #####:   40:  jerry_value_t property_name = jerry_string_sz (module_name_property_name);
+        -:   41:
+    #####:   42:  jerry_value_free (jerry_object_set (error_object, property_name, module_name));
+        -:   43:
+    #####:   44:  jerry_value_free (property_name);
+    #####:   45:  return jerry_throw_value (error_object, true);
+        -:   46:} /* jerryx_module_create_error */
+        -:   47:
+        -:   48:/**
+        -:   49: * Initialize the module manager extension.
+        -:   50: */
+        -:   51:static void
+    #####:   52:jerryx_module_manager_init (void *user_data_p)
+        -:   53:{
+    #####:   54:  *((jerry_value_t *) user_data_p) = jerry_object ();
+    #####:   55:} /* jerryx_module_manager_init */
+        -:   56:
+        -:   57:/**
+        -:   58: * Deinitialize the module manager extension.
+        -:   59: */
+        -:   60:static void
+    #####:   61:jerryx_module_manager_deinit (void *user_data_p) /**< context pointer to deinitialize */
+        -:   62:{
+    #####:   63:  jerry_value_free (*(jerry_value_t *) user_data_p);
+    #####:   64:} /* jerryx_module_manager_deinit */
+        -:   65:
+        -:   66:/**
+        -:   67: * Declare the context data manager for modules.
+        -:   68: */
+        -:   69:static const jerry_context_data_manager_t jerryx_module_manager = { .init_cb = jerryx_module_manager_init,
+        -:   70:                                                                    .deinit_cb = jerryx_module_manager_deinit,
+        -:   71:                                                                    .bytes_needed = sizeof (jerry_value_t) };
+        -:   72:
+        -:   73:/**
+        -:   74: * Global static entry point to the linked list of available modules.
+        -:   75: */
+        -:   76:static jerryx_native_module_t *first_module_p = NULL;
+        -:   77:
+        -:   78:void
+    #####:   79:jerryx_native_module_register (jerryx_native_module_t *module_p)
+        -:   80:{
+    #####:   81:  module_p->next_p = first_module_p;
+    #####:   82:  first_module_p = module_p;
+    #####:   83:} /* jerryx_native_module_register */
+        -:   84:
+        -:   85:void
+    #####:   86:jerryx_native_module_unregister (jerryx_native_module_t *module_p)
+        -:   87:{
+    #####:   88:  jerryx_native_module_t *parent_p = NULL, *iter_p = NULL;
+        -:   89:
+    #####:   90:  for (iter_p = first_module_p; iter_p != NULL; parent_p = iter_p, iter_p = iter_p->next_p)
+        -:   91:  {
+    #####:   92:    if (iter_p == module_p)
+        -:   93:    {
+    #####:   94:      if (parent_p)
+        -:   95:      {
+    #####:   96:        parent_p->next_p = module_p->next_p;
+        -:   97:      }
+        -:   98:      else
+        -:   99:      {
+    #####:  100:        first_module_p = module_p->next_p;
+        -:  101:      }
+    #####:  102:      module_p->next_p = NULL;
+        -:  103:    }
+        -:  104:  }
+    #####:  105:} /* jerryx_native_module_unregister */
+        -:  106:
+        -:  107:/**
+        -:  108: * Attempt to retrieve a module by name from a cache, and return false if not found.
+        -:  109: */
+        -:  110:static bool
+    #####:  111:jerryx_module_check_cache (jerry_value_t cache, /**< cache from which to attempt to retrieve the module by name */
+        -:  112:                           jerry_value_t module_name, /**< JerryScript string value holding the module name */
+        -:  113:                           jerry_value_t *result) /**< Resulting value */
+        -:  114:{
+    #####:  115:  bool ret = false;
+        -:  116:
+        -:  117:  /* Check if the cache has the module. */
+    #####:  118:  jerry_value_t js_has_property = jerry_object_has (cache, module_name);
+        -:  119:
+        -:  120:  /* If we succeed in getting an answer, we examine the answer. */
+    #####:  121:  if (!jerry_value_is_exception (js_has_property))
+        -:  122:  {
+    #####:  123:    bool has_property = jerry_value_is_true (js_has_property);
+        -:  124:
+        -:  125:    /* If the module is indeed in the cache, we return it. */
+    #####:  126:    if (has_property)
+        -:  127:    {
+    #####:  128:      if (result != NULL)
+        -:  129:      {
+    #####:  130:        (*result) = jerry_object_get (cache, module_name);
+        -:  131:      }
+    #####:  132:      ret = true;
+        -:  133:    }
+        -:  134:  }
+        -:  135:
+    #####:  136:  jerry_value_free (js_has_property);
+        -:  137:
+    #####:  138:  return ret;
+        -:  139:} /* jerryx_module_check_cache */
+        -:  140:
+        -:  141:/**
+        -:  142: * Attempt to cache a loaded module.
+        -:  143: *
+        -:  144: * @return the module on success, otherwise the error encountered when attempting to cache. In the latter case, the
+        -:  145: * @p module is released.
+        -:  146: */
+        -:  147:static jerry_value_t
+    #####:  148:jerryx_module_add_to_cache (jerry_value_t cache, /**< cache to which to add the module */
+        -:  149:                            jerry_value_t module_name, /**< key at which to cache the module */
+        -:  150:                            jerry_value_t module) /**< the module to cache */
+        -:  151:{
+    #####:  152:  jerry_value_t ret = jerry_object_set (cache, module_name, module);
+        -:  153:
+    #####:  154:  if (jerry_value_is_exception (ret))
+        -:  155:  {
+    #####:  156:    jerry_value_free (module);
+        -:  157:  }
+        -:  158:  else
+        -:  159:  {
+    #####:  160:    jerry_value_free (ret);
+    #####:  161:    ret = module;
+        -:  162:  }
+        -:  163:
+    #####:  164:  return ret;
+        -:  165:} /* jerryx_module_add_to_cache */
+        -:  166:
+        -:  167:static const char *on_resolve_absent = "Module on_resolve () must not be NULL";
+        -:  168:
+        -:  169:/**
+        -:  170: * Declare and define the default module resolver - one which examines what modules are defined in the above linker
+        -:  171: * section and loads one that matches the requested name, caching the result for subsequent requests using the context
+        -:  172: * data mechanism.
+        -:  173: */
+        -:  174:static bool
+    #####:  175:jerryx_resolve_native_module (const jerry_value_t canonical_name, /**< canonical name of the module */
+        -:  176:                              jerry_value_t *result) /**< [out] where to put the resulting module instance */
+    #####:  177:{
+    #####:  178:  const jerryx_native_module_t *module_p = NULL;
+        -:  179:
+    #####:  180:  jerry_size_t name_size = jerry_string_size (canonical_name, JERRY_ENCODING_UTF8);
+    #####:  181:  JERRY_VLA (jerry_char_t, name_string, name_size);
+    #####:  182:  jerry_string_to_buffer (canonical_name, JERRY_ENCODING_UTF8, name_string, name_size);
+        -:  183:
+        -:  184:  /* Look for the module by its name in the list of module definitions. */
+    #####:  185:  for (module_p = first_module_p; module_p != NULL; module_p = module_p->next_p)
+        -:  186:  {
+    #####:  187:    if (module_p->name_p != NULL && strlen ((char *) module_p->name_p) == name_size
+    #####:  188:        && !strncmp ((char *) module_p->name_p, (char *) name_string, name_size))
+        -:  189:    {
+        -:  190:      /* If we find the module by its name we load it and cache it if it has an on_resolve () and complain otherwise. */
+    #####:  191:      (*result) =
+    #####:  192:        ((module_p->on_resolve_p) ? module_p->on_resolve_p ()
+    #####:  193:                                  : jerryx_module_create_error (JERRY_ERROR_TYPE, on_resolve_absent, canonical_name));
+    #####:  194:      return true;
+        -:  195:    }
+        -:  196:  }
+        -:  197:
+    #####:  198:  return false;
+        -:  199:} /* jerryx_resolve_native_module */
+        -:  200:
+        -:  201:jerryx_module_resolver_t jerryx_module_native_resolver = { .get_canonical_name_p = NULL,
+        -:  202:                                                           .resolve_p = jerryx_resolve_native_module };
+        -:  203:
+        -:  204:static void
+    #####:  205:jerryx_module_resolve_local (const jerry_value_t name, /**< name of the module to load */
+        -:  206:                             const jerryx_module_resolver_t **resolvers_p, /**< list of resolvers */
+        -:  207:                             size_t resolver_count, /**< number of resolvers in @p resolvers */
+        -:  208:                             jerry_value_t *result) /**< location to store the result, or NULL to remove the module */
+    #####:  209:{
+        -:  210:  size_t index;
+    #####:  211:  size_t canonical_names_used = 0;
+        -:  212:  jerry_value_t instances;
+    #####:  213:  JERRY_VLA (jerry_value_t, canonical_names, resolver_count);
+        -:  214:  jerry_value_t (*get_canonical_name_p) (const jerry_value_t name);
+        -:  215:  bool (*resolve_p) (const jerry_value_t canonical_name, jerry_value_t *result);
+        -:  216:
+    #####:  217:  if (!jerry_value_is_string (name))
+        -:  218:  {
+    #####:  219:    if (result != NULL)
+        -:  220:    {
+    #####:  221:      *result = jerryx_module_create_error (JERRY_ERROR_COMMON, module_name_not_string, name);
+        -:  222:    }
+    #####:  223:    goto done;
+        -:  224:  }
+        -:  225:
+    #####:  226:  instances = *(jerry_value_t *) jerry_context_data (&jerryx_module_manager);
+        -:  227:
+        -:  228:  /**
+        -:  229:   * Establish the canonical name for the requested module. Each resolver presents its own canonical name. If one of
+        -:  230:   * the canonical names matches a cached module, it is returned as the result.
+        -:  231:   */
+    #####:  232:  for (index = 0; index < resolver_count; index++)
+        -:  233:  {
+    #####:  234:    get_canonical_name_p = (resolvers_p[index] == NULL ? NULL : resolvers_p[index]->get_canonical_name_p);
+    #####:  235:    canonical_names[index] = ((get_canonical_name_p == NULL) ? jerry_value_copy (name) : get_canonical_name_p (name));
+    #####:  236:    canonical_names_used++;
+    #####:  237:    if (jerryx_module_check_cache (instances, canonical_names[index], result))
+        -:  238:    {
+        -:  239:      /* A NULL for result indicates that we are to delete the module from the cache if found. Let's do that here.*/
+    #####:  240:      if (result == NULL)
+        -:  241:      {
+    #####:  242:        jerry_object_delete (instances, canonical_names[index]);
+        -:  243:      }
+    #####:  244:      goto done;
+        -:  245:    }
+        -:  246:  }
+        -:  247:
+    #####:  248:  if (result == NULL)
+        -:  249:  {
+    #####:  250:    goto done;
+        -:  251:  }
+        -:  252:
+        -:  253:  /**
+        -:  254:   * Past this point we assume a module is wanted, and therefore result is not NULL. So, we try each resolver until one
+        -:  255:   * manages to resolve the module.
+        -:  256:   */
+    #####:  257:  for (index = 0; index < resolver_count; index++)
+        -:  258:  {
+    #####:  259:    resolve_p = (resolvers_p[index] == NULL ? NULL : resolvers_p[index]->resolve_p);
+    #####:  260:    if (resolve_p != NULL && resolve_p (canonical_names[index], result))
+        -:  261:    {
+    #####:  262:      if (!jerry_value_is_exception (*result))
+        -:  263:      {
+    #####:  264:        *result = jerryx_module_add_to_cache (instances, canonical_names[index], *result);
+        -:  265:      }
+    #####:  266:      goto done;
+        -:  267:    }
+        -:  268:  }
+        -:  269:
+        -:  270:  /* If none of the resolvers manage to find the module, complain with "Module not found" */
+    #####:  271:  *result = jerryx_module_create_error (JERRY_ERROR_COMMON, module_not_found, name);
+        -:  272:
+    #####:  273:done:
+        -:  274:  /* Release the canonical names as returned by the various resolvers. */
+    #####:  275:  for (index = 0; index < canonical_names_used; index++)
+        -:  276:  {
+    #####:  277:    jerry_value_free (canonical_names[index]);
+        -:  278:  }
+    #####:  279:} /* jerryx_module_resolve_local */
+        -:  280:
+        -:  281:/**
+        -:  282: * Resolve a single module using the module resolvers available in the section declared above and load it into the
+        -:  283: * current context.
+        -:  284: *
+        -:  285: * @p name - name of the module to resolve
+        -:  286: * @p resolvers - list of resolvers to invoke
+        -:  287: * @p count - number of resolvers in the list
+        -:  288: *
+        -:  289: * @return a jerry_value_t containing one of the followings:
+        -:  290: *   - the result of having loaded the module named @p name, or
+        -:  291: *   - the result of a previous successful load, or
+        -:  292: *   - an error indicating that something went wrong during the attempt to load the module.
+        -:  293: */
+        -:  294:jerry_value_t
+    #####:  295:jerryx_module_resolve (const jerry_value_t name, /**< name of the module to load */
+        -:  296:                       const jerryx_module_resolver_t **resolvers_p, /**< list of resolvers */
+        -:  297:                       size_t resolver_count) /**< number of resolvers in @p resolvers */
+        -:  298:{
+        -:  299:  /* Set to zero to circumvent fatal warning. */
+    #####:  300:  jerry_value_t ret = 0;
+    #####:  301:  jerryx_module_resolve_local (name, resolvers_p, resolver_count, &ret);
+    #####:  302:  return ret;
+        -:  303:} /* jerryx_module_resolve */
+        -:  304:
+        -:  305:void
+    #####:  306:jerryx_module_clear_cache (const jerry_value_t name, /**< name of the module to remove, or undefined */
+        -:  307:                           const jerryx_module_resolver_t **resolvers_p, /**< list of resolvers */
+        -:  308:                           size_t resolver_count) /**< number of resolvers in @p resolvers */
+        -:  309:{
+    #####:  310:  void *instances_p = jerry_context_data (&jerryx_module_manager);
+        -:  311:
+    #####:  312:  if (jerry_value_is_undefined (name))
+        -:  313:  {
+        -:  314:    /* We were requested to clear the entire cache, so we bounce the context data in the most agnostic way possible. */
+    #####:  315:    jerryx_module_manager.deinit_cb (instances_p);
+    #####:  316:    jerryx_module_manager.init_cb (instances_p);
+    #####:  317:    return;
+        -:  318:  }
+        -:  319:
+        -:  320:  /* Delete the requested module from the cache if it's there. */
+    #####:  321:  jerryx_module_resolve_local (name, resolvers_p, resolver_count, NULL);
+        -:  322:} /* jerryx_module_clear_cache */

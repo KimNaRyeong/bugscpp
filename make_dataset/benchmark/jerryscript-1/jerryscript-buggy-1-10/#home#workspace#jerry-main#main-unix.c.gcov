@@ -1,0 +1,1009 @@
+        -:    0:Source:/home/workspace/jerry-main/main-unix.c
+        -:    0:Programs:274
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include <assert.h>
+        -:   17:#include <stdio.h>
+        -:   18:#include <stdlib.h>
+        -:   19:#include <string.h>
+        -:   20:
+        -:   21:#include "jerryscript.h"
+        -:   22:#include "jerryscript-ext/debugger.h"
+        -:   23:#include "jerryscript-ext/handler.h"
+        -:   24:#include "jerryscript-port.h"
+        -:   25:#include "jerryscript-port-default.h"
+        -:   26:
+        -:   27:#include "cli.h"
+        -:   28:
+        -:   29:/**
+        -:   30: * Maximum size of source code
+        -:   31: */
+        -:   32:#define JERRY_BUFFER_SIZE (1048576)
+        -:   33:
+        -:   34:/**
+        -:   35: * Maximum size of snapshots buffer
+        -:   36: */
+        -:   37:#define JERRY_SNAPSHOT_BUFFER_SIZE (JERRY_BUFFER_SIZE / sizeof (uint32_t))
+        -:   38:
+        -:   39:/**
+        -:   40: * Standalone Jerry exit codes
+        -:   41: */
+        -:   42:#define JERRY_STANDALONE_EXIT_CODE_OK   (0)
+        -:   43:#define JERRY_STANDALONE_EXIT_CODE_FAIL (1)
+        -:   44:
+        -:   45:/**
+        -:   46: * Context size of the SYNTAX_ERROR
+        -:   47: */
+        -:   48:#define SYNTAX_ERROR_CONTEXT_SIZE 2
+        -:   49:
+        -:   50:static uint8_t buffer[ JERRY_BUFFER_SIZE ];
+        -:   51:
+        -:   52:static const uint32_t *
+        1:   53:read_file (const char *file_name,
+        -:   54:           size_t *out_size_p)
+        -:   55:{
+        1:   56:  if (file_name == NULL)
+        -:   57:  {
+    #####:   58:    jerry_port_log (JERRY_LOG_LEVEL_ERROR, "Error: failed to open file, missing filename\n");
+    #####:   59:    return NULL;
+        -:   60:  }
+        -:   61:
+        -:   62:  FILE *file;
+        1:   63:  if (!strcmp ("-", file_name))
+        -:   64:  {
+    #####:   65:    file = stdin;
+        -:   66:  }
+        -:   67:  else
+        -:   68:  {
+        1:   69:    file = fopen (file_name, "rb");
+        1:   70:    if (file == NULL)
+        -:   71:    {
+    #####:   72:      jerry_port_log (JERRY_LOG_LEVEL_ERROR, "Error: failed to open file: %s\n", file_name);
+    #####:   73:      return NULL;
+        -:   74:    }
+        -:   75:  }
+        -:   76:
+        1:   77:  size_t bytes_read = fread (buffer, 1u, sizeof (buffer), file);
+        1:   78:  if (!bytes_read)
+        -:   79:  {
+    #####:   80:    jerry_port_log (JERRY_LOG_LEVEL_ERROR, "Error: failed to read file: %s\n", file_name);
+    #####:   81:    fclose (file);
+    #####:   82:    return NULL;
+        -:   83:  }
+        -:   84:
+        1:   85:  fclose (file);
+        -:   86:
+        1:   87:  *out_size_p = bytes_read;
+        1:   88:  return (const uint32_t *) buffer;
+        -:   89:} /* read_file */
+        -:   90:
+        -:   91:/**
+        -:   92: * Print error value
+        -:   93: */
+        -:   94:static void
+    #####:   95:print_unhandled_exception (jerry_value_t error_value) /**< error value */
+        -:   96:{
+    #####:   97:  assert (!jerry_value_is_error (error_value));
+        -:   98:
+    #####:   99:  jerry_char_t err_str_buf[256];
+        -:  100:
+    #####:  101:  if (jerry_value_is_object (error_value))
+        -:  102:  {
+    #####:  103:    jerry_value_t stack_str = jerry_create_string ((const jerry_char_t *) "stack");
+    #####:  104:    jerry_value_t backtrace_val = jerry_get_property (error_value, stack_str);
+    #####:  105:    jerry_release_value (stack_str);
+        -:  106:
+    #####:  107:    if (!jerry_value_is_error (backtrace_val)
+    #####:  108:        && jerry_value_is_array (backtrace_val))
+        -:  109:    {
+    #####:  110:      printf ("Exception backtrace:\n");
+        -:  111:
+    #####:  112:      uint32_t length = jerry_get_array_length (backtrace_val);
+        -:  113:
+        -:  114:      /* This length should be enough. */
+    #####:  115:      if (length > 32)
+        -:  116:      {
+    #####:  117:        length = 32;
+        -:  118:      }
+        -:  119:
+    #####:  120:      for (uint32_t i = 0; i < length; i++)
+        -:  121:      {
+    #####:  122:        jerry_value_t item_val = jerry_get_property_by_index (backtrace_val, i);
+        -:  123:
+    #####:  124:        if (!jerry_value_is_error (item_val)
+    #####:  125:            && jerry_value_is_string (item_val))
+        -:  126:        {
+    #####:  127:          jerry_size_t str_size = jerry_get_utf8_string_size (item_val);
+        -:  128:
+    #####:  129:          if (str_size >= 256)
+        -:  130:          {
+    #####:  131:            printf ("%3u: [Backtrace string too long]\n", i);
+        -:  132:          }
+        -:  133:          else
+        -:  134:          {
+    #####:  135:            jerry_size_t string_end = jerry_string_to_utf8_char_buffer (item_val, err_str_buf, str_size);
+    #####:  136:            assert (string_end == str_size);
+    #####:  137:            err_str_buf[string_end] = 0;
+        -:  138:
+    #####:  139:            printf ("%3u: %s\n", i, err_str_buf);
+        -:  140:          }
+        -:  141:        }
+        -:  142:
+    #####:  143:        jerry_release_value (item_val);
+        -:  144:      }
+        -:  145:    }
+    #####:  146:    jerry_release_value (backtrace_val);
+        -:  147:  }
+        -:  148:
+    #####:  149:  jerry_value_t err_str_val = jerry_value_to_string (error_value);
+    #####:  150:  jerry_size_t err_str_size = jerry_get_utf8_string_size (err_str_val);
+        -:  151:
+    #####:  152:  if (err_str_size >= 256)
+        -:  153:  {
+    #####:  154:    const char msg[] = "[Error message too long]";
+    #####:  155:    err_str_size = sizeof (msg) / sizeof (char) - 1;
+    #####:  156:    memcpy (err_str_buf, msg, err_str_size + 1);
+        -:  157:  }
+        -:  158:  else
+        -:  159:  {
+    #####:  160:    jerry_size_t string_end = jerry_string_to_utf8_char_buffer (err_str_val, err_str_buf, err_str_size);
+    #####:  161:    assert (string_end == err_str_size);
+    #####:  162:    err_str_buf[string_end] = 0;
+        -:  163:
+    #####:  164:    if (jerry_is_feature_enabled (JERRY_FEATURE_ERROR_MESSAGES)
+    #####:  165:        && jerry_get_error_type (error_value) == JERRY_ERROR_SYNTAX)
+        -:  166:    {
+    #####:  167:      jerry_char_t *string_end_p = err_str_buf + string_end;
+    #####:  168:      unsigned int err_line = 0;
+    #####:  169:      unsigned int err_col = 0;
+    #####:  170:      char *path_str_p = NULL;
+    #####:  171:      char *path_str_end_p = NULL;
+        -:  172:
+        -:  173:      /* 1. parse column and line information */
+    #####:  174:      for (jerry_char_t *current_p = err_str_buf; current_p < string_end_p; current_p++)
+        -:  175:      {
+    #####:  176:        if (*current_p == '[')
+        -:  177:        {
+    #####:  178:          current_p++;
+        -:  179:
+    #####:  180:          if (*current_p == '<')
+        -:  181:          {
+    #####:  182:            break;
+        -:  183:          }
+        -:  184:
+    #####:  185:          path_str_p = (char *) current_p;
+    #####:  186:          while (current_p < string_end_p && *current_p != ':')
+        -:  187:          {
+    #####:  188:            current_p++;
+        -:  189:          }
+        -:  190:
+    #####:  191:          path_str_end_p = (char *) current_p++;
+        -:  192:
+    #####:  193:          err_line = (unsigned int) strtol ((char *) current_p, (char **) &current_p, 10);
+        -:  194:
+    #####:  195:          current_p++;
+        -:  196:
+    #####:  197:          err_col = (unsigned int) strtol ((char *) current_p, NULL, 10);
+    #####:  198:          break;
+        -:  199:        }
+        -:  200:      } /* for */
+        -:  201:
+    #####:  202:      if (err_line != 0 && err_col != 0)
+        -:  203:      {
+    #####:  204:        unsigned int curr_line = 1;
+        -:  205:
+    #####:  206:        bool is_printing_context = false;
+    #####:  207:        unsigned int pos = 0;
+        -:  208:
+    #####:  209:        size_t source_size;
+        -:  210:
+        -:  211:        /* Temporarily modify the error message, so we can use the path. */
+    #####:  212:        *path_str_end_p = '\0';
+        -:  213:
+    #####:  214:        read_file (path_str_p, &source_size);
+        -:  215:
+        -:  216:        /* Revert the error message. */
+    #####:  217:        *path_str_end_p = ':';
+        -:  218:
+        -:  219:        /* 2. seek and print */
+    #####:  220:        while ((pos < source_size) && (buffer[pos] != '\0'))
+        -:  221:        {
+    #####:  222:          if (buffer[pos] == '\n')
+        -:  223:          {
+    #####:  224:            curr_line++;
+        -:  225:          }
+        -:  226:
+    #####:  227:          if (err_line < SYNTAX_ERROR_CONTEXT_SIZE
+    #####:  228:              || (err_line >= curr_line
+    #####:  229:                  && (err_line - curr_line) <= SYNTAX_ERROR_CONTEXT_SIZE))
+        -:  230:          {
+        -:  231:            /* context must be printed */
+    #####:  232:            is_printing_context = true;
+        -:  233:          }
+        -:  234:
+    #####:  235:          if (curr_line > err_line)
+        -:  236:          {
+    #####:  237:            break;
+        -:  238:          }
+        -:  239:
+    #####:  240:          if (is_printing_context)
+        -:  241:          {
+    #####:  242:            jerry_port_log (JERRY_LOG_LEVEL_ERROR, "%c", buffer[pos]);
+        -:  243:          }
+        -:  244:
+    #####:  245:          pos++;
+        -:  246:        }
+        -:  247:
+    #####:  248:        jerry_port_log (JERRY_LOG_LEVEL_ERROR, "\n");
+        -:  249:
+    #####:  250:        while (--err_col)
+        -:  251:        {
+    #####:  252:          jerry_port_log (JERRY_LOG_LEVEL_ERROR, "~");
+        -:  253:        }
+        -:  254:
+    #####:  255:        jerry_port_log (JERRY_LOG_LEVEL_ERROR, "^\n");
+        -:  256:      }
+        -:  257:    }
+        -:  258:  }
+        -:  259:
+    #####:  260:  jerry_port_log (JERRY_LOG_LEVEL_ERROR, "Script Error: %s\n", err_str_buf);
+    #####:  261:  jerry_release_value (err_str_val);
+    #####:  262:} /* print_unhandled_exception */
+        -:  263:
+        -:  264:/**
+        -:  265: * Register a JavaScript function in the global object.
+        -:  266: */
+        -:  267:static void
+        4:  268:register_js_function (const char *name_p, /**< name of the function */
+        -:  269:                      jerry_external_handler_t handler_p) /**< function callback */
+        -:  270:{
+        4:  271:  jerry_value_t result_val = jerryx_handler_register_global ((const jerry_char_t *) name_p, handler_p);
+        -:  272:
+        4:  273:  if (jerry_value_is_error (result_val))
+        -:  274:  {
+    #####:  275:    jerry_port_log (JERRY_LOG_LEVEL_WARNING, "Warning: failed to register '%s' method.", name_p);
+    #####:  276:    result_val = jerry_get_value_from_error (result_val, true);
+    #####:  277:    print_unhandled_exception (result_val);
+        -:  278:  }
+        -:  279:
+        4:  280:  jerry_release_value (result_val);
+        4:  281:} /* register_js_function */
+        -:  282:
+        -:  283:/**
+        -:  284: * Runs the source code received by jerry_debugger_wait_for_client_source.
+        -:  285: *
+        -:  286: * @return result fo the source code execution
+        -:  287: */
+        -:  288:static jerry_value_t
+    #####:  289:wait_for_source_callback (const jerry_char_t *resource_name_p, /**< resource name */
+        -:  290:                          size_t resource_name_size, /**< size of resource name */
+        -:  291:                          const jerry_char_t *source_p, /**< source code */
+        -:  292:                          size_t source_size, /**< source code size */
+        -:  293:                          void *user_p) /**< user pointer */
+        -:  294:{
+        -:  295:  (void) user_p; /* unused */
+    #####:  296:  jerry_value_t ret_val = jerry_parse (resource_name_p,
+        -:  297:                                       resource_name_size,
+        -:  298:                                       source_p,
+        -:  299:                                       source_size,
+        -:  300:                                       JERRY_PARSE_NO_OPTS);
+        -:  301:
+    #####:  302:  if (!jerry_value_is_error (ret_val))
+        -:  303:  {
+    #####:  304:    jerry_value_t func_val = ret_val;
+    #####:  305:    ret_val = jerry_run (func_val);
+    #####:  306:    jerry_release_value (func_val);
+        -:  307:  }
+        -:  308:
+    #####:  309:  return ret_val;
+        -:  310:} /* wait_for_source_callback */
+        -:  311:
+        -:  312:/**
+        -:  313: * Command line option IDs
+        -:  314: */
+        -:  315:typedef enum
+        -:  316:{
+        -:  317:  OPT_HELP,
+        -:  318:  OPT_VERSION,
+        -:  319:  OPT_MEM_STATS,
+        -:  320:  OPT_PARSE_ONLY,
+        -:  321:  OPT_SHOW_OP,
+        -:  322:  OPT_SHOW_RE_OP,
+        -:  323:  OPT_DEBUG_SERVER,
+        -:  324:  OPT_DEBUG_PORT,
+        -:  325:  OPT_DEBUG_CHANNEL,
+        -:  326:  OPT_DEBUG_PROTOCOL,
+        -:  327:  OPT_DEBUG_SERIAL_CONFIG,
+        -:  328:  OPT_DEBUGGER_WAIT_SOURCE,
+        -:  329:  OPT_EXEC_SNAP,
+        -:  330:  OPT_EXEC_SNAP_FUNC,
+        -:  331:  OPT_LOG_LEVEL,
+        -:  332:  OPT_NO_PROMPT,
+        -:  333:  OPT_CALL_ON_EXIT
+        -:  334:} main_opt_id_t;
+        -:  335:
+        -:  336:/**
+        -:  337: * Command line options
+        -:  338: */
+        -:  339:static const cli_opt_t main_opts[] =
+        -:  340:{
+        -:  341:  CLI_OPT_DEF (.id = OPT_HELP, .opt = "h", .longopt = "help",
+        -:  342:               .help = "print this help and exit"),
+        -:  343:  CLI_OPT_DEF (.id = OPT_VERSION, .opt = "v", .longopt = "version",
+        -:  344:               .help = "print tool and library version and exit"),
+        -:  345:  CLI_OPT_DEF (.id = OPT_MEM_STATS, .longopt = "mem-stats",
+        -:  346:               .help = "dump memory statistics"),
+        -:  347:  CLI_OPT_DEF (.id = OPT_PARSE_ONLY, .longopt = "parse-only",
+        -:  348:               .help = "don't execute JS input"),
+        -:  349:  CLI_OPT_DEF (.id = OPT_SHOW_OP, .longopt = "show-opcodes",
+        -:  350:               .help = "dump parser byte-code"),
+        -:  351:  CLI_OPT_DEF (.id = OPT_SHOW_RE_OP, .longopt = "show-regexp-opcodes",
+        -:  352:               .help = "dump regexp byte-code"),
+        -:  353:  CLI_OPT_DEF (.id = OPT_DEBUG_SERVER, .longopt = "start-debug-server",
+        -:  354:               .help = "start debug server and wait for a connecting client"),
+        -:  355:  CLI_OPT_DEF (.id = OPT_DEBUG_PORT, .longopt = "debug-port", .meta = "NUM",
+        -:  356:               .help = "debug server port (default: 5001)"),
+        -:  357:  CLI_OPT_DEF (.id = OPT_DEBUG_CHANNEL, .longopt = "debug-channel", .meta = "[websocket|rawpacket]",
+        -:  358:               .help = "Specify the debugger transmission channel (default: websocket)"),
+        -:  359:  CLI_OPT_DEF (.id = OPT_DEBUG_PROTOCOL, .longopt = "debug-protocol", .meta = "PROTOCOL",
+        -:  360:               .help = "Specify the transmission protocol over the communication channel (tcp|serial, default: tcp)"),
+        -:  361:  CLI_OPT_DEF (.id = OPT_DEBUG_SERIAL_CONFIG, .longopt = "serial-config", .meta = "OPTIONS_STRING",
+        -:  362:               .help = "Configure parameters for serial port (default: /dev/ttyS0,115200,8,N,1)"),
+        -:  363:  CLI_OPT_DEF (.id = OPT_DEBUGGER_WAIT_SOURCE, .longopt = "debugger-wait-source",
+        -:  364:               .help = "wait for an executable source from the client"),
+        -:  365:  CLI_OPT_DEF (.id = OPT_EXEC_SNAP, .longopt = "exec-snapshot", .meta = "FILE",
+        -:  366:               .help = "execute input snapshot file(s)"),
+        -:  367:  CLI_OPT_DEF (.id = OPT_EXEC_SNAP_FUNC, .longopt = "exec-snapshot-func", .meta = "FILE NUM",
+        -:  368:               .help = "execute specific function from input snapshot file(s)"),
+        -:  369:  CLI_OPT_DEF (.id = OPT_LOG_LEVEL, .longopt = "log-level", .meta = "NUM",
+        -:  370:               .help = "set log level (0-3)"),
+        -:  371:  CLI_OPT_DEF (.id = OPT_NO_PROMPT, .longopt = "no-prompt",
+        -:  372:               .help = "don't print prompt in REPL mode"),
+        -:  373:  CLI_OPT_DEF (.id = OPT_CALL_ON_EXIT, .longopt = "call-on-exit", .meta = "STRING",
+        -:  374:               .help = "invoke the specified function when the process is just about to exit"),
+        -:  375:  CLI_OPT_DEF (.id = CLI_OPT_DEFAULT, .meta = "FILE",
+        -:  376:               .help = "input JS file(s) (If file is -, read standard input.)")
+        -:  377:};
+        -:  378:
+        -:  379:/**
+        -:  380: * Check whether JerryScript has a requested feature enabled or not. If not,
+        -:  381: * print a warning message.
+        -:  382: *
+        -:  383: * @return the status of the feature.
+        -:  384: */
+        -:  385:static bool
+    #####:  386:check_feature (jerry_feature_t feature, /**< feature to check */
+        -:  387:               const char *option) /**< command line option that triggered this check */
+        -:  388:{
+    #####:  389:  if (!jerry_is_feature_enabled (feature))
+        -:  390:  {
+    #####:  391:    jerry_port_default_set_log_level (JERRY_LOG_LEVEL_WARNING);
+    #####:  392:    jerry_port_log (JERRY_LOG_LEVEL_WARNING, "Ignoring '%s' option because this feature is disabled!\n", option);
+    #####:  393:    return false;
+        -:  394:  }
+    #####:  395:  return true;
+        -:  396:} /* check_feature */
+        -:  397:
+        -:  398:/**
+        -:  399: * Check whether a usage-related condition holds. If not, print an error
+        -:  400: * message, print the usage, and terminate the application.
+        -:  401: */
+        -:  402:static void
+    #####:  403:check_usage (bool condition, /**< the condition that must hold */
+        -:  404:             const char *name, /**< name of the application (argv[0]) */
+        -:  405:             const char *msg, /**< error message to print if condition does not hold */
+        -:  406:             const char *opt) /**< optional part of the error message */
+        -:  407:{
+    #####:  408:  if (!condition)
+        -:  409:  {
+    #####:  410:    jerry_port_log (JERRY_LOG_LEVEL_ERROR, "%s: %s%s\n", name, msg, opt != NULL ? opt : "");
+    #####:  411:    exit (JERRY_STANDALONE_EXIT_CODE_FAIL);
+        -:  412:  }
+    #####:  413:} /* check_usage */
+        -:  414:
+        -:  415:#if defined (JERRY_EXTERNAL_CONTEXT) && (JERRY_EXTERNAL_CONTEXT == 1)
+        -:  416:
+        -:  417:/**
+        -:  418: * The alloc function passed to jerry_create_context
+        -:  419: */
+        -:  420:static void *
+        -:  421:context_alloc (size_t size,
+        -:  422:               void *cb_data_p)
+        -:  423:{
+        -:  424:  (void) cb_data_p; /* unused */
+        -:  425:  return malloc (size);
+        -:  426:} /* context_alloc */
+        -:  427:
+        -:  428:#endif /* defined (JERRY_EXTERNAL_CONTEXT) && (JERRY_EXTERNAL_CONTEXT == 1) */
+        -:  429:
+        -:  430:/**
+        -:  431: * Inits the engine and the debugger
+        -:  432: */
+        -:  433:static void
+        1:  434:init_engine (jerry_init_flag_t flags, /**< initialized flags for the engine */
+        -:  435:             char *debug_channel, /**< enable the debugger init or not */
+        -:  436:             char *debug_protocol, /**< enable the debugger init or not */
+        -:  437:             uint16_t debug_port, /**< the debugger port for tcp protocol */
+        -:  438:             char *debug_serial_config) /**< configuration string for serial protocol */
+        -:  439:{
+        1:  440:  jerry_init (flags);
+        1:  441:  if (strcmp (debug_channel, ""))
+        -:  442:  {
+    #####:  443:    bool protocol = false;
+        -:  444:
+    #####:  445:    if (!strcmp (debug_protocol, "tcp"))
+        -:  446:    {
+    #####:  447:      protocol = jerryx_debugger_tcp_create (debug_port);
+        -:  448:    }
+        -:  449:    else
+        -:  450:    {
+    #####:  451:      assert (!strcmp (debug_protocol, "serial"));
+    #####:  452:      protocol = jerryx_debugger_serial_create (debug_serial_config);
+        -:  453:    }
+        -:  454:
+    #####:  455:    if (!strcmp (debug_channel, "rawpacket"))
+        -:  456:    {
+    #####:  457:      jerryx_debugger_after_connect (protocol && jerryx_debugger_rp_create ());
+        -:  458:    }
+        -:  459:    else
+        -:  460:    {
+    #####:  461:      assert (!strcmp (debug_channel, "websocket"));
+    #####:  462:      jerryx_debugger_after_connect (protocol && jerryx_debugger_ws_create ());
+        -:  463:    }
+        -:  464:  }
+        -:  465:
+        1:  466:  register_js_function ("assert", jerryx_handler_assert);
+        1:  467:  register_js_function ("gc", jerryx_handler_gc);
+        1:  468:  register_js_function ("print", jerryx_handler_print);
+        1:  469:  register_js_function ("resourceName", jerryx_handler_resource_name);
+        1:  470:} /* init_engine */
+        -:  471:
+        -:  472:#ifdef DPP_ENABLE_GCOV
+        -:  473:#include <gcov.h>
+        -:  474:void __asan_on_error(void);
+        1:  475:void __asan_on_error(void) {
+        1:  476:	__gcov_flush();
+    #####:  477:}
+        -:  478:#endif
+        -:  479:
+        -:  480:int
+        1:  481:main (int argc,
+        -:  482:      char **argv)
+        1:  483:{
+        -:  484:  union
+        -:  485:  {
+        -:  486:    double d;
+        -:  487:    unsigned u;
+        1:  488:  } now = { .d = jerry_port_get_current_time () };
+        1:  489:  srand (now.u);
+        1:  490:  JERRY_VLA (const char *, file_names, argc);
+        1:  491:  int files_counter = 0;
+        -:  492:
+        1:  493:  jerry_init_flag_t flags = JERRY_INIT_EMPTY;
+        -:  494:
+        1:  495:  JERRY_VLA (const char *, exec_snapshot_file_names, argc);
+        1:  496:  JERRY_VLA (uint32_t, exec_snapshot_file_indices, argc);
+        1:  497:  int exec_snapshots_count = 0;
+        -:  498:
+        1:  499:  bool is_parse_only = false;
+        -:  500:
+        1:  501:  bool start_debug_server = false;
+        1:  502:  uint16_t debug_port = 5001;
+        1:  503:  char *debug_channel = "websocket";
+        1:  504:  char *debug_protocol = "tcp";
+        1:  505:  char *debug_serial_config = "/dev/ttyS0,115200,8,N,1";
+        -:  506:
+        1:  507:  bool is_repl_mode = false;
+        1:  508:  bool is_wait_mode = false;
+        1:  509:  bool no_prompt = false;
+        -:  510:
+        1:  511:  const char *exit_cb = NULL;
+        -:  512:
+        1:  513:  cli_state_t cli_state = cli_init (main_opts, argc - 1, argv + 1);
+        2:  514:  for (int id = cli_consume_option (&cli_state); id != CLI_OPT_END; id = cli_consume_option (&cli_state))
+        -:  515:  {
+        1:  516:    switch (id)
+        -:  517:    {
+    #####:  518:      case OPT_HELP:
+        -:  519:      {
+    #####:  520:        cli_help (argv[0], NULL, main_opts);
+    #####:  521:        return JERRY_STANDALONE_EXIT_CODE_OK;
+        -:  522:      }
+    #####:  523:      case OPT_VERSION:
+        -:  524:      {
+    #####:  525:        printf ("Version: %d.%d.%d%s\n",
+        -:  526:                JERRY_API_MAJOR_VERSION,
+        -:  527:                JERRY_API_MINOR_VERSION,
+        -:  528:                JERRY_API_PATCH_VERSION,
+        -:  529:                JERRY_COMMIT_HASH);
+    #####:  530:        return JERRY_STANDALONE_EXIT_CODE_OK;
+        -:  531:      }
+    #####:  532:      case OPT_MEM_STATS:
+        -:  533:      {
+    #####:  534:        if (check_feature (JERRY_FEATURE_MEM_STATS, cli_state.arg))
+        -:  535:        {
+    #####:  536:          jerry_port_default_set_log_level (JERRY_LOG_LEVEL_DEBUG);
+    #####:  537:          flags |= JERRY_INIT_MEM_STATS;
+        -:  538:        }
+    #####:  539:        break;
+        -:  540:      }
+    #####:  541:      case OPT_PARSE_ONLY:
+        -:  542:      {
+    #####:  543:        is_parse_only = true;
+    #####:  544:        break;
+        -:  545:      }
+    #####:  546:      case OPT_SHOW_OP:
+        -:  547:      {
+    #####:  548:        if (check_feature (JERRY_FEATURE_PARSER_DUMP, cli_state.arg))
+        -:  549:        {
+    #####:  550:          jerry_port_default_set_log_level (JERRY_LOG_LEVEL_DEBUG);
+    #####:  551:          flags |= JERRY_INIT_SHOW_OPCODES;
+        -:  552:        }
+    #####:  553:        break;
+        -:  554:      }
+    #####:  555:      case OPT_CALL_ON_EXIT:
+        -:  556:      {
+    #####:  557:        exit_cb = cli_consume_string (&cli_state);
+    #####:  558:        break;
+        -:  559:      }
+    #####:  560:      case OPT_SHOW_RE_OP:
+        -:  561:      {
+    #####:  562:        if (check_feature (JERRY_FEATURE_REGEXP_DUMP, cli_state.arg))
+        -:  563:        {
+    #####:  564:          jerry_port_default_set_log_level (JERRY_LOG_LEVEL_DEBUG);
+    #####:  565:          flags |= JERRY_INIT_SHOW_REGEXP_OPCODES;
+        -:  566:        }
+    #####:  567:        break;
+        -:  568:      }
+    #####:  569:      case OPT_DEBUG_SERVER:
+        -:  570:      {
+    #####:  571:        if (check_feature (JERRY_FEATURE_DEBUGGER, cli_state.arg))
+        -:  572:        {
+    #####:  573:          start_debug_server = true;
+        -:  574:        }
+    #####:  575:        break;
+        -:  576:      }
+    #####:  577:      case OPT_DEBUG_PORT:
+        -:  578:      {
+    #####:  579:        if (check_feature (JERRY_FEATURE_DEBUGGER, cli_state.arg))
+        -:  580:        {
+    #####:  581:          debug_port = (uint16_t) cli_consume_int (&cli_state);
+        -:  582:        }
+    #####:  583:        break;
+        -:  584:      }
+    #####:  585:      case OPT_DEBUG_CHANNEL:
+        -:  586:      {
+    #####:  587:        if (check_feature (JERRY_FEATURE_DEBUGGER, cli_state.arg))
+        -:  588:        {
+    #####:  589:          debug_channel = (char *) cli_consume_string (&cli_state);
+    #####:  590:          check_usage (!strcmp (debug_channel, "websocket") || !strcmp (debug_channel, "rawpacket"),
+        -:  591:                       argv[0], "Error: invalid value for --debug-channel: ", cli_state.arg);
+        -:  592:        }
+    #####:  593:        break;
+        -:  594:      }
+    #####:  595:      case OPT_DEBUG_PROTOCOL:
+        -:  596:      {
+    #####:  597:        if (check_feature (JERRY_FEATURE_DEBUGGER, cli_state.arg))
+        -:  598:        {
+    #####:  599:          debug_protocol = (char *) cli_consume_string (&cli_state);
+    #####:  600:          check_usage (!strcmp (debug_protocol, "tcp") || !strcmp (debug_protocol, "serial"),
+        -:  601:                       argv[0], "Error: invalid value for --debug-protocol: ", cli_state.arg);
+        -:  602:        }
+    #####:  603:        break;
+        -:  604:      }
+    #####:  605:      case OPT_DEBUG_SERIAL_CONFIG:
+        -:  606:      {
+    #####:  607:        if (check_feature (JERRY_FEATURE_DEBUGGER, cli_state.arg))
+        -:  608:        {
+    #####:  609:          debug_serial_config = (char *) cli_consume_string (&cli_state);
+        -:  610:        }
+    #####:  611:        break;
+        -:  612:      }
+    #####:  613:      case OPT_DEBUGGER_WAIT_SOURCE:
+        -:  614:      {
+    #####:  615:        if (check_feature (JERRY_FEATURE_DEBUGGER, cli_state.arg))
+        -:  616:        {
+    #####:  617:          is_wait_mode = true;
+        -:  618:        }
+    #####:  619:        break;
+        -:  620:      }
+    #####:  621:      case OPT_EXEC_SNAP:
+        -:  622:      {
+    #####:  623:        if (check_feature (JERRY_FEATURE_SNAPSHOT_EXEC, cli_state.arg))
+        -:  624:        {
+    #####:  625:          exec_snapshot_file_names[exec_snapshots_count] = cli_consume_string (&cli_state);
+    #####:  626:          exec_snapshot_file_indices[exec_snapshots_count++] = 0;
+        -:  627:        }
+        -:  628:        else
+        -:  629:        {
+    #####:  630:          cli_consume_string (&cli_state);
+        -:  631:        }
+    #####:  632:        break;
+        -:  633:      }
+    #####:  634:      case OPT_EXEC_SNAP_FUNC:
+        -:  635:      {
+    #####:  636:        if (check_feature (JERRY_FEATURE_SNAPSHOT_EXEC, cli_state.arg))
+        -:  637:        {
+    #####:  638:          exec_snapshot_file_names[exec_snapshots_count] = cli_consume_string (&cli_state);
+    #####:  639:          exec_snapshot_file_indices[exec_snapshots_count++] = (uint32_t) cli_consume_int (&cli_state);
+        -:  640:        }
+        -:  641:        else
+        -:  642:        {
+    #####:  643:          cli_consume_string (&cli_state);
+        -:  644:        }
+    #####:  645:        break;
+        -:  646:      }
+    #####:  647:      case OPT_LOG_LEVEL:
+        -:  648:      {
+    #####:  649:        long int log_level = cli_consume_int (&cli_state);
+    #####:  650:        check_usage (log_level >= 0 && log_level <= 3,
+        -:  651:                     argv[0], "Error: invalid value for --log-level: ", cli_state.arg);
+        -:  652:
+    #####:  653:        jerry_port_default_set_log_level ((jerry_log_level_t) log_level);
+    #####:  654:        break;
+        -:  655:      }
+    #####:  656:      case OPT_NO_PROMPT:
+        -:  657:      {
+    #####:  658:        no_prompt = true;
+    #####:  659:        break;
+        -:  660:      }
+        1:  661:      case CLI_OPT_DEFAULT:
+        -:  662:      {
+        1:  663:        file_names[files_counter++] = cli_consume_string (&cli_state);
+        1:  664:        break;
+        -:  665:      }
+    #####:  666:      default:
+        -:  667:      {
+    #####:  668:        cli_state.error = "Internal error";
+    #####:  669:        break;
+        -:  670:      }
+        -:  671:    }
+        -:  672:  }
+        -:  673:
+        1:  674:  if (cli_state.error != NULL)
+        -:  675:  {
+    #####:  676:    if (cli_state.arg != NULL)
+        -:  677:    {
+    #####:  678:      jerry_port_log (JERRY_LOG_LEVEL_ERROR, "Error: %s %s\n", cli_state.error, cli_state.arg);
+        -:  679:    }
+        -:  680:    else
+        -:  681:    {
+    #####:  682:      jerry_port_log (JERRY_LOG_LEVEL_ERROR, "Error: %s\n", cli_state.error);
+        -:  683:    }
+        -:  684:
+    #####:  685:    return JERRY_STANDALONE_EXIT_CODE_FAIL;
+        -:  686:  }
+        -:  687:
+        1:  688:  if (files_counter == 0
+    #####:  689:      && exec_snapshots_count == 0)
+        -:  690:  {
+    #####:  691:    is_repl_mode = true;
+        -:  692:  }
+        -:  693:
+        -:  694:#if defined (JERRY_EXTERNAL_CONTEXT) && (JERRY_EXTERNAL_CONTEXT == 1)
+        -:  695:
+        -:  696:  jerry_context_t *context_p = jerry_create_context (JERRY_GLOBAL_HEAP_SIZE * 1024, context_alloc, NULL);
+        -:  697:  jerry_port_default_set_current_context (context_p);
+        -:  698:
+        -:  699:#endif /* defined (JERRY_EXTERNAL_CONTEXT) && (JERRY_EXTERNAL_CONTEXT == 1) */
+        -:  700:
+        1:  701:  if (!start_debug_server)
+        -:  702:  {
+        1:  703:    debug_channel = "";
+        -:  704:  }
+        -:  705:
+        1:  706:  init_engine (flags, debug_channel, debug_protocol, debug_port, debug_serial_config);
+        -:  707:
+        1:  708:  jerry_value_t ret_value = jerry_create_undefined ();
+        -:  709:
+        1:  710:  if (jerry_is_feature_enabled (JERRY_FEATURE_SNAPSHOT_EXEC))
+        -:  711:  {
+    #####:  712:    for (int i = 0; i < exec_snapshots_count; i++)
+        -:  713:    {
+    #####:  714:      size_t snapshot_size;
+    #####:  715:      const uint32_t *snapshot_p = read_file (exec_snapshot_file_names[i], &snapshot_size);
+        -:  716:
+    #####:  717:      if (snapshot_p == NULL)
+        -:  718:      {
+    #####:  719:        ret_value = jerry_create_error (JERRY_ERROR_COMMON, (jerry_char_t *) "Snapshot file load error");
+        -:  720:      }
+        -:  721:      else
+        -:  722:      {
+    #####:  723:        ret_value = jerry_exec_snapshot (snapshot_p,
+        -:  724:                                         snapshot_size,
+    #####:  725:                                         exec_snapshot_file_indices[i],
+        -:  726:                                         JERRY_SNAPSHOT_EXEC_COPY_DATA);
+        -:  727:      }
+        -:  728:
+    #####:  729:      if (jerry_value_is_error (ret_value))
+        -:  730:      {
+    #####:  731:        break;
+        -:  732:      }
+        -:  733:    }
+        -:  734:  }
+        -:  735:
+        -:  736:  while (true)
+    #####:  737:  {
+        -:  738:
+        1:  739:    if (!jerry_value_is_error (ret_value))
+        -:  740:    {
+        1:  741:      for (int i = 0; i < files_counter; i++)
+        -:  742:      {
+        1:  743:        size_t source_size;
+        1:  744:        const jerry_char_t *source_p = (jerry_char_t *) read_file (file_names[i], &source_size);
+        -:  745:
+        1:  746:        if (source_p == NULL)
+        -:  747:        {
+    #####:  748:          ret_value = jerry_create_error (JERRY_ERROR_COMMON, (jerry_char_t *) "Source file load error");
+    #####:  749:          break;
+        -:  750:        }
+        -:  751:
+        1:  752:        if (!jerry_is_valid_utf8_string (source_p, (jerry_size_t) source_size))
+        -:  753:        {
+    #####:  754:          ret_value = jerry_create_error (JERRY_ERROR_COMMON, (jerry_char_t *) ("Input must be a valid UTF-8 string."));
+    #####:  755:          break;
+        -:  756:        }
+        -:  757:
+        1:  758:        ret_value = jerry_parse ((jerry_char_t *) file_names[i],
+        -:  759:                                 strlen (file_names[i]),
+        -:  760:                                 source_p,
+        -:  761:                                 source_size,
+        -:  762:                                 JERRY_PARSE_NO_OPTS);
+        -:  763:
+        1:  764:        if (!jerry_value_is_error (ret_value) && !is_parse_only)
+        -:  765:        {
+        1:  766:          jerry_value_t func_val = ret_value;
+        1:  767:          ret_value = jerry_run (func_val);
+    #####:  768:          jerry_release_value (func_val);
+        -:  769:        }
+        -:  770:
+    #####:  771:        if (jerry_value_is_error (ret_value))
+        -:  772:        {
+    #####:  773:          break;
+        -:  774:        }
+        -:  775:
+    #####:  776:        jerry_release_value (ret_value);
+    #####:  777:        ret_value = jerry_create_undefined ();
+        -:  778:      }
+        -:  779:    }
+        -:  780:
+    #####:  781:    if (is_wait_mode)
+        -:  782:    {
+    #####:  783:      is_repl_mode = false;
+        -:  784:
+    #####:  785:      if (jerry_is_feature_enabled (JERRY_FEATURE_DEBUGGER))
+        -:  786:      {
+        -:  787:        while (true)
+    #####:  788:        {
+        -:  789:          jerry_debugger_wait_for_source_status_t receive_status;
+        -:  790:
+        -:  791:          do
+        -:  792:          {
+    #####:  793:            jerry_value_t run_result;
+        -:  794:
+    #####:  795:            receive_status = jerry_debugger_wait_for_client_source (wait_for_source_callback,
+        -:  796:                                                                    NULL,
+        -:  797:                                                                    &run_result);
+        -:  798:
+    #####:  799:            if (receive_status == JERRY_DEBUGGER_SOURCE_RECEIVE_FAILED)
+        -:  800:            {
+    #####:  801:              ret_value = jerry_create_error (JERRY_ERROR_COMMON,
+        -:  802:                                              (jerry_char_t *) "Connection aborted before source arrived.");
+        -:  803:            }
+        -:  804:
+    #####:  805:            if (receive_status == JERRY_DEBUGGER_SOURCE_END)
+        -:  806:            {
+    #####:  807:              jerry_port_log (JERRY_LOG_LEVEL_DEBUG, "No more client source.\n");
+        -:  808:            }
+        -:  809:
+    #####:  810:            if (jerry_value_is_abort (run_result))
+        -:  811:            {
+    #####:  812:              ret_value = jerry_acquire_value (run_result);
+        -:  813:            }
+        -:  814:
+    #####:  815:            jerry_release_value (run_result);
+        -:  816:          }
+    #####:  817:          while (receive_status == JERRY_DEBUGGER_SOURCE_RECEIVED);
+        -:  818:
+    #####:  819:          if (receive_status != JERRY_DEBUGGER_CONTEXT_RESET_RECEIVED)
+        -:  820:          {
+    #####:  821:            break;
+        -:  822:          }
+        -:  823:
+    #####:  824:          init_engine (flags, debug_channel, debug_protocol, debug_port, debug_serial_config);
+        -:  825:
+    #####:  826:          ret_value = jerry_create_undefined ();
+        -:  827:        }
+        -:  828:      }
+        -:  829:
+        -:  830:    }
+        -:  831:
+    #####:  832:    bool restart = false;
+        -:  833:
+    #####:  834:    if (jerry_is_feature_enabled (JERRY_FEATURE_DEBUGGER) && jerry_value_is_abort (ret_value))
+        -:  835:    {
+    #####:  836:      jerry_value_t abort_value = jerry_get_value_from_error (ret_value, false);
+    #####:  837:      if (jerry_value_is_string (abort_value))
+        -:  838:      {
+        -:  839:        static const char restart_str[] = "r353t";
+        -:  840:
+    #####:  841:        jerry_value_t str_val = jerry_value_to_string (abort_value);
+    #####:  842:        jerry_size_t str_size = jerry_get_string_size (str_val);
+        -:  843:
+    #####:  844:        if (str_size == sizeof (restart_str) - 1)
+    #####:  845:        {
+    #####:  846:          JERRY_VLA (jerry_char_t, str_buf, str_size);
+    #####:  847:          jerry_string_to_char_buffer (str_val, str_buf, str_size);
+    #####:  848:          if (memcmp (restart_str, (char *) (str_buf), str_size) == 0)
+        -:  849:          {
+    #####:  850:            jerry_release_value (ret_value);
+    #####:  851:            restart = true;
+        -:  852:          }
+        -:  853:        }
+        -:  854:
+    #####:  855:        jerry_release_value (str_val);
+        -:  856:      }
+        -:  857:
+    #####:  858:      jerry_release_value (abort_value);
+        -:  859:    }
+        -:  860:
+    #####:  861:    if (!restart)
+        -:  862:    {
+    #####:  863:      break;
+        -:  864:    }
+        -:  865:
+    #####:  866:    jerry_cleanup ();
+        -:  867:
+    #####:  868:    init_engine (flags, debug_channel, debug_protocol, debug_port, debug_serial_config);
+        -:  869:
+    #####:  870:    ret_value = jerry_create_undefined ();
+        -:  871:  }
+        -:  872:
+    #####:  873:  if (is_repl_mode)
+        -:  874:  {
+    #####:  875:    const char *prompt = !no_prompt ? "jerry> " : "";
+    #####:  876:    bool is_done = false;
+        -:  877:
+    #####:  878:    while (!is_done)
+        -:  879:    {
+    #####:  880:      uint8_t *source_buffer_tail = buffer;
+    #####:  881:      size_t len = 0;
+        -:  882:
+    #####:  883:      printf ("%s", prompt);
+        -:  884:
+        -:  885:      /* Read a line */
+        -:  886:      while (true)
+        -:  887:      {
+    #####:  888:        if (fread (source_buffer_tail, 1, 1, stdin) != 1)
+        -:  889:        {
+    #####:  890:          is_done = true;
+    #####:  891:          break;
+        -:  892:        }
+    #####:  893:        if (*source_buffer_tail == '\n')
+        -:  894:        {
+    #####:  895:          break;
+        -:  896:        }
+    #####:  897:        source_buffer_tail ++;
+    #####:  898:        len ++;
+        -:  899:      }
+    #####:  900:      *source_buffer_tail = 0;
+        -:  901:
+    #####:  902:      if (len > 0)
+        -:  903:      {
+    #####:  904:        if (!jerry_is_valid_utf8_string (buffer, (jerry_size_t) len))
+        -:  905:        {
+    #####:  906:          jerry_port_log (JERRY_LOG_LEVEL_ERROR, "Error: Input must be a valid UTF-8 string.\n");
+    #####:  907:          return JERRY_STANDALONE_EXIT_CODE_FAIL;
+        -:  908:        }
+        -:  909:
+        -:  910:        /* Evaluate the line */
+    #####:  911:        jerry_value_t ret_val = jerry_parse (NULL,
+        -:  912:                                             0,
+        -:  913:                                             buffer,
+        -:  914:                                             len,
+        -:  915:                                             JERRY_PARSE_NO_OPTS);
+        -:  916:
+    #####:  917:        if (!jerry_value_is_error (ret_val))
+        -:  918:        {
+    #####:  919:          jerry_value_t func_val = ret_val;
+    #####:  920:          ret_val = jerry_run (func_val);
+    #####:  921:          jerry_release_value (func_val);
+        -:  922:        }
+        -:  923:
+    #####:  924:        if (!jerry_value_is_error (ret_val))
+        -:  925:        {
+        -:  926:          /* Print return value */
+    #####:  927:          const jerry_value_t args[] = { ret_val };
+    #####:  928:          jerry_value_t ret_val_print = jerryx_handler_print (jerry_create_undefined (),
+        -:  929:                                                              jerry_create_undefined (),
+        -:  930:                                                              args,
+        -:  931:                                                              1);
+    #####:  932:          jerry_release_value (ret_val_print);
+    #####:  933:          jerry_release_value (ret_val);
+    #####:  934:          ret_val = jerry_run_all_enqueued_jobs ();
+        -:  935:
+    #####:  936:          if (jerry_value_is_error (ret_val))
+        -:  937:          {
+    #####:  938:            ret_val = jerry_get_value_from_error (ret_val, true);
+    #####:  939:            print_unhandled_exception (ret_val);
+        -:  940:          }
+        -:  941:        }
+        -:  942:        else
+        -:  943:        {
+    #####:  944:          ret_val = jerry_get_value_from_error (ret_val, true);
+    #####:  945:          print_unhandled_exception (ret_val);
+        -:  946:        }
+        -:  947:
+    #####:  948:        jerry_release_value (ret_val);
+        -:  949:      }
+        -:  950:    }
+        -:  951:  }
+        -:  952:
+    #####:  953:  int ret_code = JERRY_STANDALONE_EXIT_CODE_OK;
+        -:  954:
+    #####:  955:  if (jerry_value_is_error (ret_value))
+        -:  956:  {
+    #####:  957:    ret_value = jerry_get_value_from_error (ret_value, true);
+    #####:  958:    print_unhandled_exception (ret_value);
+        -:  959:
+    #####:  960:    ret_code = JERRY_STANDALONE_EXIT_CODE_FAIL;
+        -:  961:  }
+        -:  962:
+    #####:  963:  jerry_release_value (ret_value);
+        -:  964:
+    #####:  965:  ret_value = jerry_run_all_enqueued_jobs ();
+        -:  966:
+    #####:  967:  if (jerry_value_is_error (ret_value))
+        -:  968:  {
+    #####:  969:    ret_value = jerry_get_value_from_error (ret_value, true);
+    #####:  970:    print_unhandled_exception (ret_value);
+    #####:  971:    ret_code = JERRY_STANDALONE_EXIT_CODE_FAIL;
+        -:  972:  }
+        -:  973:
+    #####:  974:  jerry_release_value (ret_value);
+        -:  975:
+    #####:  976:  if (exit_cb != NULL)
+        -:  977:  {
+    #####:  978:    jerry_value_t global = jerry_get_global_object ();
+    #####:  979:    jerry_value_t fn_str = jerry_create_string ((jerry_char_t *) exit_cb);
+    #####:  980:    jerry_value_t callback_fn = jerry_get_property (global, fn_str);
+        -:  981:
+    #####:  982:    jerry_release_value (global);
+    #####:  983:    jerry_release_value (fn_str);
+        -:  984:
+    #####:  985:    if (jerry_value_is_function (callback_fn))
+        -:  986:    {
+    #####:  987:      jerry_value_t ret_val = jerry_call_function (callback_fn, jerry_create_undefined (), NULL, 0);
+        -:  988:
+    #####:  989:      if (jerry_value_is_error (ret_val))
+        -:  990:      {
+    #####:  991:        ret_val = jerry_get_value_from_error (ret_val, true);
+    #####:  992:        print_unhandled_exception (ret_val);
+    #####:  993:        ret_code = JERRY_STANDALONE_EXIT_CODE_FAIL;
+        -:  994:      }
+        -:  995:
+    #####:  996:      jerry_release_value (ret_val);
+        -:  997:    }
+        -:  998:
+    #####:  999:    jerry_release_value (callback_fn);
+        -: 1000:  }
+        -: 1001:
+    #####: 1002:  jerry_cleanup ();
+        -: 1003:#if defined (JERRY_EXTERNAL_CONTEXT) && (JERRY_EXTERNAL_CONTEXT == 1)
+        -: 1004:  free (context_p);
+        -: 1005:#endif /* defined (JERRY_EXTERNAL_CONTEXT) && (JERRY_EXTERNAL_CONTEXT == 1) */
+    #####: 1006:  return ret_code;
+        -: 1007:} /* main */
