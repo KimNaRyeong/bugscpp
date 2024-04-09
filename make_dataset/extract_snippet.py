@@ -259,7 +259,24 @@ def collect_token_statistics(target_bugs):
         iterate_over_directory(os.path.join(repo_path, src_dir))        
         with open(os.path.join(data_dir, 'token_statistics.json'), 'w') as f:
             json.dump(sorted(data, key=lambda info: info['name']), f, indent=4)
- 
+
+def collect_jerryscript_extra_test(bug_index):
+    path_to_repo = f'benchmark/jerryscript/buggy-{bug_index}'
+    data = list()
+    with open(os.path.join(path_to_repo, '.dpp', 'test.js')) as f:
+        test_code = f.read()
+        line_count = len(test_code.splitlines())
+        data.append({'name' : 'test.test#1', \
+                     'src_path': 'test.js', \
+                     'class_name': 'test', \
+                     'signature': 'test.test()', \
+                     'snippet': test_code, \
+                     'begin_line': 1, \
+                     'end_line': line_count, \
+                     'is_bug': False})   
+    data_dir = f'data/jerryscript-{bug_index}'
+    with open(os.path.join(data_dir, 'test_snippet.json'), 'w') as f:
+        json.dump(data, f, indent=4)
+
 if __name__ == "__main__":
-    collect_snippet([('yara', '1'), ('yara', '2'), ('yara', '3'), ('yara', '4'), ('yara', '5')])
-    # collect_token_statistics([('zsh', '1', 'Src', True), ('libchewing', '1', 'src', True), ('berry', '1', 'src', True), ('yara', '1', 'libyara', True)])
+    collect_jerryscript_extra_test(1)
