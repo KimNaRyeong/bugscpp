@@ -1,0 +1,594 @@
+        -:    0:Source:/home/workspace/jerry-core/parser/js/js-parser-line-info-create.c
+        -:    0:Programs:299
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "ecma-line-info.h"
+        -:   17:
+        -:   18:#include "js-parser-internal.h"
+        -:   19:
+        -:   20:#if JERRY_PARSER
+        -:   21:
+        -:   22:#if JERRY_LINE_INFO
+        -:   23:
+        -:   24:/* \addtogroup parser Parser
+        -:   25: * @{
+        -:   26: *
+        -:   27: * \addtogroup jsparser JavaScript
+        -:   28: * @{
+        -:   29: *
+        -:   30: * \addtogroup jsparser_line_info_create Create line info data
+        -:   31: * @{
+        -:   32: */
+        -:   33:
+        -:   34:/*
+        -:   35: * The line-info data structure uses two number encodings:
+        -:   36: *
+        -:   37: * Vlq (variable length quantity):
+        -:   38: *    Each byte has 7 bit data and the highest bit is set for continuation.
+        -:   39: *    The format is big endian.
+        -:   40: *
+        -:   41: * Small:
+        -:   42: *    One byte can encode signed values between 127 and -126.
+        -:   43: *    Two byte can encode signed values between 319 and -318.
+        -:   44: *    Large values are encoded with vlq with a prefix byte.
+        -:   45: *
+        -:   46: * The line-info data structure is a sequence of chunks:
+        -:   47: *
+        -:   48: *  +------+--------------+------------+----------------+
+        -:   49: *  | Line | StreamLength | StreamData | [ByteCodeSize] |
+        -:   50: *  +------+--------------+------------+----------------+
+        -:   51: *
+        -:   52: *  Line [Vlq encoding]:
+        -:   53: *      Specifies the start line of this chunk, relative to its previous value.
+        -:   54: *      The starting column is always ECMA_LINE_INFO_COLUMN_DEFAULT
+        -:   55: *
+        -:   56: *  StreamLength [uint8_t]:
+        -:   57: *      Length of the StreamData in bytes minus ECMA_LINE_INFO_STREAM_SIZE_MIN.
+        -:   58: *      The 0 value represents the last chunk, which size is not specified
+        -:   59: *      (Can be less than ECMA_LINE_INFO_STREAM_SIZE_MIN).
+        -:   60: *
+        -:   61: *  StreamData [sequence of bytes]:
+        -:   62: *      Sequence of the following items:
+        -:   63: *
+        -:   64: *      +-----------+--------+--------+
+        -:   65: *      | EndOffset | [Line] | Column |
+        -:   66: *      +-----------+--------+--------+
+        -:   67: *
+        -:   68: *      EndOffset [Small encoding]:
+        -:   69: *          Specifies the EndOffset in the byte code, relative to the previous EndOffset.
+        -:   70: *          The range of byte codes corresponding to the line/column position of this item
+        -:   71: *          is between the EndOffset of the previous item (inclusive) and the EndOffset
+        -:   72: *          of this item (exclusive). The last end offset of a stream is always 0, which
+        -:   73: *          represents an unterminated range.
+        -:   74: *
+        -:   75: *      Line [Small encoding] [Optional]:
+        -:   76: *          If bit 1 of end offset is set, this specifies the line position of this item,
+        -:   77: *          relative to the previous line position, and the column position is set to
+        -:   78: *          ECMA_LINE_INFO_COLUMN_DEFAULT.
+        -:   79: *
+        -:   80: *      Column [Small encoding]:
+        -:   81: *          Specifies the current column position relative to the previous column position.
+        -:   82: *
+        -:   83: *  ByteCodeSize [Vlq encoding] [Optional]:
+        -:   84: *      If StreamLength is not 0, this specifies the byte code size of the whole range.
+        -:   85: *      This value can be used to skip the byte codes which line info is stored
+        -:   86: *      in this chunk. This information is not available for the last chunk.
+        -:   87: */
+        -:   88:
+        -:   89:/**
+        -:   90: * Maximum number of bytes requires to encode a number.
+        -:   91: */
+        -:   92:#define PARSER_LINE_INFO_BUFFER_MAX_SIZE 6
+        -:   93:
+        -:   94:/**
+        -:   95: * Stream generation ends after this size is reached,
+        -:   96: * since there might be not enough place for the next item.
+        -:   97: */
+        -:   98:#define PARSER_LINE_INFO_STREAM_SIZE_LIMIT \
+        -:   99:  (ECMA_LINE_INFO_STREAM_SIZE_MIN + UINT8_MAX - ((2 * PARSER_LINE_INFO_BUFFER_MAX_SIZE) + 1))
+        -:  100:
+        -:  101:/**
+        -:  102: * Page size of line info pages excluding the first one.
+        -:  103: */
+        -:  104:#define PARSER_LINE_INFO_PAGE_SIZE (sizeof (parser_mem_page_t *) + PARSER_STACK_PAGE_SIZE)
+        -:  105:
+        -:  106:/**
+        -:  107: * Page size of the first line info page.
+        -:  108: */
+        -:  109:#define PARSER_LINE_INFO_FIRST_PAGE_SIZE (sizeof (parser_line_info_data_t) + PARSER_LINE_INFO_PAGE_SIZE)
+        -:  110:
+        -:  111:/**
+        -:  112: * Get memory data of the first page.
+        -:  113: */
+        -:  114:#define PARSER_LINE_INFO_GET_FIRST_PAGE(line_info_p) (((parser_mem_page_t *) ((line_info_p) + 1)))
+        -:  115:
+        -:  116:/**
+        -:  117: * Free line info temporary data collected during parsing.
+        -:  118: */
+        -:  119:void
+       27:  120:parser_line_info_free (parser_line_info_data_t *line_info_p)
+        -:  121:{
+       27:  122:  if (line_info_p == NULL)
+        -:  123:  {
+    #####:  124:    return;
+        -:  125:  }
+        -:  126:
+       27:  127:  parser_mem_page_t *current_page_p = PARSER_LINE_INFO_GET_FIRST_PAGE (line_info_p)->next_p;
+       27:  128:  parser_free (line_info_p, PARSER_LINE_INFO_FIRST_PAGE_SIZE);
+        -:  129:
+       54:  130:  while (current_page_p != NULL)
+        -:  131:  {
+    #####:  132:    parser_mem_page_t *next_p = current_page_p->next_p;
+        -:  133:
+    #####:  134:    parser_free (current_page_p, PARSER_LINE_INFO_PAGE_SIZE);
+    #####:  135:    current_page_p = next_p;
+        -:  136:  }
+        -:  137:} /* parser_line_info_free */
+        -:  138:
+        -:  139:/**
+        -:  140: * Encodes an uint32_t number into a buffer. Numbers expected to be larger values.
+        -:  141: *
+        -:  142: * @return the number of bytes written to the buffer
+        -:  143: */
+        -:  144:static uint32_t
+      246:  145:parser_line_info_encode_vlq (uint8_t *buffer_p, /**< target buffer */
+        -:  146:                             uint32_t value) /**< encoded value */
+        -:  147:{
+      246:  148:  if (value <= ECMA_LINE_INFO_VLQ_MASK)
+        -:  149:  {
+      210:  150:    *buffer_p = (uint8_t) value;
+      210:  151:    return 1;
+        -:  152:  }
+        -:  153:
+       36:  154:  uint32_t length = 0;
+       36:  155:  uint32_t current_value = value;
+        -:  156:
+        -:  157:  do
+        -:  158:  {
+       72:  159:    current_value >>= ECMA_LINE_INFO_VLQ_SHIFT;
+       72:  160:    length++;
+       72:  161:  } while (current_value > 0);
+        -:  162:
+       36:  163:  buffer_p += length;
+        -:  164:
+        -:  165:  do
+        -:  166:  {
+       72:  167:    *(--buffer_p) = (uint8_t) (value | ECMA_LINE_INFO_VLQ_CONTINUE);
+       72:  168:    value >>= ECMA_LINE_INFO_VLQ_SHIFT;
+       72:  169:  } while (value > 0);
+        -:  170:
+       36:  171:  buffer_p[length - 1] &= ECMA_LINE_INFO_VLQ_MASK;
+       36:  172:  return length;
+        -:  173:} /* parser_line_info_encode_vlq */
+        -:  174:
+        -:  175:/**
+        -:  176: * Encodes an uint32_t number into a buffer. Numbers expected to be smaller values.
+        -:  177: *
+        -:  178: * @return the number of bytes written to the buffer
+        -:  179: */
+        -:  180:static uint32_t
+      168:  181:parser_line_info_encode_small (uint8_t *buffer_p, /**< target buffer */
+        -:  182:                               uint32_t value) /**< encoded value */
+        -:  183:{
+      168:  184:  if (JERRY_LIKELY (value < ECMA_LINE_INFO_ENCODE_TWO_BYTE_MIN))
+        -:  185:  {
+      168:  186:    buffer_p[0] = (uint8_t) value;
+      168:  187:    return 1;
+        -:  188:  }
+        -:  189:
+    #####:  190:  if (JERRY_LIKELY (value < ECMA_LINE_INFO_ENCODE_VLQ_MIN))
+        -:  191:  {
+    #####:  192:    buffer_p[0] = ECMA_LINE_INFO_ENCODE_TWO_BYTE;
+    #####:  193:    buffer_p[1] = (uint8_t) (value - ECMA_LINE_INFO_ENCODE_TWO_BYTE_MIN);
+    #####:  194:    return 2;
+        -:  195:  }
+        -:  196:
+    #####:  197:  *buffer_p++ = ECMA_LINE_INFO_ENCODE_VLQ;
+    #####:  198:  return parser_line_info_encode_vlq (buffer_p, value - ECMA_LINE_INFO_ENCODE_VLQ_MIN) + 1;
+        -:  199:} /* parser_line_info_encode_small */
+        -:  200:
+        -:  201:/**
+        -:  202: * Encodes the difference between two values.
+        -:  203: *
+        -:  204: * @return encoded difference
+        -:  205: */
+        -:  206:static inline uint32_t JERRY_ATTR_ALWAYS_INLINE
+        -:  207:parser_line_info_difference_get (uint32_t current_value, /**< current value */
+        -:  208:                                 uint32_t prev_value) /**< previous value */
+        -:  209:{
+      276:  210:  uint32_t result = current_value - prev_value - 1;
+        -:  211:
+      276:  212:  if (result <= (UINT32_MAX >> 1))
+        -:  213:  {
+      166:  214:    return (result << 1) | ECMA_LINE_INFO_INCREASE;
+        -:  215:  }
+        -:  216:
+      110:  217:  return ((UINT32_MAX - result) << 1) | ECMA_LINE_INFO_DECREASE;
+        -:  218:} /* parser_line_info_difference_get */
+        -:  219:
+        -:  220:/**
+        -:  221: * Appends a value at the end of the line info stream.
+        -:  222: */
+        -:  223:static void
+      138:  224:parser_line_info_append_number (parser_context_t *context_p, /**< context */
+        -:  225:                                uint32_t value) /**< value to be encoded */
+        -:  226:{
+      138:  227:  parser_line_info_data_t *line_info_p = context_p->line_info_p;
+      138:  228:  uint8_t buffer[PARSER_LINE_INFO_BUFFER_MAX_SIZE];
+        -:  229:
+      138:  230:  JERRY_ASSERT (line_info_p != NULL);
+        -:  231:
+      138:  232:  uint32_t length = parser_line_info_encode_vlq (buffer, value);
+      138:  233:  uint8_t offset = line_info_p->last_page_p->bytes[0];
+        -:  234:
+      138:  235:  if (offset + length <= PARSER_STACK_PAGE_SIZE)
+        -:  236:  {
+      138:  237:    memcpy (line_info_p->last_page_p->bytes + offset, buffer, length);
+        -:  238:
+      138:  239:    line_info_p->last_page_p->bytes[0] = (uint8_t) (length + offset);
+      138:  240:    return;
+        -:  241:  }
+        -:  242:
+        -:  243:  parser_mem_page_t *new_page_p;
+    #####:  244:  new_page_p = (parser_mem_page_t *) parser_malloc (context_p, PARSER_LINE_INFO_PAGE_SIZE);
+        -:  245:
+    #####:  246:  new_page_p->next_p = NULL;
+        -:  247:
+    #####:  248:  line_info_p->last_page_p->next_p = new_page_p;
+    #####:  249:  line_info_p->last_page_p = new_page_p;
+        -:  250:
+    #####:  251:  new_page_p->bytes[0] = (uint8_t) (length + 1);
+    #####:  252:  memcpy (new_page_p->bytes + 1, buffer, length);
+        -:  253:} /* parser_line_info_append_number */
+        -:  254:
+        -:  255:/**
+        -:  256: * Updates the current line information data.
+        -:  257: */
+        -:  258:void
+       48:  259:parser_line_info_append (parser_context_t *context_p, /**< context */
+        -:  260:                         parser_line_counter_t line, /**< line */
+        -:  261:                         parser_line_counter_t column) /**< column */
+        -:  262:{
+       48:  263:  parser_line_info_data_t *line_info_p = context_p->line_info_p;
+        -:  264:  uint32_t value;
+        -:  265:
+       48:  266:  if (line_info_p != NULL)
+        -:  267:  {
+       21:  268:    if (line_info_p->byte_code_position == context_p->byte_code_size
+       19:  269:        || (line_info_p->line == line && line_info_p->column == column))
+        -:  270:    {
+        2:  271:      return;
+        -:  272:    }
+        -:  273:
+        -:  274:    /* Sets ECMA_LINE_INFO_HAS_LINE bit. */
+       19:  275:    value = (uint32_t) (line != line_info_p->line);
+        -:  276:  }
+        -:  277:  else
+        -:  278:  {
+       27:  279:    line_info_p = (parser_line_info_data_t *) parser_malloc (context_p, PARSER_LINE_INFO_FIRST_PAGE_SIZE);
+       27:  280:    context_p->line_info_p = line_info_p;
+        -:  281:
+       27:  282:    parser_mem_page_t *page_p = PARSER_LINE_INFO_GET_FIRST_PAGE (line_info_p);
+       27:  283:    page_p->next_p = NULL;
+       27:  284:    page_p->bytes[0] = 1;
+        -:  285:
+       27:  286:    line_info_p->last_page_p = page_p;
+       27:  287:    line_info_p->byte_code_position = 0;
+       27:  288:    line_info_p->line = 1;
+       27:  289:    line_info_p->column = 1;
+        -:  290:
+        -:  291:    /* Sets ECMA_LINE_INFO_HAS_LINE bit. */
+       27:  292:    value = (uint32_t) (line != 1);
+        -:  293:  }
+        -:  294:
+       46:  295:  value |= ((context_p->byte_code_size - line_info_p->byte_code_position) << 1);
+        -:  296:
+       46:  297:  parser_line_info_append_number (context_p, value);
+       46:  298:  line_info_p->byte_code_position = context_p->byte_code_size;
+        -:  299:
+       46:  300:  if (value & ECMA_LINE_INFO_HAS_LINE)
+        -:  301:  {
+       92:  302:    value = parser_line_info_difference_get (line, line_info_p->line);
+       46:  303:    parser_line_info_append_number (context_p, value);
+       46:  304:    line_info_p->line = line;
+        -:  305:  }
+        -:  306:
+       92:  307:  value = parser_line_info_difference_get (column, line_info_p->column);
+       46:  308:  parser_line_info_append_number (context_p, value);
+       46:  309:  line_info_p->column = column;
+        -:  310:} /* parser_line_info_append */
+        -:  311:
+        -:  312:/**
+        -:  313: * Line info iterator structure
+        -:  314: */
+        -:  315:typedef struct
+        -:  316:{
+        -:  317:  parser_mem_page_t *current_page_p; /**< current page */
+        -:  318:  uint32_t offset; /**< current offset */
+        -:  319:} parser_line_info_iterator_t;
+        -:  320:
+        -:  321:/**
+        -:  322: * Decodes the next value from the iterator stream
+        -:  323: */
+        -:  324:static uint32_t
+      276:  325:parser_line_info_iterator_get (parser_line_info_iterator_t *iterator_p) /**< iterator */
+        -:  326:{
+      276:  327:  uint8_t *source_p = iterator_p->current_page_p->bytes + iterator_p->offset;
+      276:  328:  uint32_t result = ecma_line_info_decode_vlq (&source_p);
+        -:  329:
+      276:  330:  iterator_p->offset = (uint32_t) (source_p - iterator_p->current_page_p->bytes);
+        -:  331:
+      276:  332:  JERRY_ASSERT (iterator_p->offset <= iterator_p->current_page_p->bytes[0]);
+        -:  333:
+      276:  334:  if (iterator_p->offset < iterator_p->current_page_p->bytes[0])
+        -:  335:  {
+      222:  336:    return result;
+        -:  337:  }
+        -:  338:
+       54:  339:  iterator_p->current_page_p = iterator_p->current_page_p->next_p;
+       54:  340:  iterator_p->offset = 1;
+       54:  341:  return result;
+        -:  342:} /* parser_line_info_iterator_get */
+        -:  343:
+        -:  344:/**
+        -:  345: * Generate line info data
+        -:  346: *
+        -:  347: * @return generated line info data
+        -:  348: */
+        -:  349:uint8_t *
+       27:  350:parser_line_info_generate (parser_context_t *context_p) /**< context */
+        -:  351:{
+       27:  352:  parser_line_info_iterator_t iterator;
+       27:  353:  uint8_t *line_info_p = NULL;
+       27:  354:  uint8_t *dst_p = NULL;
+       27:  355:  uint32_t total_length = 0;
+       27:  356:  uint32_t total_length_size = 0;
+        -:  357:
+        -:  358:  while (true)
+       27:  359:  {
+        -:  360:    /* The following code runs twice: first the size of the data,
+        -:  361:     * is computed and the data is generated during the second run.
+        -:  362:     * Note: line_info_p is NULL during the first run. */
+       54:  363:    parser_mem_page_t *iterator_byte_code_page_p = context_p->byte_code.first_p;
+       54:  364:    uint32_t iterator_byte_code_page_offset = 0;
+       54:  365:    uint32_t iterator_byte_code_base = 0;
+       54:  366:    uint32_t iterator_last_byte_code_offset = UINT32_MAX;
+       54:  367:    uint32_t iterator_prev_line = 0;
+       54:  368:    uint32_t iterator_prev_column = 0;
+       54:  369:    uint32_t iterator_line = 1;
+       54:  370:    uint32_t iterator_column = 1;
+       54:  371:    uint8_t block_buffer[PARSER_LINE_INFO_BUFFER_MAX_SIZE];
+       54:  372:    uint8_t line_column_buffer[PARSER_LINE_INFO_BUFFER_MAX_SIZE * 2];
+       54:  373:    uint8_t *block_size_p = NULL;
+       54:  374:    uint32_t block_byte_code_offset = 0;
+       54:  375:    uint32_t block_prev_line = 1;
+       54:  376:    uint32_t stream_byte_code_offset = 0;
+       54:  377:    uint32_t stream_current_line = 1;
+       54:  378:    uint32_t stream_current_column = ECMA_LINE_INFO_COLUMN_DEFAULT;
+       54:  379:    uint32_t stream_prev_line = 1;
+       54:  380:    uint32_t stream_prev_column = ECMA_LINE_INFO_COLUMN_DEFAULT;
+       54:  381:    uint32_t stream_size = 0;
+       54:  382:    uint32_t stream_value_count = 0;
+        -:  383:    uint32_t value;
+        -:  384:
+       54:  385:    iterator.current_page_p = PARSER_LINE_INFO_GET_FIRST_PAGE (context_p->line_info_p);
+       54:  386:    iterator.offset = 1;
+        -:  387:
+        -:  388:    do
+        -:  389:    {
+        -:  390:      /* Decode line information generated during parsing. */
+       92:  391:      value = parser_line_info_iterator_get (&iterator);
+       92:  392:      iterator_byte_code_page_offset += (value >> 1);
+        -:  393:
+       92:  394:      if (value & 0x1)
+        -:  395:      {
+       92:  396:        value = parser_line_info_iterator_get (&iterator);
+       92:  397:        JERRY_ASSERT (value != ((0 << 1) | ECMA_LINE_INFO_DECREASE));
+       92:  398:        iterator_line = ecma_line_info_difference_update (iterator_line, value);
+        -:  399:      }
+        -:  400:
+       92:  401:      value = parser_line_info_iterator_get (&iterator);
+       92:  402:      iterator_column = ecma_line_info_difference_update (iterator_column, value);
+        -:  403:
+      192:  404:      while (iterator_byte_code_page_offset >= PARSER_CBC_STREAM_PAGE_SIZE)
+        -:  405:      {
+        8:  406:        uint8_t relative_offset = iterator_byte_code_page_p->bytes[PARSER_CBC_STREAM_PAGE_SIZE - 1];
+        8:  407:        iterator_byte_code_base += relative_offset & CBC_LOWER_SEVEN_BIT_MASK;
+        8:  408:        iterator_byte_code_page_offset -= PARSER_CBC_STREAM_PAGE_SIZE;
+        8:  409:        iterator_byte_code_page_p = iterator_byte_code_page_p->next_p;
+        -:  410:      }
+        -:  411:
+       92:  412:      uint32_t iterator_byte_code_offset = iterator_byte_code_base;
+        -:  413:
+       92:  414:      if (iterator_byte_code_page_offset > 0)
+        -:  415:      {
+       42:  416:        uint8_t relative_offset = iterator_byte_code_page_p->bytes[iterator_byte_code_page_offset - 1];
+       42:  417:        iterator_byte_code_offset += relative_offset & CBC_LOWER_SEVEN_BIT_MASK;
+        -:  418:      }
+        -:  419:
+        -:  420:      /* Skip those line/column pairs which byte code was discarded during post processing
+        -:  421:       * or does not change line/column (this is possible when multiple skips occures). */
+       92:  422:      if (iterator_byte_code_offset == iterator_last_byte_code_offset
+       92:  423:          || (iterator_line == iterator_prev_line && iterator_column == iterator_prev_column))
+        -:  424:      {
+    #####:  425:        continue;
+        -:  426:      }
+        -:  427:
+       92:  428:      iterator_prev_line = iterator_line;
+       92:  429:      iterator_prev_column = iterator_column;
+       92:  430:      iterator_last_byte_code_offset = iterator_byte_code_offset;
+        -:  431:
+       92:  432:      if (block_size_p != NULL)
+        -:  433:      {
+        -:  434:        /* Sets ECMA_LINE_INFO_HAS_LINE bit. */
+       76:  435:        value = (((iterator_byte_code_offset - stream_byte_code_offset) << 1)
+       38:  436:                 | (uint32_t) (stream_prev_line != stream_current_line));
+        -:  437:
+       38:  438:        uint32_t line_column_size = 0;
+       38:  439:        uint32_t offset_size = parser_line_info_encode_small (block_buffer, value);
+       38:  440:        stream_byte_code_offset = iterator_byte_code_offset;
+        -:  441:
+       38:  442:        if (value & ECMA_LINE_INFO_HAS_LINE)
+        -:  443:        {
+       32:  444:          value = parser_line_info_difference_get (stream_current_line, stream_prev_line);
+       32:  445:          line_column_size = parser_line_info_encode_small (line_column_buffer, value);
+       32:  446:          stream_prev_line = stream_current_line;
+       32:  447:          stream_prev_column = ECMA_LINE_INFO_COLUMN_DEFAULT;
+        -:  448:        }
+        -:  449:
+       38:  450:        value = parser_line_info_difference_get (stream_current_column, stream_prev_column);
+       38:  451:        line_column_size += parser_line_info_encode_small (line_column_buffer + line_column_size, value);
+        -:  452:
+       38:  453:        stream_prev_column = stream_current_column;
+       38:  454:        stream_current_line = iterator_line;
+       38:  455:        stream_current_column = iterator_column;
+        -:  456:
+       38:  457:        stream_value_count++;
+        -:  458:
+       38:  459:        if (stream_value_count < ECMA_LINE_INFO_STREAM_VALUE_COUNT_MAX
+       38:  460:            && (stream_size + offset_size + line_column_size <= PARSER_LINE_INFO_STREAM_SIZE_LIMIT))
+        -:  461:        {
+       38:  462:          stream_size += offset_size + line_column_size;
+        -:  463:
+       38:  464:          if (line_info_p != NULL)
+        -:  465:          {
+       19:  466:            memcpy (dst_p, block_buffer, offset_size);
+       19:  467:            dst_p += offset_size;
+       19:  468:            memcpy (dst_p, line_column_buffer, line_column_size);
+       19:  469:            dst_p += line_column_size;
+        -:  470:          }
+       38:  471:          continue;
+        -:  472:        }
+        -:  473:
+        -:  474:        /* Finalize the current chunk. The size of EndOffset is always 1. */
+    #####:  475:        stream_size += 1 + line_column_size;
+        -:  476:
+    #####:  477:        JERRY_ASSERT (stream_size > ECMA_LINE_INFO_STREAM_SIZE_MIN
+        -:  478:                      && (stream_size - ECMA_LINE_INFO_STREAM_SIZE_MIN) <= UINT8_MAX);
+        -:  479:
+    #####:  480:        if (line_info_p != NULL)
+        -:  481:        {
+    #####:  482:          *block_size_p = (uint8_t) (stream_size - ECMA_LINE_INFO_STREAM_SIZE_MIN);
+        -:  483:          /* Set EndOffset to 0 and copy the has_line bit. */
+    #####:  484:          *dst_p++ = (uint8_t) (block_buffer[0] & ECMA_LINE_INFO_HAS_LINE);
+    #####:  485:          memcpy (dst_p, line_column_buffer, line_column_size);
+    #####:  486:          dst_p += line_column_size;
+        -:  487:        }
+        -:  488:        else
+        -:  489:        {
+    #####:  490:          total_length += stream_size;
+    #####:  491:          dst_p = block_buffer;
+        -:  492:        }
+        -:  493:
+    #####:  494:        uint32_t byte_code_diff = iterator_last_byte_code_offset - block_byte_code_offset;
+    #####:  495:        dst_p += parser_line_info_encode_vlq (dst_p, byte_code_diff);
+    #####:  496:        block_byte_code_offset = iterator_last_byte_code_offset;
+        -:  497:
+    #####:  498:        if (line_info_p == NULL)
+        -:  499:        {
+    #####:  500:          total_length += (uint32_t) (dst_p - block_buffer);
+        -:  501:        }
+        -:  502:      }
+        -:  503:
+        -:  504:      /* Start a new chunk. */
+       54:  505:      if (line_info_p == NULL)
+        -:  506:      {
+       27:  507:        dst_p = block_buffer;
+        -:  508:      }
+        -:  509:
+       54:  510:      value = parser_line_info_difference_get (iterator_line, block_prev_line);
+        -:  511:
+       54:  512:      dst_p += parser_line_info_encode_vlq (dst_p, value);
+       54:  513:      block_size_p = dst_p;
+       54:  514:      dst_p++;
+        -:  515:
+       54:  516:      if (line_info_p == NULL)
+        -:  517:      {
+       27:  518:        total_length += (uint32_t) (dst_p - block_buffer);
+        -:  519:      }
+        -:  520:
+       54:  521:      block_prev_line = iterator_line;
+       54:  522:      stream_current_line = iterator_line;
+       54:  523:      stream_current_column = iterator_column;
+       54:  524:      stream_prev_line = iterator_line;
+       54:  525:      stream_prev_column = ECMA_LINE_INFO_COLUMN_DEFAULT;
+       54:  526:      stream_size = 0;
+       54:  527:      stream_value_count = 0;
+       92:  528:    } while (iterator.current_page_p != NULL);
+        -:  529:
+       54:  530:    value = (stream_prev_line != stream_current_line);
+        -:  531:
+        -:  532:    /* Finalize the last stream */
+       54:  533:    if (line_info_p == NULL)
+        -:  534:    {
+       27:  535:      dst_p = line_column_buffer;
+       27:  536:      total_length += stream_size + 1;
+        -:  537:    }
+        -:  538:    else
+        -:  539:    {
+       27:  540:      *block_size_p = 0;
+        -:  541:      /* Small encoded value of has_line bit. */
+       27:  542:      *dst_p++ = (uint8_t) value;
+        -:  543:    }
+        -:  544:
+       54:  545:    if (value)
+        -:  546:    {
+        6:  547:      value = parser_line_info_difference_get (stream_current_line, stream_prev_line);
+        6:  548:      dst_p += parser_line_info_encode_small (dst_p, value);
+        6:  549:      stream_prev_column = ECMA_LINE_INFO_COLUMN_DEFAULT;
+        -:  550:    }
+        -:  551:
+       54:  552:    value = parser_line_info_difference_get (stream_current_column, stream_prev_column);
+       54:  553:    dst_p += parser_line_info_encode_small (dst_p, value);
+        -:  554:
+       54:  555:    if (line_info_p == NULL)
+        -:  556:    {
+       27:  557:      total_length += (uint32_t) (dst_p - line_column_buffer);
+        -:  558:    }
+        -:  559:
+       54:  560:    if (line_info_p != NULL)
+        -:  561:    {
+       27:  562:      break;
+        -:  563:    }
+        -:  564:
+       27:  565:    total_length_size = parser_line_info_encode_vlq (block_buffer, total_length);
+        -:  566:
+        -:  567:    /* TODO: Support allocation fail. */
+       27:  568:    line_info_p = (uint8_t *) jmem_heap_alloc_block (total_length + total_length_size);
+       27:  569:    dst_p = line_info_p + parser_line_info_encode_vlq (line_info_p, total_length);
+        -:  570:  }
+        -:  571:
+       27:  572:  JERRY_ASSERT (line_info_p + total_length_size + total_length == dst_p);
+        -:  573:
+        -:  574:#if JERRY_PARSER_DUMP_BYTE_CODE
+        -:  575:  if (context_p->is_show_opcodes)
+        -:  576:  {
+        -:  577:    ecma_line_info_dump (line_info_p);
+        -:  578:  }
+        -:  579:#endif /* JERRY_PARSER_DUMP_BYTE_CODE */
+        -:  580:
+       27:  581:  return line_info_p;
+        -:  582:} /* parser_line_info_generate */
+        -:  583:
+        -:  584:#endif /* JERRY_LINE_INFO */
+        -:  585:
+        -:  586:#endif /* JERRY_PARSER */
+        -:  587:
+        -:  588:/**
+        -:  589: * @}
+        -:  590: * @}
+        -:  591: * @}
+        -:  592: */

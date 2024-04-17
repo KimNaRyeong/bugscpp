@@ -1,0 +1,186 @@
+        -:    0:Source:/home/workspace/jerry-core/parser/regexp/re-compiler.c
+        -:    0:Programs:274
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "ecma-exceptions.h"
+        -:   17:#include "ecma-helpers.h"
+        -:   18:#include "ecma-regexp-object.h"
+        -:   19:#include "ecma-try-catch-macro.h"
+        -:   20:#include "lit-char-helpers.h"
+        -:   21:#include "jcontext.h"
+        -:   22:#include "jrt-libc-includes.h"
+        -:   23:#include "jmem.h"
+        -:   24:#include "re-bytecode.h"
+        -:   25:#include "re-compiler.h"
+        -:   26:#include "re-compiler-context.h"
+        -:   27:#include "re-parser.h"
+        -:   28:
+        -:   29:#if ENABLED (JERRY_BUILTIN_REGEXP)
+        -:   30:
+        -:   31:/** \addtogroup parser Parser
+        -:   32: * @{
+        -:   33: *
+        -:   34: * \addtogroup regexparser Regular expression
+        -:   35: * @{
+        -:   36: *
+        -:   37: * \addtogroup regexparser_compiler Compiler
+        -:   38: * @{
+        -:   39: */
+        -:   40:
+        -:   41:/**
+        -:   42: * Search for the given pattern in the RegExp cache.
+        -:   43: *
+        -:   44: * @return pointer to bytecode if found
+        -:   45: *         NULL - otherwise
+        -:   46: */
+        -:   47:static re_compiled_code_t *
+    #####:   48:re_cache_lookup (ecma_string_t *pattern_str_p, /**< pattern string */
+        -:   49:                 uint16_t flags) /**< flags */
+        -:   50:{
+    #####:   51:  re_compiled_code_t **cache_p = JERRY_CONTEXT (re_cache);
+        -:   52:
+    #####:   53:  for (uint8_t idx = 0u; idx < RE_CACHE_SIZE; idx++)
+        -:   54:  {
+    #####:   55:    re_compiled_code_t *cached_bytecode_p = cache_p[idx];
+        -:   56:
+    #####:   57:    if (cached_bytecode_p == NULL)
+        -:   58:    {
+    #####:   59:      break;
+        -:   60:    }
+        -:   61:
+    #####:   62:    ecma_string_t *cached_pattern_str_p = ecma_get_string_from_value (cached_bytecode_p->source);
+        -:   63:
+    #####:   64:    if ((cached_bytecode_p->header.status_flags & RE_FLAGS_MASK) == flags
+    #####:   65:        && ecma_compare_ecma_strings (cached_pattern_str_p, pattern_str_p))
+        -:   66:    {
+    #####:   67:      return cached_bytecode_p;
+        -:   68:    }
+        -:   69:  }
+        -:   70:
+    #####:   71:  return NULL;
+        -:   72:} /* re_cache_lookup */
+        -:   73:
+        -:   74:/**
+        -:   75: * Run garbage collection in RegExp cache.
+        -:   76: */
+        -:   77:void
+      293:   78:re_cache_gc (void)
+        -:   79:{
+      293:   80:  re_compiled_code_t **cache_p = JERRY_CONTEXT (re_cache);
+        -:   81:
+      293:   82:  for (uint32_t i = 0u; i < RE_CACHE_SIZE; i++)
+        -:   83:  {
+      293:   84:    const re_compiled_code_t *cached_bytecode_p = cache_p[i];
+        -:   85:
+      293:   86:    if (cached_bytecode_p == NULL)
+        -:   87:    {
+      293:   88:      break;
+        -:   89:    }
+        -:   90:
+    #####:   91:    ecma_bytecode_deref ((ecma_compiled_code_t *) cached_bytecode_p);
+    #####:   92:    cache_p[i] = NULL;
+        -:   93:  }
+        -:   94:
+      293:   95:  JERRY_CONTEXT (re_cache_idx) = 0;
+      293:   96:} /* re_cache_gc */
+        -:   97:
+        -:   98:/**
+        -:   99: * Compilation of RegExp bytecode
+        -:  100: *
+        -:  101: * @return pointer to bytecode if compilation was successful
+        -:  102: *         NULL - otherwise
+        -:  103: */
+        -:  104:re_compiled_code_t *
+    #####:  105:re_compile_bytecode (ecma_string_t *pattern_str_p, /**< pattern */
+        -:  106:                     uint16_t flags) /**< flags */
+        -:  107:{
+    #####:  108:  re_compiled_code_t *cached_bytecode_p = re_cache_lookup (pattern_str_p, flags);
+        -:  109:
+    #####:  110:  if (cached_bytecode_p != NULL)
+        -:  111:  {
+    #####:  112:    ecma_bytecode_ref ((ecma_compiled_code_t *) cached_bytecode_p);
+    #####:  113:    return cached_bytecode_p;
+        -:  114:  }
+        -:  115:
+    #####:  116:  re_compiler_ctx_t re_ctx;
+    #####:  117:  re_ctx.flags = flags;
+    #####:  118:  re_ctx.captures_count = 1;
+    #####:  119:  re_ctx.non_captures_count = 0;
+        -:  120:
+    #####:  121:  re_initialize_regexp_bytecode (&re_ctx);
+        -:  122:
+    #####:  123:  ECMA_STRING_TO_UTF8_STRING (pattern_str_p, pattern_start_p, pattern_start_size);
+        -:  124:
+    #####:  125:  re_ctx.input_start_p = pattern_start_p;
+    #####:  126:  re_ctx.input_curr_p = (lit_utf8_byte_t *) pattern_start_p;
+    #####:  127:  re_ctx.input_end_p = pattern_start_p + pattern_start_size;
+    #####:  128:  re_ctx.groups_count = -1;
+        -:  129:
+        -:  130:  /* Parse RegExp pattern */
+    #####:  131:  ecma_value_t result = re_parse_alternative (&re_ctx, true);
+        -:  132:
+    #####:  133:  ECMA_FINALIZE_UTF8_STRING (pattern_start_p, pattern_start_size);
+        -:  134:
+    #####:  135:  if (ECMA_IS_VALUE_ERROR (result))
+        -:  136:  {
+        -:  137:    /* Compilation failed, free bytecode. */
+    #####:  138:    jmem_heap_free_block (re_ctx.bytecode_start_p, re_ctx.bytecode_size);
+    #####:  139:    return NULL;
+        -:  140:  }
+        -:  141:
+        -:  142:  /* Align bytecode size to JMEM_ALIGNMENT so that it can be stored in the bytecode header. */
+    #####:  143:  const uint32_t final_size = JERRY_ALIGNUP (re_ctx.bytecode_size, JMEM_ALIGNMENT);
+    #####:  144:  re_compiled_code_t *re_compiled_code_p = (re_compiled_code_t *) jmem_heap_realloc_block (re_ctx.bytecode_start_p,
+        -:  145:                                                                                           re_ctx.bytecode_size,
+        -:  146:                                                                                           final_size);
+        -:  147:
+        -:  148:  /* Bytecoded will be inserted into the cache and returned to the caller, so refcount is implicitly set to 2. */
+    #####:  149:  re_compiled_code_p->header.refs = 2;
+    #####:  150:  re_compiled_code_p->header.size = (uint16_t) (final_size >> JMEM_ALIGNMENT_LOG);
+    #####:  151:  re_compiled_code_p->header.status_flags = re_ctx.flags;
+        -:  152:
+    #####:  153:  ecma_ref_ecma_string (pattern_str_p);
+    #####:  154:  re_compiled_code_p->source = ecma_make_string_value (pattern_str_p);
+    #####:  155:  re_compiled_code_p->captures_count = re_ctx.captures_count;
+    #####:  156:  re_compiled_code_p->non_captures_count = re_ctx.non_captures_count;
+        -:  157:
+        -:  158:#if ENABLED (JERRY_REGEXP_DUMP_BYTE_CODE)
+        -:  159:  if (JERRY_CONTEXT (jerry_init_flags) & ECMA_INIT_SHOW_REGEXP_OPCODES)
+        -:  160:  {
+        -:  161:    re_dump_bytecode (&re_ctx);
+        -:  162:  }
+        -:  163:#endif /* ENABLED (JERRY_REGEXP_DUMP_BYTE_CODE) */
+        -:  164:
+    #####:  165:  uint8_t cache_idx = JERRY_CONTEXT (re_cache_idx);
+        -:  166:
+    #####:  167:  if (JERRY_CONTEXT (re_cache)[cache_idx] != NULL)
+        -:  168:  {
+    #####:  169:    ecma_bytecode_deref ((ecma_compiled_code_t *) JERRY_CONTEXT (re_cache)[cache_idx]);
+        -:  170:  }
+        -:  171:
+    #####:  172:  JERRY_CONTEXT (re_cache)[cache_idx] = re_compiled_code_p;
+    #####:  173:  JERRY_CONTEXT (re_cache_idx) = (uint8_t) (cache_idx + 1) % RE_CACHE_SIZE;
+        -:  174:
+    #####:  175:  return re_compiled_code_p;
+        -:  176:} /* re_compile_bytecode */
+        -:  177:
+        -:  178:/**
+        -:  179: * @}
+        -:  180: * @}
+        -:  181: * @}
+        -:  182: */
+        -:  183:
+        -:  184:#endif /* ENABLED (JERRY_BUILTIN_REGEXP) */

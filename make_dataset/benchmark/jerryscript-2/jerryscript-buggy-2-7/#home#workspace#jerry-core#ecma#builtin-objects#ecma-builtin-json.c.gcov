@@ -1,0 +1,1841 @@
+        -:    0:Source:/home/workspace/jerry-core/ecma/builtin-objects/ecma-builtin-json.c
+        -:    0:Programs:296
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "ecma-alloc.h"
+        -:   17:#include "ecma-array-object.h"
+        -:   18:#include "ecma-builtins.h"
+        -:   19:#include "ecma-conversion.h"
+        -:   20:#include "ecma-exceptions.h"
+        -:   21:#include "ecma-function-object.h"
+        -:   22:#include "ecma-gc.h"
+        -:   23:#include "ecma-globals.h"
+        -:   24:#include "ecma-helpers.h"
+        -:   25:#include "ecma-builtin-helpers.h"
+        -:   26:#include "ecma-objects.h"
+        -:   27:#include "ecma-objects-general.h"
+        -:   28:#include "jrt.h"
+        -:   29:#include "jrt-libc-includes.h"
+        -:   30:#include "lit-char-helpers.h"
+        -:   31:#include "lit-globals.h"
+        -:   32:
+        -:   33:#if JERRY_BUILTIN_JSON
+        -:   34:
+        -:   35:#define ECMA_BUILTINS_INTERNAL
+        -:   36:#include "ecma-builtins-internal.h"
+        -:   37:
+        -:   38:/**
+        -:   39: * This object has a custom dispatch function.
+        -:   40: */
+        -:   41:#define BUILTIN_CUSTOM_DISPATCH
+        -:   42:
+        -:   43:/**
+        -:   44: * List of built-in routine identifiers.
+        -:   45: */
+        -:   46:enum
+        -:   47:{
+        -:   48:  ECMA_BUILTIN_JSON_ROUTINE_START = 0,
+        -:   49:  ECMA_BUILTIN_JSON_PARSE,
+        -:   50:  ECMA_BUILTIN_JSON_STRINGIFY,
+        -:   51:};
+        -:   52:
+        -:   53:#define BUILTIN_INC_HEADER_NAME "ecma-builtin-json.inc.h"
+        -:   54:#define BUILTIN_UNDERSCORED_ID json
+        -:   55:#include "ecma-builtin-internal-routines-template.inc.h"
+        -:   56:
+        -:   57:/**
+        -:   58: * The number of expected hexidecimal characters in a hex escape sequence
+        -:   59: */
+        -:   60:#define ECMA_JSON_HEX_ESCAPE_SEQUENCE_LENGTH (4)
+        -:   61:
+        -:   62:/** \addtogroup ecma ECMA
+        -:   63: * @{
+        -:   64: *
+        -:   65: * \addtogroup ecmabuiltins
+        -:   66: * @{
+        -:   67: *
+        -:   68: * \addtogroup json ECMA JSON object built-in
+        -:   69: * @{
+        -:   70: */
+        -:   71:
+        -:   72:/**
+        -:   73: * JSON token type
+        -:   74: */
+        -:   75:typedef enum
+        -:   76:{
+        -:   77:  TOKEN_INVALID, /**< error token */
+        -:   78:  TOKEN_END, /**< end of stream reached */
+        -:   79:  TOKEN_NUMBER, /**< JSON number */
+        -:   80:  TOKEN_STRING, /**< JSON string */
+        -:   81:  TOKEN_NULL, /**< JSON null primitive value */
+        -:   82:  TOKEN_TRUE, /**< JSON true primitive value */
+        -:   83:  TOKEN_FALSE, /**< JSON false primitive value */
+        -:   84:  TOKEN_LEFT_BRACE, /**< JSON left brace */
+        -:   85:  TOKEN_RIGHT_BRACE, /**< JSON right brace */
+        -:   86:  TOKEN_LEFT_SQUARE, /**< JSON left square bracket */
+        -:   87:  TOKEN_RIGHT_SQUARE, /**< JSON right square bracket */
+        -:   88:  TOKEN_COMMA, /**< JSON comma */
+        -:   89:  TOKEN_COLON /**< JSON colon */
+        -:   90:} ecma_json_token_type_t;
+        -:   91:
+        -:   92:/**
+        -:   93: * JSON token
+        -:   94: */
+        -:   95:typedef struct
+        -:   96:{
+        -:   97:  ecma_json_token_type_t type; /**< type of the current token */
+        -:   98:  const lit_utf8_byte_t *current_p; /**< current position of the string processed by the parser */
+        -:   99:  const lit_utf8_byte_t *end_p; /**< end of the string processed by the parser */
+        -:  100:
+        -:  101:  /**
+        -:  102:   * Fields depending on type.
+        -:  103:   */
+        -:  104:  union
+        -:  105:  {
+        -:  106:    ecma_string_t *string_p; /**< when type is string_token it contains the string */
+        -:  107:    ecma_number_t number; /**< when type is number_token, it contains the value of the number */
+        -:  108:  } u;
+        -:  109:} ecma_json_token_t;
+        -:  110:
+        -:  111:/**
+        -:  112: * Parse and extract string token.
+        -:  113: */
+        -:  114:static void
+    #####:  115:ecma_builtin_json_parse_string (ecma_json_token_t *token_p) /**< token argument */
+        -:  116:{
+    #####:  117:  const lit_utf8_byte_t *current_p = token_p->current_p;
+    #####:  118:  const lit_utf8_byte_t *end_p = token_p->end_p;
+        -:  119:
+    #####:  120:  ecma_stringbuilder_t result_builder = ecma_stringbuilder_create ();
+    #####:  121:  const lit_utf8_byte_t *unappended_p = current_p;
+        -:  122:
+        -:  123:  while (true)
+        -:  124:  {
+    #####:  125:    if (current_p >= end_p || *current_p <= 0x1f)
+        -:  126:    {
+        -:  127:      goto invalid_string;
+        -:  128:    }
+        -:  129:
+    #####:  130:    if (*current_p == LIT_CHAR_DOUBLE_QUOTE)
+        -:  131:    {
+    #####:  132:      break;
+        -:  133:    }
+        -:  134:
+    #####:  135:    if (*current_p == LIT_CHAR_BACKSLASH)
+        -:  136:    {
+    #####:  137:      ecma_stringbuilder_append_raw (&result_builder,
+        -:  138:                                     unappended_p,
+    #####:  139:                                     (lit_utf8_size_t) (current_p - unappended_p));
+        -:  140:
+    #####:  141:      current_p++;
+        -:  142:
+        -:  143:      /* If there is an escape sequence but there's no escapable character just return */
+    #####:  144:      if (current_p >= end_p)
+        -:  145:      {
+    #####:  146:        goto invalid_string;
+        -:  147:      }
+        -:  148:
+    #####:  149:      const lit_utf8_byte_t c = *current_p;
+    #####:  150:      switch (c)
+        -:  151:      {
+    #####:  152:        case LIT_CHAR_DOUBLE_QUOTE:
+        -:  153:        case LIT_CHAR_SLASH:
+        -:  154:        case LIT_CHAR_BACKSLASH:
+        -:  155:        {
+    #####:  156:          ecma_stringbuilder_append_byte (&result_builder, c);
+    #####:  157:          current_p++;
+    #####:  158:          break;
+        -:  159:        }
+    #####:  160:        case LIT_CHAR_LOWERCASE_B:
+        -:  161:        {
+    #####:  162:          ecma_stringbuilder_append_byte (&result_builder, LIT_CHAR_BS);
+    #####:  163:          current_p++;
+    #####:  164:          break;
+        -:  165:        }
+    #####:  166:        case LIT_CHAR_LOWERCASE_F:
+        -:  167:        {
+    #####:  168:          ecma_stringbuilder_append_byte (&result_builder, LIT_CHAR_FF);
+    #####:  169:          current_p++;
+    #####:  170:          break;
+        -:  171:        }
+    #####:  172:        case LIT_CHAR_LOWERCASE_N:
+        -:  173:        {
+    #####:  174:          ecma_stringbuilder_append_byte (&result_builder, LIT_CHAR_LF);
+    #####:  175:          current_p++;
+    #####:  176:          break;
+        -:  177:        }
+    #####:  178:        case LIT_CHAR_LOWERCASE_R:
+        -:  179:        {
+    #####:  180:          ecma_stringbuilder_append_byte (&result_builder, LIT_CHAR_CR);
+    #####:  181:          current_p++;
+    #####:  182:          break;
+        -:  183:        }
+    #####:  184:        case LIT_CHAR_LOWERCASE_T:
+        -:  185:        {
+    #####:  186:          ecma_stringbuilder_append_byte (&result_builder, LIT_CHAR_TAB);
+    #####:  187:          current_p++;
+    #####:  188:          break;
+        -:  189:        }
+    #####:  190:        case LIT_CHAR_LOWERCASE_U:
+        -:  191:        {
+    #####:  192:          uint32_t hex_value = lit_char_hex_lookup (current_p + 1, end_p, ECMA_JSON_HEX_ESCAPE_SEQUENCE_LENGTH);
+    #####:  193:          if (hex_value == UINT32_MAX)
+        -:  194:          {
+    #####:  195:            goto invalid_string;
+        -:  196:          }
+        -:  197:
+    #####:  198:          ecma_stringbuilder_append_char (&result_builder, (ecma_char_t) hex_value);
+    #####:  199:          current_p += ECMA_JSON_HEX_ESCAPE_SEQUENCE_LENGTH + 1;
+    #####:  200:          break;
+        -:  201:        }
+    #####:  202:        default:
+        -:  203:        {
+    #####:  204:          goto invalid_string;
+        -:  205:        }
+        -:  206:      }
+        -:  207:
+    #####:  208:      unappended_p = current_p;
+    #####:  209:      continue;
+        -:  210:    }
+        -:  211:
+    #####:  212:    current_p++;
+        -:  213:  }
+        -:  214:
+    #####:  215:  ecma_stringbuilder_append_raw (&result_builder,
+        -:  216:                                 unappended_p,
+    #####:  217:                                 (lit_utf8_size_t) (current_p - unappended_p));
+    #####:  218:  token_p->u.string_p = ecma_stringbuilder_finalize (&result_builder);
+    #####:  219:  token_p->current_p = current_p + 1;
+    #####:  220:  token_p->type = TOKEN_STRING;
+    #####:  221:  return;
+        -:  222:
+    #####:  223:invalid_string:
+    #####:  224:  ecma_stringbuilder_destroy (&result_builder);
+        -:  225:} /* ecma_builtin_json_parse_string */
+        -:  226:
+        -:  227:/**
+        -:  228: * Parse and extract string token.
+        -:  229: */
+        -:  230:static void
+    #####:  231:ecma_builtin_json_parse_number (ecma_json_token_t *token_p) /**< token argument */
+        -:  232:{
+    #####:  233:  const lit_utf8_byte_t *current_p = token_p->current_p;
+    #####:  234:  const lit_utf8_byte_t *end_p = token_p->end_p;
+    #####:  235:  const lit_utf8_byte_t *start_p = current_p;
+        -:  236:
+    #####:  237:  JERRY_ASSERT (current_p < end_p);
+        -:  238:
+    #####:  239:  if (*current_p == LIT_CHAR_MINUS)
+        -:  240:  {
+    #####:  241:    current_p++;
+        -:  242:  }
+        -:  243:
+    #####:  244:  if (current_p >= end_p)
+        -:  245:  {
+    #####:  246:    return;
+        -:  247:  }
+        -:  248:
+    #####:  249:  if (*current_p == LIT_CHAR_0)
+        -:  250:  {
+    #####:  251:    current_p++;
+        -:  252:
+    #####:  253:    if (current_p < end_p && lit_char_is_decimal_digit (*current_p))
+        -:  254:    {
+    #####:  255:      return;
+        -:  256:    }
+        -:  257:  }
+    #####:  258:  else if (lit_char_is_decimal_digit (*current_p))
+        -:  259:  {
+        -:  260:    do
+        -:  261:    {
+    #####:  262:      current_p++;
+        -:  263:    }
+    #####:  264:    while (current_p < end_p && lit_char_is_decimal_digit (*current_p));
+        -:  265:  }
+        -:  266:
+    #####:  267:  if (current_p < end_p && *current_p == LIT_CHAR_DOT)
+        -:  268:  {
+    #####:  269:    current_p++;
+        -:  270:
+    #####:  271:    if (current_p >= end_p || !lit_char_is_decimal_digit (*current_p))
+        -:  272:    {
+    #####:  273:      return;
+        -:  274:    }
+        -:  275:
+        -:  276:    do
+        -:  277:    {
+    #####:  278:      current_p++;
+        -:  279:    }
+    #####:  280:    while (current_p < end_p && lit_char_is_decimal_digit (*current_p));
+        -:  281:  }
+        -:  282:
+    #####:  283:  if (current_p < end_p && (*current_p == LIT_CHAR_LOWERCASE_E || *current_p == LIT_CHAR_UPPERCASE_E))
+        -:  284:  {
+    #####:  285:    current_p++;
+        -:  286:
+    #####:  287:    if (current_p < end_p && (*current_p == LIT_CHAR_PLUS || *current_p == LIT_CHAR_MINUS))
+        -:  288:    {
+    #####:  289:      current_p++;
+        -:  290:    }
+        -:  291:
+    #####:  292:    if (current_p >= end_p || !lit_char_is_decimal_digit (*current_p))
+        -:  293:    {
+    #####:  294:      return;
+        -:  295:    }
+        -:  296:
+        -:  297:    do
+        -:  298:    {
+    #####:  299:      current_p++;
+        -:  300:    }
+    #####:  301:    while (current_p < end_p && lit_char_is_decimal_digit (*current_p));
+        -:  302:  }
+        -:  303:
+    #####:  304:  token_p->type = TOKEN_NUMBER;
+    #####:  305:  token_p->u.number = ecma_utf8_string_to_number (start_p, (lit_utf8_size_t) (current_p - start_p), 0);
+        -:  306:
+    #####:  307:  token_p->current_p = current_p;
+        -:  308:} /* ecma_builtin_json_parse_number */
+        -:  309:
+        -:  310:/**
+        -:  311: * Parse next token.
+        -:  312: *
+        -:  313: * The function fills the fields of the ecma_json_token_t
+        -:  314: * argument and advances the string pointer.
+        -:  315: */
+        -:  316:static void
+    #####:  317:ecma_builtin_json_parse_next_token (ecma_json_token_t *token_p, /**< token argument */
+        -:  318:                                    bool parse_string) /**< strings are allowed to parse */
+        -:  319:{
+    #####:  320:  const lit_utf8_byte_t *current_p = token_p->current_p;
+    #####:  321:  const lit_utf8_byte_t *end_p = token_p->end_p;
+    #####:  322:  token_p->type = TOKEN_INVALID;
+        -:  323:
+    #####:  324:  while (current_p < end_p
+    #####:  325:         && (*current_p == LIT_CHAR_SP
+    #####:  326:             || *current_p == LIT_CHAR_CR
+    #####:  327:             || *current_p == LIT_CHAR_LF
+    #####:  328:             || *current_p == LIT_CHAR_TAB))
+        -:  329:  {
+    #####:  330:    current_p++;
+        -:  331:  }
+        -:  332:
+    #####:  333:  if (current_p == end_p)
+        -:  334:  {
+    #####:  335:    token_p->type = TOKEN_END;
+    #####:  336:    return;
+        -:  337:  }
+        -:  338:
+    #####:  339:  switch (*current_p)
+        -:  340:  {
+    #####:  341:    case LIT_CHAR_LEFT_BRACE:
+        -:  342:    {
+    #####:  343:      token_p->type = TOKEN_LEFT_BRACE;
+    #####:  344:      token_p->current_p = current_p + 1;
+    #####:  345:      return;
+        -:  346:    }
+    #####:  347:    case LIT_CHAR_RIGHT_BRACE:
+        -:  348:    {
+    #####:  349:      token_p->type = TOKEN_RIGHT_BRACE;
+    #####:  350:      token_p->current_p = current_p + 1;
+    #####:  351:      return;
+        -:  352:    }
+    #####:  353:    case LIT_CHAR_LEFT_SQUARE:
+        -:  354:    {
+    #####:  355:      token_p->type = TOKEN_LEFT_SQUARE;
+    #####:  356:      token_p->current_p = current_p + 1;
+    #####:  357:      return;
+        -:  358:    }
+    #####:  359:    case LIT_CHAR_RIGHT_SQUARE:
+        -:  360:    {
+    #####:  361:      token_p->type = TOKEN_RIGHT_SQUARE;
+    #####:  362:      token_p->current_p = current_p + 1;
+    #####:  363:      return;
+        -:  364:    }
+    #####:  365:    case LIT_CHAR_COMMA:
+        -:  366:    {
+    #####:  367:      token_p->type = TOKEN_COMMA;
+    #####:  368:      token_p->current_p = current_p + 1;
+    #####:  369:      return;
+        -:  370:    }
+    #####:  371:    case LIT_CHAR_COLON:
+        -:  372:    {
+    #####:  373:      token_p->type = TOKEN_COLON;
+    #####:  374:      token_p->current_p = current_p + 1;
+    #####:  375:      return;
+        -:  376:    }
+    #####:  377:    case LIT_CHAR_DOUBLE_QUOTE:
+        -:  378:    {
+    #####:  379:      if (parse_string)
+        -:  380:      {
+    #####:  381:        token_p->current_p = current_p + 1;
+    #####:  382:        ecma_builtin_json_parse_string (token_p);
+        -:  383:      }
+    #####:  384:      return;
+        -:  385:    }
+    #####:  386:    case LIT_CHAR_LOWERCASE_N:
+        -:  387:    {
+    #####:  388:      lit_utf8_size_t size = lit_get_magic_string_size (LIT_MAGIC_STRING_NULL);
+    #####:  389:      if (current_p + size <= end_p)
+        -:  390:      {
+    #####:  391:        if (!memcmp (lit_get_magic_string_utf8 (LIT_MAGIC_STRING_NULL),
+        -:  392:                     current_p,
+        -:  393:                     size))
+        -:  394:        {
+    #####:  395:          token_p->type = TOKEN_NULL;
+    #####:  396:          token_p->current_p = current_p + size;
+    #####:  397:          return;
+        -:  398:        }
+        -:  399:      }
+    #####:  400:      break;
+        -:  401:    }
+    #####:  402:    case LIT_CHAR_LOWERCASE_T:
+        -:  403:    {
+    #####:  404:      lit_utf8_size_t size = lit_get_magic_string_size (LIT_MAGIC_STRING_TRUE);
+    #####:  405:      if (current_p + size <= end_p)
+        -:  406:      {
+    #####:  407:        if (!memcmp (lit_get_magic_string_utf8 (LIT_MAGIC_STRING_TRUE),
+        -:  408:                     current_p,
+        -:  409:                     size))
+        -:  410:        {
+    #####:  411:          token_p->type = TOKEN_TRUE;
+    #####:  412:          token_p->current_p = current_p + size;
+    #####:  413:          return;
+        -:  414:        }
+        -:  415:      }
+    #####:  416:      break;
+        -:  417:    }
+    #####:  418:    case LIT_CHAR_LOWERCASE_F:
+        -:  419:    {
+    #####:  420:      lit_utf8_size_t size = lit_get_magic_string_size (LIT_MAGIC_STRING_FALSE);
+    #####:  421:      if (current_p + size <= end_p)
+        -:  422:      {
+    #####:  423:        if (!memcmp (lit_get_magic_string_utf8 (LIT_MAGIC_STRING_FALSE),
+        -:  424:                     current_p,
+        -:  425:                     size))
+        -:  426:        {
+    #####:  427:          token_p->type = TOKEN_FALSE;
+    #####:  428:          token_p->current_p = current_p + size;
+    #####:  429:          return;
+        -:  430:        }
+        -:  431:      }
+    #####:  432:      break;
+        -:  433:    }
+    #####:  434:    default:
+        -:  435:    {
+    #####:  436:      if (*current_p == LIT_CHAR_MINUS || lit_char_is_decimal_digit (*current_p))
+        -:  437:      {
+    #####:  438:        token_p->current_p = current_p;
+    #####:  439:        ecma_builtin_json_parse_number (token_p);
+    #####:  440:        return;
+        -:  441:      }
+    #####:  442:      break;
+        -:  443:    }
+        -:  444:  }
+        -:  445:} /* ecma_builtin_json_parse_next_token */
+        -:  446:
+        -:  447:/**
+        -:  448: * Utility for defining properties.
+        -:  449: *
+        -:  450: * It silently ignores all errors.
+        -:  451: */
+        -:  452:static void
+    #####:  453:ecma_builtin_json_define_value_property (ecma_object_t *obj_p, /**< this object */
+        -:  454:                                         ecma_string_t *property_name_p, /**< property name */
+        -:  455:                                         ecma_value_t value) /**< value */
+        -:  456:{
+    #####:  457:  ecma_value_t completion_value = ecma_builtin_helper_def_prop (obj_p,
+        -:  458:                                                                property_name_p,
+        -:  459:                                                                value,
+        -:  460:                                                                ECMA_PROPERTY_CONFIGURABLE_ENUMERABLE_WRITABLE);
+        -:  461:
+    #####:  462:  JERRY_ASSERT (ecma_is_value_boolean (completion_value));
+    #####:  463:} /* ecma_builtin_json_define_value_property */
+        -:  464:
+        -:  465:/**
+        -:  466: * Parse next value.
+        -:  467: *
+        -:  468: * The function fills the fields of the ecma_json_token_t
+        -:  469: * argument and advances the string pointer.
+        -:  470: *
+        -:  471: * @return ecma_value with the property value
+        -:  472: */
+        -:  473:static ecma_value_t
+    #####:  474:ecma_builtin_json_parse_value (ecma_json_token_t *token_p) /**< token argument */
+        -:  475:{
+    #####:  476:  switch (token_p->type)
+        -:  477:  {
+    #####:  478:    case TOKEN_NUMBER:
+        -:  479:    {
+    #####:  480:      return ecma_make_number_value (token_p->u.number);
+        -:  481:    }
+    #####:  482:    case TOKEN_STRING:
+        -:  483:    {
+    #####:  484:      return ecma_make_string_value (token_p->u.string_p);
+        -:  485:    }
+    #####:  486:    case TOKEN_NULL:
+        -:  487:    {
+    #####:  488:      return ECMA_VALUE_NULL;
+        -:  489:    }
+    #####:  490:    case TOKEN_TRUE:
+        -:  491:    {
+    #####:  492:      return ECMA_VALUE_TRUE;
+        -:  493:    }
+    #####:  494:    case TOKEN_FALSE:
+        -:  495:    {
+    #####:  496:      return ECMA_VALUE_FALSE;
+        -:  497:    }
+    #####:  498:    case TOKEN_LEFT_BRACE:
+        -:  499:    {
+    #####:  500:      ecma_object_t *object_p = ecma_op_create_object_object_noarg ();
+        -:  501:
+    #####:  502:      ecma_builtin_json_parse_next_token (token_p, true);
+        -:  503:
+    #####:  504:      if (token_p->type == TOKEN_RIGHT_BRACE)
+        -:  505:      {
+    #####:  506:        return ecma_make_object_value (object_p);
+        -:  507:      }
+        -:  508:
+        -:  509:      while (true)
+    #####:  510:      {
+    #####:  511:        if (token_p->type != TOKEN_STRING)
+        -:  512:        {
+    #####:  513:          break;
+        -:  514:        }
+        -:  515:
+    #####:  516:        ecma_string_t *name_p = token_p->u.string_p;
+        -:  517:
+    #####:  518:        ecma_builtin_json_parse_next_token (token_p, false);
+    #####:  519:        if (token_p->type != TOKEN_COLON)
+        -:  520:        {
+    #####:  521:          ecma_deref_ecma_string (name_p);
+    #####:  522:          break;
+        -:  523:        }
+        -:  524:
+    #####:  525:        ecma_builtin_json_parse_next_token (token_p, true);
+    #####:  526:        ecma_value_t value = ecma_builtin_json_parse_value (token_p);
+        -:  527:
+    #####:  528:        if (ecma_is_value_empty (value))
+        -:  529:        {
+    #####:  530:          ecma_deref_ecma_string (name_p);
+    #####:  531:          break;
+        -:  532:        }
+        -:  533:
+    #####:  534:        ecma_builtin_json_define_value_property (object_p, name_p, value);
+    #####:  535:        ecma_deref_ecma_string (name_p);
+    #####:  536:        ecma_free_value (value);
+        -:  537:
+    #####:  538:        ecma_builtin_json_parse_next_token (token_p, false);
+    #####:  539:        if (token_p->type == TOKEN_RIGHT_BRACE)
+        -:  540:        {
+    #####:  541:          return ecma_make_object_value (object_p);
+        -:  542:        }
+        -:  543:
+    #####:  544:        if (token_p->type != TOKEN_COMMA)
+        -:  545:        {
+    #####:  546:          break;
+        -:  547:        }
+        -:  548:
+    #####:  549:        ecma_builtin_json_parse_next_token (token_p, true);
+        -:  550:      }
+        -:  551:
+        -:  552:      /*
+        -:  553:       * Parse error occured.
+        -:  554:       */
+    #####:  555:      ecma_deref_object (object_p);
+    #####:  556:      return ECMA_VALUE_EMPTY;
+        -:  557:    }
+    #####:  558:    case TOKEN_LEFT_SQUARE:
+        -:  559:    {
+    #####:  560:      uint32_t length = 0;
+    #####:  561:      ecma_object_t *array_p = ecma_op_new_array_object (0);
+        -:  562:
+    #####:  563:      ecma_builtin_json_parse_next_token (token_p, true);
+        -:  564:
+    #####:  565:      if (token_p->type == TOKEN_RIGHT_SQUARE)
+        -:  566:      {
+    #####:  567:        return ecma_make_object_value (array_p);
+        -:  568:      }
+        -:  569:
+        -:  570:      while (true)
+    #####:  571:      {
+    #####:  572:        ecma_value_t value = ecma_builtin_json_parse_value (token_p);
+        -:  573:
+    #####:  574:        if (ecma_is_value_empty (value))
+        -:  575:        {
+    #####:  576:          JERRY_ASSERT (token_p->type != TOKEN_STRING);
+    #####:  577:          break;
+        -:  578:        }
+        -:  579:
+        -:  580:        ecma_value_t completion;
+    #####:  581:        completion = ecma_builtin_helper_def_prop_by_index (array_p,
+        -:  582:                                                            length,
+        -:  583:                                                            value,
+        -:  584:                                                            ECMA_PROPERTY_CONFIGURABLE_ENUMERABLE_WRITABLE);
+    #####:  585:        JERRY_ASSERT (ecma_is_value_true (completion));
+    #####:  586:        ecma_free_value (value);
+        -:  587:
+    #####:  588:        ecma_builtin_json_parse_next_token (token_p, false);
+        -:  589:
+    #####:  590:        if (token_p->type == TOKEN_RIGHT_SQUARE)
+        -:  591:        {
+    #####:  592:          return ecma_make_object_value (array_p);
+        -:  593:        }
+        -:  594:
+    #####:  595:        if (token_p->type != TOKEN_COMMA)
+        -:  596:        {
+    #####:  597:          JERRY_ASSERT (token_p->type != TOKEN_STRING);
+    #####:  598:          break;
+        -:  599:        }
+        -:  600:
+    #####:  601:        ecma_builtin_json_parse_next_token (token_p, true);
+    #####:  602:        length++;
+        -:  603:      }
+        -:  604:
+    #####:  605:      ecma_deref_object (array_p);
+    #####:  606:      return ECMA_VALUE_EMPTY;
+        -:  607:    }
+    #####:  608:    default:
+        -:  609:    {
+    #####:  610:      return ECMA_VALUE_EMPTY;
+        -:  611:    }
+        -:  612:  }
+        -:  613:} /* ecma_builtin_json_parse_value */
+        -:  614:
+        -:  615:static ecma_value_t
+        -:  616:ecma_builtin_json_internalize_process_property (ecma_object_t *reviver_p,
+        -:  617:                                                ecma_object_t *object_p,
+        -:  618:                                                ecma_string_t *prop_name);
+        -:  619:
+        -:  620:/**
+        -:  621: * Abstract operation InternalizeJSONProperty
+        -:  622: *
+        -:  623: * See also:
+        -:  624: *         ECMA-262 v5, 24.3.1.1
+        -:  625: *         ECMA-262 v11, 24.5.1.1
+        -:  626: *
+        -:  627: * @return ecma value
+        -:  628: *         Returned value must be freed with ecma_free_value.
+        -:  629: */
+        -:  630:static ecma_value_t
+    #####:  631:ecma_builtin_json_internalize_property (ecma_object_t *reviver_p, /**< reviver function */
+        -:  632:                                        ecma_object_t *holder_p, /**< holder object */
+        -:  633:                                        ecma_string_t *name_p) /**< property name */
+        -:  634:{
+    #####:  635:  JERRY_ASSERT (reviver_p);
+    #####:  636:  JERRY_ASSERT (holder_p);
+    #####:  637:  JERRY_ASSERT (name_p);
+        -:  638:
+        -:  639:  /* 1. */
+    #####:  640:  ecma_value_t value = ecma_op_object_get (holder_p, name_p);
+        -:  641:
+        -:  642:  /* 2. */
+    #####:  643:  if (ECMA_IS_VALUE_ERROR (value))
+        -:  644:  {
+    #####:  645:    return value;
+        -:  646:  }
+        -:  647:
+        -:  648:  /* 3. */
+    #####:  649:  if (ecma_is_value_object (value))
+        -:  650:  {
+        -:  651:    /* 3.a */
+    #####:  652:    ecma_value_t is_array = ecma_is_value_array (value);
+        -:  653:
+        -:  654:#if JERRY_ESNEXT
+    #####:  655:    if (ECMA_IS_VALUE_ERROR (is_array))
+        -:  656:    {
+    #####:  657:      ecma_free_value (value);
+    #####:  658:      return is_array;
+        -:  659:    }
+        -:  660:#endif /* JERRY_ESNEXT */
+        -:  661:
+    #####:  662:    ecma_object_t *object_p = ecma_get_object_from_value (value);
+        -:  663:
+        -:  664:    /* 3.c */
+    #####:  665:    if (ecma_is_value_true (is_array))
+        -:  666:    {
+        -:  667:      /* 3.c.ii */
+    #####:  668:      ecma_length_t length;
+    #####:  669:      ecma_value_t to_len = ecma_op_object_get_length (object_p, &length);
+        -:  670:
+        -:  671:      /* 3.c.iii */
+        -:  672:#if JERRY_BUILTIN_PROXY
+    #####:  673:      if (ECMA_IS_VALUE_ERROR (to_len))
+        -:  674:      {
+    #####:  675:        ecma_deref_object (object_p);
+    #####:  676:        return to_len;
+        -:  677:      }
+        -:  678:#endif /* JERRY_BUILTIN_PROXY */
+    #####:  679:      JERRY_ASSERT (ecma_is_value_empty (to_len));
+        -:  680:
+        -:  681:      /* 3.c.iv */
+    #####:  682:      for (ecma_length_t i = 0; i < length; i++)
+        -:  683:      {
+    #####:  684:        ecma_string_t *prop_index = ecma_new_ecma_string_from_length (i);
+    #####:  685:        ecma_value_t result = ecma_builtin_json_internalize_process_property (reviver_p, object_p, prop_index);
+        -:  686:
+    #####:  687:        ecma_deref_ecma_string (prop_index);
+        -:  688:
+    #####:  689:        if (ECMA_IS_VALUE_ERROR (result))
+        -:  690:        {
+    #####:  691:          ecma_deref_object (object_p);
+    #####:  692:          return result;
+        -:  693:        }
+        -:  694:
+    #####:  695:        JERRY_ASSERT (result == ECMA_VALUE_TRUE);
+        -:  696:      }
+        -:  697:    }
+        -:  698:    /* 3.d */
+        -:  699:    else
+        -:  700:    {
+    #####:  701:      ecma_collection_t *props_p = ecma_op_object_get_enumerable_property_names (object_p,
+        -:  702:                                                                                 ECMA_ENUMERABLE_PROPERTY_KEYS);
+        -:  703:#if JERRY_ESNEXT
+    #####:  704:      if (JERRY_UNLIKELY (props_p == NULL))
+        -:  705:      {
+    #####:  706:        ecma_deref_object (object_p);
+    #####:  707:        return ECMA_VALUE_ERROR;
+        -:  708:      }
+        -:  709:#else /* !JERRY_ESNEXT */
+        -:  710:      JERRY_ASSERT (props_p != NULL);
+        -:  711:#endif /* JERRY_ESNEXT */
+        -:  712:
+    #####:  713:      ecma_value_t *buffer_p = props_p->buffer_p;
+        -:  714:
+        -:  715:      /* 3.d.iii */
+    #####:  716:      for (uint32_t i = 0; i < props_p->item_count; i++)
+        -:  717:      {
+    #####:  718:        ecma_string_t *property_name_p = ecma_get_string_from_value (buffer_p[i]);
+    #####:  719:        ecma_value_t result = ecma_builtin_json_internalize_process_property (reviver_p, object_p, property_name_p);
+        -:  720:
+    #####:  721:        if (ECMA_IS_VALUE_ERROR (result))
+        -:  722:        {
+    #####:  723:          ecma_collection_free (props_p);
+    #####:  724:          ecma_deref_object (object_p);
+    #####:  725:          return result;
+        -:  726:        }
+        -:  727:
+    #####:  728:        JERRY_ASSERT (result == ECMA_VALUE_TRUE);
+        -:  729:      }
+        -:  730:
+    #####:  731:      ecma_collection_free (props_p);
+        -:  732:    }
+        -:  733:  }
+        -:  734:
+    #####:  735:  ecma_value_t arguments_list[2];
+    #####:  736:  arguments_list[0] = ecma_make_string_value (name_p);
+    #####:  737:  arguments_list[1] = value;
+        -:  738:
+        -:  739:  /* 4. */
+    #####:  740:  ecma_value_t ret_value = ecma_op_function_call (reviver_p,
+        -:  741:                                                  ecma_make_object_value (holder_p),
+        -:  742:                                                  arguments_list,
+        -:  743:                                                  2);
+    #####:  744:  ecma_free_value (value);
+    #####:  745:  return ret_value;
+        -:  746:} /* ecma_builtin_json_internalize_property */
+        -:  747:
+        -:  748:/**
+        -:  749: * Part of the InternalizeJSONProperty abstract method.
+        -:  750: *
+        -:  751: * See also:
+        -:  752: *         ECMA-262 v5, 15.12.2
+        -:  753: *         ECMA-262 v11, 24.5.1.1 in step 2
+        -:  754: *
+        -:  755: * @return ECMA_VALUE_TRUE - if no error occured.
+        -:  756: *         error if one of the operation failed.
+        -:  757: */
+        -:  758:static
+    #####:  759:ecma_value_t ecma_builtin_json_internalize_process_property (ecma_object_t *reviver_p, /**< reviver function */
+        -:  760:                                                             ecma_object_t *object_p, /**< holder object */
+        -:  761:                                                             ecma_string_t *prop_name) /**< property name */
+        -:  762:{
+        -:  763:  /* ES11: 2.b.iii.1 / 2.c.ii.1 */
+    #####:  764:  ecma_value_t new_element = ecma_builtin_json_internalize_property (reviver_p, object_p, prop_name);
+        -:  765:
+    #####:  766:  if (ECMA_IS_VALUE_ERROR (new_element))
+        -:  767:  {
+    #####:  768:    return new_element;
+        -:  769:  }
+        -:  770:
+        -:  771:  /* ES11: 2.b.iii.2 / 2.c.ii.2 */
+    #####:  772:  if (ecma_is_value_undefined (new_element))
+        -:  773:  {
+        -:  774:    /* ES11: 2.b.iii.2.a / 2.c.ii.2.a */
+    #####:  775:    ecma_value_t delete_val = ecma_op_object_delete (object_p, prop_name, false);
+        -:  776:
+        -:  777:#if JERRY_ESNEXT
+    #####:  778:    if (ECMA_IS_VALUE_ERROR (delete_val))
+        -:  779:    {
+    #####:  780:      return delete_val;
+        -:  781:    }
+        -:  782:#endif /* JERRY_ESNEXT */
+        -:  783:
+    #####:  784:    JERRY_ASSERT (ecma_is_value_boolean (delete_val));
+        -:  785:  }
+        -:  786:  else
+        -:  787:  {
+        -:  788:    /* ES11: 2.b.iii.3.a / 2.c.ii.3.a */
+    #####:  789:    ecma_value_t def_value = ecma_builtin_helper_def_prop (object_p,
+        -:  790:                                                           prop_name,
+        -:  791:                                                           new_element,
+        -:  792:                                                           ECMA_PROPERTY_CONFIGURABLE_ENUMERABLE_WRITABLE);
+    #####:  793:    ecma_free_value (new_element);
+        -:  794:
+        -:  795:#if JERRY_ESNEXT
+    #####:  796:    if (ECMA_IS_VALUE_ERROR (def_value))
+        -:  797:    {
+    #####:  798:      return def_value;
+        -:  799:    }
+        -:  800:#endif /* JERRY_ESNEXT */
+        -:  801:
+    #####:  802:    JERRY_ASSERT (ecma_is_value_boolean (def_value));
+        -:  803:  }
+        -:  804:
+    #####:  805:  return ECMA_VALUE_TRUE;
+        -:  806:} /* ecma_builtin_json_internalize_process_property */
+        -:  807:
+        -:  808:/**
+        -:  809: * Function to set a string token from the given arguments, fills its fields and advances the string pointer.
+        -:  810: *
+        -:  811: * @return ecma_value_t containing an object or an error massage
+        -:  812: *         Returned value must be freed with ecma_free_value.
+        -:  813: */
+        -:  814:ecma_value_t
+    #####:  815:ecma_builtin_json_parse_buffer (const lit_utf8_byte_t * str_start_p, /**< String to parse */
+        -:  816:                                lit_utf8_size_t string_size) /**< size of the string */
+        -:  817:{
+    #####:  818:  ecma_json_token_t token;
+    #####:  819:  token.current_p = str_start_p;
+    #####:  820:  token.end_p = str_start_p + string_size;
+        -:  821:
+    #####:  822:  ecma_builtin_json_parse_next_token (&token, true);
+    #####:  823:  ecma_value_t result = ecma_builtin_json_parse_value (&token);
+        -:  824:
+    #####:  825:  if (!ecma_is_value_empty (result))
+        -:  826:  {
+    #####:  827:    ecma_builtin_json_parse_next_token (&token, false);
+    #####:  828:    if (token.type == TOKEN_END)
+        -:  829:    {
+    #####:  830:      return result;
+        -:  831:    }
+        -:  832:
+    #####:  833:    ecma_free_value (result);
+        -:  834:  }
+        -:  835:
+    #####:  836:  return ecma_raise_syntax_error (ECMA_ERR_MSG ("Invalid JSON format"));
+        -:  837:} /*ecma_builtin_json_parse_buffer*/
+        -:  838:
+        -:  839:/**
+        -:  840: * The JSON object's 'parse' routine
+        -:  841: *
+        -:  842: * See also:
+        -:  843: *          ECMA-262 v5, 15.12.2
+        -:  844: *
+        -:  845: * @return ecma value
+        -:  846: *         Returned value must be freed with ecma_free_value.
+        -:  847: */
+        -:  848:static ecma_value_t
+    #####:  849:ecma_builtin_json_parse (ecma_value_t arg1, /**< string argument */
+        -:  850:                         ecma_value_t arg2) /**< reviver argument */
+        -:  851:{
+    #####:  852:  ecma_string_t *text_string_p = ecma_op_to_string (arg1);
+        -:  853:
+    #####:  854:  if (JERRY_UNLIKELY (text_string_p == NULL))
+        -:  855:  {
+    #####:  856:    return ECMA_VALUE_ERROR;
+        -:  857:  }
+        -:  858:
+    #####:  859:  ECMA_STRING_TO_UTF8_STRING (text_string_p, str_start_p, string_size);
+    #####:  860:  ecma_value_t result = ecma_builtin_json_parse_buffer (str_start_p, string_size);
+    #####:  861:  ECMA_FINALIZE_UTF8_STRING (str_start_p, string_size);
+    #####:  862:  ecma_deref_ecma_string (text_string_p);
+        -:  863:
+    #####:  864:  if (!ECMA_IS_VALUE_ERROR (result) && ecma_op_is_callable (arg2))
+        -:  865:  {
+    #####:  866:    ecma_object_t *object_p = ecma_op_create_object_object_noarg ();
+        -:  867:
+        -:  868:    ecma_property_value_t *prop_value_p;
+    #####:  869:    prop_value_p = ecma_create_named_data_property (object_p,
+        -:  870:                                                    ecma_get_magic_string (LIT_MAGIC_STRING__EMPTY),
+        -:  871:                                                    ECMA_PROPERTY_CONFIGURABLE_ENUMERABLE_WRITABLE,
+        -:  872:                                                    NULL);
+        -:  873:
+    #####:  874:    ecma_named_data_property_assign_value (object_p, prop_value_p, result);
+        -:  875:
+    #####:  876:    ecma_free_value (result);
+    #####:  877:    result = ecma_builtin_json_internalize_property (ecma_get_object_from_value (arg2),
+        -:  878:                                                     object_p,
+        -:  879:                                                     ecma_get_magic_string (LIT_MAGIC_STRING__EMPTY));
+    #####:  880:    ecma_deref_object (object_p);
+        -:  881:  }
+        -:  882:
+    #####:  883:  return result;
+        -:  884:} /* ecma_builtin_json_parse */
+        -:  885:
+        -:  886:/**
+        -:  887: * Abstract operation 'QuoteJSONString' defined in 24.3.2.2
+        -:  888: */
+        -:  889:static void
+    #####:  890:ecma_builtin_json_quote (ecma_stringbuilder_t *builder_p, /**< builder for the result */
+        -:  891:                         ecma_string_t *string_p) /**< string that should be quoted */
+        -:  892:{
+    #####:  893:  ECMA_STRING_TO_UTF8_STRING (string_p, string_buff, string_buff_size);
+    #####:  894:  const lit_utf8_byte_t *str_p = string_buff;
+    #####:  895:  const lit_utf8_byte_t *regular_str_start_p = string_buff;
+    #####:  896:  const lit_utf8_byte_t *str_end_p = str_p + string_buff_size;
+        -:  897:
+    #####:  898:  ecma_stringbuilder_append_byte (builder_p, LIT_CHAR_DOUBLE_QUOTE);
+        -:  899:
+    #####:  900:  while (str_p < str_end_p)
+        -:  901:  {
+    #####:  902:    ecma_char_t c = lit_cesu8_read_next (&str_p);
+        -:  903:
+    #####:  904:    bool should_escape = false;
+        -:  905:
+        -:  906:#if JERRY_ESNEXT
+    #####:  907:    if (lit_is_code_point_utf16_high_surrogate (c))
+        -:  908:    {
+    #####:  909:      if (str_p < str_end_p)
+        -:  910:      {
+    #####:  911:        const ecma_char_t next_ch = lit_cesu8_peek_next (str_p);
+    #####:  912:        if (lit_is_code_point_utf16_low_surrogate (next_ch))
+        -:  913:        {
+    #####:  914:          str_p += LIT_UTF8_MAX_BYTES_IN_CODE_UNIT;
+    #####:  915:          continue;
+        -:  916:        }
+    #####:  917:        should_escape = true;
+        -:  918:      }
+        -:  919:      else
+        -:  920:      {
+    #####:  921:        should_escape = true;
+        -:  922:      }
+        -:  923:    }
+    #####:  924:    else if (lit_is_code_point_utf16_low_surrogate (c))
+        -:  925:    {
+    #####:  926:      should_escape = true;
+        -:  927:    }
+        -:  928:#endif /* JERRY_ESNEXT */
+        -:  929:
+    #####:  930:    if (c == LIT_CHAR_BACKSLASH || c == LIT_CHAR_DOUBLE_QUOTE)
+        -:  931:    {
+    #####:  932:      ecma_stringbuilder_append_raw (builder_p,
+        -:  933:                                     regular_str_start_p,
+    #####:  934:                                     (lit_utf8_size_t) (str_p - regular_str_start_p - 1));
+    #####:  935:      regular_str_start_p = str_p;
+    #####:  936:      ecma_stringbuilder_append_byte (builder_p, LIT_CHAR_BACKSLASH);
+    #####:  937:      ecma_stringbuilder_append_byte (builder_p, (lit_utf8_byte_t) c);
+        -:  938:    }
+    #####:  939:    else if (c < LIT_CHAR_SP || should_escape)
+        -:  940:    {
+        -:  941:      /**
+        -:  942:        * In ES10 we should escape high or low surrogate characters,
+        -:  943:        * so we shouldn't append the unescaped character to the stringbuilder
+        -:  944:        */
+    #####:  945:      uint8_t offset = should_escape ? LIT_UTF8_MAX_BYTES_IN_CODE_UNIT : 1;
+        -:  946:
+    #####:  947:      ecma_stringbuilder_append_raw (builder_p,
+        -:  948:                                     regular_str_start_p,
+    #####:  949:                                     (lit_utf8_size_t) (str_p - regular_str_start_p - offset));
+        -:  950:
+    #####:  951:      regular_str_start_p = str_p;
+        -:  952:
+    #####:  953:      switch (c)
+        -:  954:      {
+    #####:  955:        case LIT_CHAR_BS:
+        -:  956:        {
+    #####:  957:          ecma_stringbuilder_append_raw (builder_p, (lit_utf8_byte_t *) "\\b", 2);
+    #####:  958:          break;
+        -:  959:        }
+    #####:  960:        case LIT_CHAR_FF:
+        -:  961:        {
+    #####:  962:          ecma_stringbuilder_append_raw (builder_p, (lit_utf8_byte_t *) "\\f", 2);
+    #####:  963:          break;
+        -:  964:        }
+    #####:  965:        case LIT_CHAR_LF:
+        -:  966:        {
+    #####:  967:          ecma_stringbuilder_append_raw (builder_p, (lit_utf8_byte_t *) "\\n", 2);
+    #####:  968:          break;
+        -:  969:        }
+    #####:  970:        case LIT_CHAR_CR:
+        -:  971:        {
+    #####:  972:          ecma_stringbuilder_append_raw (builder_p, (lit_utf8_byte_t *) "\\r", 2);
+    #####:  973:          break;
+        -:  974:        }
+    #####:  975:        case LIT_CHAR_TAB:
+        -:  976:        {
+    #####:  977:          ecma_stringbuilder_append_raw (builder_p, (lit_utf8_byte_t *) "\\t", 2);
+    #####:  978:          break;
+        -:  979:        }
+    #####:  980:        default: /* Hexadecimal. */
+        -:  981:        {
+    #####:  982:          lit_char_unicode_escape (builder_p, c);
+    #####:  983:          break;
+        -:  984:        }
+        -:  985:      }
+    #####:  986:    }
+        -:  987:  }
+        -:  988:
+    #####:  989:  ecma_stringbuilder_append_raw (builder_p,
+        -:  990:                                 regular_str_start_p,
+    #####:  991:                                 (lit_utf8_size_t) (str_end_p - regular_str_start_p));
+    #####:  992:  ecma_stringbuilder_append_byte (builder_p, LIT_CHAR_DOUBLE_QUOTE);
+        -:  993:
+    #####:  994:  ECMA_FINALIZE_UTF8_STRING (string_buff, string_buff_size);
+    #####:  995:} /* ecma_builtin_json_quote */
+        -:  996:
+        -:  997:static ecma_value_t
+        -:  998:ecma_builtin_json_serialize_property (ecma_json_stringify_context_t *context_p,
+        -:  999:                                      ecma_object_t *holder_p,
+        -: 1000:                                      ecma_string_t *key_p);
+        -: 1001:
+        -: 1002:/**
+        -: 1003: * Abstract operation 'SerializeJSONObject' defined in 24.3.2.3
+        -: 1004: *
+        -: 1005: * @return ecma value
+        -: 1006: *         Returned value must be freed with ecma_free_value.
+        -: 1007: */
+        -: 1008:static ecma_value_t
+    #####: 1009:ecma_builtin_json_serialize_object (ecma_json_stringify_context_t *context_p, /**< context*/
+        -: 1010:                                    ecma_object_t *obj_p) /**< the object*/
+        -: 1011:{
+        -: 1012:  /* 1. */
+    #####: 1013:  if (ecma_json_has_object_in_stack (context_p->occurence_stack_last_p, obj_p))
+        -: 1014:  {
+    #####: 1015:    return ecma_raise_type_error (ECMA_ERR_MSG ("The structure is cyclical"));
+        -: 1016:  }
+        -: 1017:
+        -: 1018:  /* 2. */
+    #####: 1019:  ecma_json_occurence_stack_item_t stack_item;
+    #####: 1020:  stack_item.next_p = context_p->occurence_stack_last_p;
+    #####: 1021:  stack_item.object_p = obj_p;
+    #####: 1022:  context_p->occurence_stack_last_p = &stack_item;
+        -: 1023:
+        -: 1024:  /* 3. - 4.*/
+    #####: 1025:  const lit_utf8_size_t stepback_size = ecma_stringbuilder_get_size (&context_p->indent_builder);
+    #####: 1026:  ecma_stringbuilder_append (&context_p->indent_builder, context_p->gap_str_p);
+        -: 1027:
+    #####: 1028:  const bool has_gap = !ecma_compare_ecma_string_to_magic_id (context_p->gap_str_p, LIT_MAGIC_STRING__EMPTY);
+    #####: 1029:  const lit_utf8_size_t separator_size = ecma_stringbuilder_get_size (&context_p->indent_builder);
+        -: 1030:
+        -: 1031:  ecma_collection_t *property_keys_p;
+        -: 1032:  /* 5. */
+    #####: 1033:  if (context_p->property_list_p != NULL)
+        -: 1034:  {
+    #####: 1035:    property_keys_p = context_p->property_list_p;
+        -: 1036:  }
+        -: 1037:  /* 6. */
+        -: 1038:  else
+        -: 1039:  {
+    #####: 1040:    property_keys_p = ecma_op_object_get_enumerable_property_names (obj_p, ECMA_ENUMERABLE_PROPERTY_KEYS);
+        -: 1041:
+        -: 1042:#if JERRY_BUILTIN_PROXY
+    #####: 1043:    if (property_keys_p == NULL)
+        -: 1044:    {
+    #####: 1045:      return ECMA_VALUE_ERROR;
+        -: 1046:    }
+        -: 1047:#endif /* JERRY_BUILTIN_PROXY */
+        -: 1048:  }
+        -: 1049:
+        -: 1050:  /* 8. */
+    #####: 1051:  ecma_value_t *buffer_p = property_keys_p->buffer_p;
+        -: 1052:
+    #####: 1053:  ecma_stringbuilder_append_byte (&context_p->result_builder, LIT_CHAR_LEFT_BRACE);
+    #####: 1054:  const lit_utf8_size_t left_brace = ecma_stringbuilder_get_size (&context_p->result_builder);
+    #####: 1055:  lit_utf8_size_t last_prop = left_brace;
+    #####: 1056:  ecma_value_t result = ECMA_VALUE_EMPTY;
+        -: 1057:
+    #####: 1058:  for (uint32_t i = 0; i < property_keys_p->item_count; i++)
+        -: 1059:  {
+    #####: 1060:    if (has_gap)
+        -: 1061:    {
+    #####: 1062:      ecma_stringbuilder_append_raw (&context_p->result_builder,
+    #####: 1063:                                     ecma_stringbuilder_get_data (&context_p->indent_builder),
+        -: 1064:                                     separator_size);
+        -: 1065:    }
+        -: 1066:
+    #####: 1067:    ecma_string_t *key_p = ecma_get_string_from_value (buffer_p[i]);
+    #####: 1068:    ecma_builtin_json_quote (&context_p->result_builder, key_p);
+    #####: 1069:    ecma_stringbuilder_append_byte (&context_p->result_builder, LIT_CHAR_COLON);
+        -: 1070:
+        -: 1071:    /* 8.c.iii */
+    #####: 1072:    if (has_gap)
+        -: 1073:    {
+    #####: 1074:      ecma_stringbuilder_append_byte (&context_p->result_builder, LIT_CHAR_SP);
+        -: 1075:    }
+        -: 1076:
+    #####: 1077:    result = ecma_builtin_json_serialize_property (context_p, obj_p, key_p);
+        -: 1078:
+    #####: 1079:    if (ECMA_IS_VALUE_ERROR (result))
+        -: 1080:    {
+    #####: 1081:      goto cleanup;
+        -: 1082:    }
+        -: 1083:
+        -: 1084:    /* 8.b */
+    #####: 1085:    if (!ecma_is_value_undefined (result))
+        -: 1086:    {
+        -: 1087:      /* ecma_builtin_json_serialize_property already appended the result. */
+    #####: 1088:      JERRY_ASSERT (ecma_is_value_empty (result));
+        -: 1089:
+    #####: 1090:      ecma_stringbuilder_append_byte (&context_p->result_builder, LIT_CHAR_COMMA);
+    #####: 1091:      last_prop = ecma_stringbuilder_get_size (&context_p->result_builder);
+        -: 1092:    }
+        -: 1093:    else
+        -: 1094:    {
+        -: 1095:      /* The property should not be appended, we must backtrack. */
+    #####: 1096:      ecma_stringbuilder_revert (&context_p->result_builder, last_prop);
+        -: 1097:    }
+        -: 1098:  }
+        -: 1099:
+    #####: 1100:  if (last_prop != left_brace)
+        -: 1101:  {
+        -: 1102:    /* Remove the last comma. */
+    #####: 1103:    ecma_stringbuilder_revert (&context_p->result_builder, last_prop - 1);
+        -: 1104:
+    #####: 1105:    if (has_gap)
+        -: 1106:    {
+        -: 1107:      /* We appended at least one element, and have a separator, so must append the stepback. */
+    #####: 1108:      ecma_stringbuilder_append_raw (&context_p->result_builder,
+    #####: 1109:                                     ecma_stringbuilder_get_data (&context_p->indent_builder),
+        -: 1110:                                     stepback_size);
+        -: 1111:    }
+        -: 1112:  }
+        -: 1113:
+    #####: 1114:  ecma_stringbuilder_append_byte (&context_p->result_builder, LIT_CHAR_RIGHT_BRACE);
+    #####: 1115:  result = ECMA_VALUE_EMPTY;
+        -: 1116:
+        -: 1117:  /* 11. */
+    #####: 1118:  context_p->occurence_stack_last_p = stack_item.next_p;
+        -: 1119:
+        -: 1120:  /* 12. */
+    #####: 1121:  ecma_stringbuilder_revert (&context_p->indent_builder, stepback_size);
+        -: 1122:
+    #####: 1123:cleanup:
+    #####: 1124:  if (context_p->property_list_p == NULL)
+        -: 1125:  {
+    #####: 1126:    ecma_collection_free (property_keys_p);
+        -: 1127:  }
+        -: 1128:
+    #####: 1129:  return result;
+        -: 1130:} /* ecma_builtin_json_serialize_object */
+        -: 1131:
+        -: 1132:/**
+        -: 1133: * Abstract operation 'SerializeJSONArray' defined in 24.3.2.4
+        -: 1134: *
+        -: 1135: * @return ecma value
+        -: 1136: *         Returned value must be freed with ecma_free_value.
+        -: 1137: */
+        -: 1138:static ecma_value_t
+    #####: 1139:ecma_builtin_json_serialize_array (ecma_json_stringify_context_t *context_p, /**< context*/
+        -: 1140:                                   ecma_object_t *obj_p) /**< the array object*/
+        -: 1141:{
+        -: 1142:#ifndef JERRY_NDEBUG
+    #####: 1143:  ecma_value_t obj_value = ecma_make_object_value (obj_p);
+    #####: 1144:  ecma_value_t is_array = ecma_is_value_array (obj_value);
+        -: 1145:
+    #####: 1146:  JERRY_ASSERT (ecma_is_value_true (is_array));
+        -: 1147:#endif /* !JERRY_NDEBUG */
+        -: 1148:
+        -: 1149:  /* 1. */
+    #####: 1150:  if (ecma_json_has_object_in_stack (context_p->occurence_stack_last_p, obj_p))
+        -: 1151:  {
+    #####: 1152:    return ecma_raise_type_error (ECMA_ERR_MSG ("The structure is cyclical"));
+        -: 1153:  }
+        -: 1154:
+        -: 1155:  /* 2. */
+    #####: 1156:  ecma_json_occurence_stack_item_t stack_item;
+    #####: 1157:  stack_item.next_p = context_p->occurence_stack_last_p;
+    #####: 1158:  stack_item.object_p = obj_p;
+    #####: 1159:  context_p->occurence_stack_last_p = &stack_item;
+        -: 1160:
+        -: 1161:  /* 3. - 4.*/
+    #####: 1162:  const lit_utf8_size_t stepback_size = ecma_stringbuilder_get_size (&context_p->indent_builder);
+    #####: 1163:  ecma_stringbuilder_append (&context_p->indent_builder, context_p->gap_str_p);
+    #####: 1164:  const lit_utf8_size_t separator_size = ecma_stringbuilder_get_size (&context_p->indent_builder);
+        -: 1165:
+    #####: 1166:  const bool has_gap = !ecma_compare_ecma_string_to_magic_id (context_p->gap_str_p, LIT_MAGIC_STRING__EMPTY);
+        -: 1167:
+        -: 1168:  /* 6. */
+    #####: 1169:  ecma_length_t array_length;
+    #####: 1170:  ecma_value_t length_value = ecma_op_object_get_length (obj_p, &array_length);
+        -: 1171:
+        -: 1172:#if JERRY_BUILTIN_PROXY
+    #####: 1173:  if (ECMA_IS_VALUE_ERROR (length_value))
+        -: 1174:  {
+    #####: 1175:    return length_value;
+        -: 1176:  }
+        -: 1177:#endif /* JERRY_BUILTIN_PROXY */
+    #####: 1178:  JERRY_ASSERT (ecma_is_value_empty (length_value));
+        -: 1179:
+    #####: 1180:  ecma_stringbuilder_append_byte (&context_p->result_builder, LIT_CHAR_LEFT_SQUARE);
+        -: 1181:
+    #####: 1182:  const lit_utf8_size_t left_square = ecma_stringbuilder_get_size (&context_p->result_builder);
+    #####: 1183:  lit_utf8_size_t last_prop = left_square;
+        -: 1184:
+        -: 1185:  /* 8. - 9. */
+    #####: 1186:  for (ecma_length_t index = 0; index < array_length; index++)
+        -: 1187:  {
+        -: 1188:    /* 9.a */
+    #####: 1189:    ecma_string_t *index_str_p = ecma_new_ecma_string_from_length (index);
+        -: 1190:
+    #####: 1191:    if (has_gap)
+        -: 1192:    {
+    #####: 1193:      ecma_stringbuilder_append_raw (&context_p->result_builder,
+    #####: 1194:                                     ecma_stringbuilder_get_data (&context_p->indent_builder),
+        -: 1195:                                     separator_size);
+        -: 1196:    }
+        -: 1197:
+    #####: 1198:    ecma_value_t result = ecma_builtin_json_serialize_property (context_p, obj_p, index_str_p);
+    #####: 1199:    ecma_deref_ecma_string (index_str_p);
+        -: 1200:
+    #####: 1201:    if (ECMA_IS_VALUE_ERROR (result))
+        -: 1202:    {
+    #####: 1203:      return result;
+        -: 1204:    }
+        -: 1205:
+    #####: 1206:    if (ecma_is_value_undefined (result))
+        -: 1207:    {
+        -: 1208:      /* 9.c */
+    #####: 1209:      ecma_stringbuilder_append_magic (&context_p->result_builder, LIT_MAGIC_STRING_NULL);
+        -: 1210:    }
+        -: 1211:    else
+        -: 1212:    {
+    #####: 1213:      JERRY_ASSERT (ecma_is_value_empty (result));
+        -: 1214:    }
+        -: 1215:
+    #####: 1216:    last_prop = ecma_stringbuilder_get_size (&context_p->result_builder);
+    #####: 1217:    ecma_stringbuilder_append_byte (&context_p->result_builder, LIT_CHAR_COMMA);
+        -: 1218:  }
+        -: 1219:
+        -: 1220:  /* Remove the last comma. */
+    #####: 1221:  ecma_stringbuilder_revert (&context_p->result_builder, last_prop);
+        -: 1222:
+        -: 1223:  /* 11.b.iii */
+    #####: 1224:  if (last_prop != left_square && has_gap)
+        -: 1225:  {
+        -: 1226:    /* We appended at least one element, and have a separator, so must append the stepback. */
+    #####: 1227:    ecma_stringbuilder_append_raw (&context_p->result_builder,
+    #####: 1228:                                   ecma_stringbuilder_get_data (&context_p->indent_builder),
+        -: 1229:                                   stepback_size);
+        -: 1230:  }
+        -: 1231:
+    #####: 1232:  ecma_stringbuilder_append_byte (&context_p->result_builder, LIT_CHAR_RIGHT_SQUARE);
+        -: 1233:
+        -: 1234:  /* 12. */
+    #####: 1235:  context_p->occurence_stack_last_p = stack_item.next_p;
+        -: 1236:
+        -: 1237:  /* 13. */
+    #####: 1238:  ecma_stringbuilder_revert (&context_p->indent_builder, stepback_size);
+        -: 1239:
+    #####: 1240:  return ECMA_VALUE_EMPTY;
+        -: 1241:} /* ecma_builtin_json_serialize_array */
+        -: 1242:
+        -: 1243:/**
+        -: 1244: * Abstract operation 'SerializeJSONProperty' defined in 24.3.2.1
+        -: 1245: *
+        -: 1246: * @return ecma value
+        -: 1247: *         Returned value must be freed with ecma_free_value.
+        -: 1248: */
+        -: 1249:static ecma_value_t
+    #####: 1250:ecma_builtin_json_serialize_property (ecma_json_stringify_context_t *context_p, /**< context*/
+        -: 1251:                                      ecma_object_t *holder_p, /**< the object*/
+        -: 1252:                                      ecma_string_t *key_p) /**< property key*/
+        -: 1253:{
+        -: 1254:  /* 1. */
+    #####: 1255:  ecma_value_t value = ecma_op_object_get (holder_p, key_p);
+        -: 1256:
+        -: 1257:  /* 2. */
+    #####: 1258:  if (ECMA_IS_VALUE_ERROR (value))
+        -: 1259:  {
+    #####: 1260:    return value;
+        -: 1261:  }
+        -: 1262:
+        -: 1263:  /* 3. */
+    #####: 1264:  if (ecma_is_value_object (value) || ecma_is_value_bigint (value))
+        -: 1265:  {
+    #####: 1266:    ecma_value_t to_object_value = ecma_op_to_object (value);
+        -: 1267:
+    #####: 1268:    if (ECMA_IS_VALUE_ERROR (to_object_value))
+        -: 1269:    {
+    #####: 1270:      ecma_free_value (value);
+    #####: 1271:      return to_object_value;
+        -: 1272:    }
+        -: 1273:
+    #####: 1274:    ecma_object_t *value_obj_p = ecma_get_object_from_value (to_object_value);
+    #####: 1275:    ecma_value_t to_json = ecma_op_object_get_with_receiver (value_obj_p,
+        -: 1276:                                                             ecma_get_magic_string (LIT_MAGIC_STRING_TO_JSON_UL),
+        -: 1277:                                                             value);
+        -: 1278:
+    #####: 1279:    ecma_deref_object (value_obj_p);
+        -: 1280:
+    #####: 1281:    if (ECMA_IS_VALUE_ERROR (to_json))
+        -: 1282:    {
+    #####: 1283:      ecma_free_value (value);
+    #####: 1284:      return to_json;
+        -: 1285:    }
+        -: 1286:
+        -: 1287:    /* 3.c */
+    #####: 1288:    if (ecma_op_is_callable (to_json))
+        -: 1289:    {
+    #####: 1290:      ecma_value_t key_value = ecma_make_string_value (key_p);
+    #####: 1291:      ecma_value_t call_args[] = { key_value };
+    #####: 1292:      ecma_object_t *to_json_obj_p = ecma_get_object_from_value (to_json);
+        -: 1293:
+    #####: 1294:      ecma_value_t result = ecma_op_function_call (to_json_obj_p, value, call_args, 1);
+    #####: 1295:      ecma_free_value (value);
+        -: 1296:
+    #####: 1297:      if (ECMA_IS_VALUE_ERROR (result))
+        -: 1298:      {
+    #####: 1299:        ecma_deref_object (to_json_obj_p);
+    #####: 1300:        return result;
+        -: 1301:      }
+    #####: 1302:      value = result;
+        -: 1303:    }
+    #####: 1304:    ecma_free_value (to_json);
+        -: 1305:  }
+        -: 1306:
+        -: 1307:  /* 4. */
+    #####: 1308:  if (context_p->replacer_function_p)
+        -: 1309:  {
+    #####: 1310:    ecma_value_t holder_value = ecma_make_object_value (holder_p);
+    #####: 1311:    ecma_value_t key_value = ecma_make_string_value (key_p);
+    #####: 1312:    ecma_value_t call_args[] = { key_value, value };
+        -: 1313:
+    #####: 1314:    ecma_value_t result = ecma_op_function_call (context_p->replacer_function_p, holder_value, call_args, 2);
+    #####: 1315:    ecma_free_value (value);
+        -: 1316:
+    #####: 1317:    if (ECMA_IS_VALUE_ERROR (result))
+        -: 1318:    {
+    #####: 1319:      return result;
+        -: 1320:    }
+        -: 1321:
+    #####: 1322:    value = result;
+        -: 1323:  }
+        -: 1324:
+        -: 1325:  /* 5. */
+    #####: 1326:  if (ecma_is_value_object (value))
+        -: 1327:  {
+    #####: 1328:    ecma_object_t *obj_p = ecma_get_object_from_value (value);
+        -: 1329:
+    #####: 1330:    if (ecma_get_object_base_type (obj_p) == ECMA_OBJECT_BASE_TYPE_CLASS)
+        -: 1331:    {
+    #####: 1332:      switch (((ecma_extended_object_t *) obj_p)->u.cls.type)
+        -: 1333:      {
+        -: 1334:        /* 5.a */
+    #####: 1335:        case ECMA_OBJECT_CLASS_NUMBER:
+        -: 1336:        {
+    #####: 1337:          ecma_number_t num;
+    #####: 1338:          value = ecma_op_to_number (value, &num);
+    #####: 1339:          ecma_deref_object (obj_p);
+        -: 1340:
+    #####: 1341:          if (ECMA_IS_VALUE_ERROR (value))
+        -: 1342:          {
+    #####: 1343:            return value;
+        -: 1344:          }
+        -: 1345:
+    #####: 1346:          value = ecma_make_number_value (num);
+    #####: 1347:          break;
+        -: 1348:        }
+        -: 1349:        /* 5.b */
+    #####: 1350:        case ECMA_OBJECT_CLASS_STRING:
+        -: 1351:        {
+    #####: 1352:          ecma_string_t *str_p = ecma_op_to_string (value);
+    #####: 1353:          ecma_deref_object (obj_p);
+        -: 1354:
+    #####: 1355:          if (JERRY_UNLIKELY (str_p == NULL))
+        -: 1356:          {
+    #####: 1357:            return ECMA_VALUE_ERROR;
+        -: 1358:          }
+        -: 1359:
+    #####: 1360:          value = ecma_make_string_value (str_p);
+    #####: 1361:          break;
+        -: 1362:        }
+        -: 1363:        /* 5.c */
+    #####: 1364:        case ECMA_OBJECT_CLASS_BOOLEAN:
+        -: 1365:        {
+    #####: 1366:          ecma_extended_object_t *ext_object_p = (ecma_extended_object_t *) obj_p;
+    #####: 1367:          value = ext_object_p->u.cls.u3.value;
+    #####: 1368:          ecma_deref_object (obj_p);
+    #####: 1369:          break;
+        -: 1370:        }
+        -: 1371:#if JERRY_BUILTIN_BIGINT
+        -: 1372:        /* 5.d */
+    #####: 1373:        case ECMA_OBJECT_CLASS_BIGINT:
+        -: 1374:        {
+    #####: 1375:          ecma_extended_object_t *ext_object_p = (ecma_extended_object_t *) obj_p;
+    #####: 1376:          value = ecma_copy_value (ext_object_p->u.cls.u3.value);
+    #####: 1377:          ecma_deref_object (obj_p);
+    #####: 1378:          break;
+        -: 1379:        }
+        -: 1380:#endif /* JERRY_BUILTIN_BIGINT */
+        -: 1381:      }
+        -: 1382:    }
+        -: 1383:  }
+        -: 1384:
+        -: 1385:  /* 6. - 8. */
+    #####: 1386:  if (ecma_is_value_null (value))
+        -: 1387:  {
+    #####: 1388:    ecma_stringbuilder_append_magic (&context_p->result_builder, LIT_MAGIC_STRING_NULL);
+    #####: 1389:    return ECMA_VALUE_EMPTY;
+        -: 1390:  }
+        -: 1391:
+    #####: 1392:  if (ecma_is_value_true (value))
+        -: 1393:  {
+    #####: 1394:    ecma_stringbuilder_append_magic (&context_p->result_builder, LIT_MAGIC_STRING_TRUE);
+    #####: 1395:    return ECMA_VALUE_EMPTY;
+        -: 1396:  }
+        -: 1397:
+    #####: 1398:  if (ecma_is_value_false (value))
+        -: 1399:  {
+    #####: 1400:    ecma_stringbuilder_append_magic (&context_p->result_builder, LIT_MAGIC_STRING_FALSE);
+    #####: 1401:    return ECMA_VALUE_EMPTY;
+        -: 1402:  }
+        -: 1403:
+        -: 1404:  /* 9. */
+    #####: 1405:  if (ecma_is_value_string (value))
+        -: 1406:  {
+    #####: 1407:    ecma_string_t *value_str_p = ecma_get_string_from_value (value);
+        -: 1408:    /* Quote will append the result. */
+    #####: 1409:    ecma_builtin_json_quote (&context_p->result_builder, value_str_p);
+    #####: 1410:    ecma_deref_ecma_string (value_str_p);
+        -: 1411:
+    #####: 1412:    return ECMA_VALUE_EMPTY;
+        -: 1413:  }
+        -: 1414:
+        -: 1415:  /* 10. */
+    #####: 1416:  if (ecma_is_value_number (value))
+        -: 1417:  {
+    #####: 1418:    ecma_number_t num_value = ecma_get_number_from_value (value);
+        -: 1419:
+        -: 1420:    /* 10.a */
+    #####: 1421:    if (!ecma_number_is_nan (num_value) && !ecma_number_is_infinity (num_value))
+    #####: 1422:    {
+    #####: 1423:      ecma_string_t *result_string_p = ecma_op_to_string (value);
+    #####: 1424:      JERRY_ASSERT (result_string_p != NULL);
+        -: 1425:
+    #####: 1426:      ecma_stringbuilder_append (&context_p->result_builder, result_string_p);
+    #####: 1427:      ecma_deref_ecma_string (result_string_p);
+        -: 1428:    }
+        -: 1429:    else
+        -: 1430:    {
+        -: 1431:      /* 10.b */
+    #####: 1432:      ecma_stringbuilder_append_magic (&context_p->result_builder, LIT_MAGIC_STRING_NULL);
+        -: 1433:    }
+        -: 1434:
+    #####: 1435:    ecma_free_value (value);
+    #####: 1436:    return ECMA_VALUE_EMPTY;
+        -: 1437:  }
+        -: 1438:
+        -: 1439:#if JERRY_BUILTIN_BIGINT
+    #####: 1440:  if (ecma_is_value_bigint (value))
+        -: 1441:  {
+    #####: 1442:    ecma_free_value (value);
+    #####: 1443:    return ecma_raise_type_error (ECMA_ERR_MSG ("BigInt cannot be serialized"));
+        -: 1444:  }
+        -: 1445:#endif /* JERRY_BUILTIN_BIGINT */
+        -: 1446:
+        -: 1447:  /* 11. */
+    #####: 1448:  if (ecma_is_value_object (value) && !ecma_op_is_callable (value))
+        -: 1449:  {
+    #####: 1450:    ecma_value_t is_array = ecma_is_value_array (value);
+        -: 1451:
+        -: 1452:#if JERRY_BUILTIN_BIGINT
+    #####: 1453:    if (ECMA_IS_VALUE_ERROR (is_array))
+        -: 1454:    {
+    #####: 1455:      ecma_free_value (value);
+    #####: 1456:      return is_array;
+        -: 1457:    }
+        -: 1458:#endif /* JERRY_BUILTIN_BIGINT */
+        -: 1459:
+    #####: 1460:    ecma_object_t *obj_p = ecma_get_object_from_value (value);
+        -: 1461:
+        -: 1462:    ecma_value_t ret_value;
+        -: 1463:    /* 10.a */
+    #####: 1464:    if (ecma_is_value_true (is_array))
+        -: 1465:    {
+    #####: 1466:      ret_value = ecma_builtin_json_serialize_array (context_p, obj_p);
+        -: 1467:    }
+        -: 1468:    /* 10.b */
+        -: 1469:    else
+        -: 1470:    {
+    #####: 1471:      ret_value = ecma_builtin_json_serialize_object (context_p, obj_p);
+        -: 1472:    }
+        -: 1473:
+    #####: 1474:    ecma_deref_object (obj_p);
+    #####: 1475:    return ret_value;
+        -: 1476:  }
+        -: 1477:
+        -: 1478:  /* 12. */
+    #####: 1479:  ecma_free_value (value);
+    #####: 1480:  return ECMA_VALUE_UNDEFINED;
+        -: 1481:} /* ecma_builtin_json_serialize_property */
+        -: 1482:
+        -: 1483:/**
+        -: 1484: * Helper function to stringify an object in JSON format representing an ecma_value.
+        -: 1485: *
+        -: 1486: *  @return ecma_value_t string created from an abject formating by a given context
+        -: 1487: *          Returned value must be freed with ecma_free_value.
+        -: 1488: *
+        -: 1489: */
+    #####: 1490:static ecma_value_t ecma_builtin_json_str_helper (ecma_json_stringify_context_t *context_p, /**< context argument */
+        -: 1491:                                                  const ecma_value_t arg1) /**< object argument */
+        -: 1492:{
+    #####: 1493:  ecma_value_t ret_value = ECMA_VALUE_EMPTY;
+    #####: 1494:  ecma_object_t *obj_wrapper_p = ecma_op_create_object_object_noarg ();
+    #####: 1495:  ecma_string_t *empty_str_p = ecma_get_magic_string (LIT_MAGIC_STRING__EMPTY);
+    #####: 1496:  ecma_value_t put_comp_val = ecma_builtin_helper_def_prop (obj_wrapper_p,
+        -: 1497:                                                            empty_str_p,
+        -: 1498:                                                            arg1,
+        -: 1499:                                                            ECMA_PROPERTY_CONFIGURABLE_ENUMERABLE_WRITABLE);
+        -: 1500:
+    #####: 1501:  JERRY_ASSERT (ecma_is_value_true (put_comp_val));
+        -: 1502:
+    #####: 1503:  context_p->result_builder = ecma_stringbuilder_create ();
+        -: 1504:
+    #####: 1505:  if (!ecma_compare_ecma_string_to_magic_id (context_p->gap_str_p, LIT_MAGIC_STRING__EMPTY))
+        -: 1506:  {
+    #####: 1507:    ecma_stringbuilder_append_byte (&context_p->indent_builder, LIT_CHAR_LF);
+        -: 1508:  }
+        -: 1509:
+    #####: 1510:  ret_value = ecma_builtin_json_serialize_property (context_p, obj_wrapper_p, empty_str_p);
+    #####: 1511:  ecma_deref_object (obj_wrapper_p);
+        -: 1512:
+    #####: 1513:  if (ECMA_IS_VALUE_ERROR (ret_value) || ecma_is_value_undefined (ret_value))
+        -: 1514:  {
+    #####: 1515:    ecma_stringbuilder_destroy (&context_p->result_builder);
+    #####: 1516:    return ret_value;
+        -: 1517:  }
+        -: 1518:
+    #####: 1519:  return ecma_make_string_value (ecma_stringbuilder_finalize (&context_p->result_builder));
+        -: 1520:} /* ecma_builtin_json_str_helper */
+        -: 1521:
+        -: 1522:/**
+        -: 1523: * Function to create a JSON string from a JS value.
+        -: 1524: *
+        -: 1525: * Note:
+        -: 1526: *      The returned value must be freed with ecma_free_value.
+        -: 1527: *
+        -: 1528: * @return - ecma_value_t containing a json string.
+        -: 1529: *         - Error value in case of any errors.
+        -: 1530: */
+        -: 1531:ecma_value_t
+    #####: 1532:ecma_builtin_json_stringify_no_opts (const ecma_value_t value) /**< value to stringify */
+        -: 1533:{
+    #####: 1534:  ecma_json_stringify_context_t context;
+    #####: 1535:  context.occurence_stack_last_p = NULL;
+    #####: 1536:  context.indent_builder = ecma_stringbuilder_create ();
+    #####: 1537:  context.property_list_p = NULL;
+    #####: 1538:  context.replacer_function_p = NULL;
+    #####: 1539:  context.gap_str_p = ecma_get_magic_string (LIT_MAGIC_STRING__EMPTY);
+        -: 1540:
+    #####: 1541:  ecma_value_t ret_value = ecma_builtin_json_str_helper (&context, value);
+        -: 1542:
+    #####: 1543:  ecma_deref_ecma_string (context.gap_str_p);
+    #####: 1544:  ecma_stringbuilder_destroy (&context.indent_builder);
+    #####: 1545:  return ret_value;
+        -: 1546:} /* ecma_builtin_json_stringify_no_opts */
+        -: 1547:
+        -: 1548:/**
+        -: 1549: * The JSON object's 'stringify' routine
+        -: 1550: *
+        -: 1551: * See also:
+        -: 1552: *          ECMA-262 v5, 15.12.3
+        -: 1553: *          ECMA-262 v11, 24.5.2
+        -: 1554: *
+        -: 1555: * @return ecma value
+        -: 1556: *         Returned value must be freed with ecma_free_value.
+        -: 1557: */
+        -: 1558:static ecma_value_t
+    #####: 1559:ecma_builtin_json_stringify (ecma_value_t arg1,  /**< value */
+        -: 1560:                             ecma_value_t arg2,  /**< replacer */
+        -: 1561:                             ecma_value_t arg3)  /**< space */
+        -: 1562:{
+    #####: 1563:  ecma_json_stringify_context_t context;
+    #####: 1564:  context.replacer_function_p = NULL;
+    #####: 1565:  context.property_list_p = NULL;
+        -: 1566:
+        -: 1567:  /* 4. */
+    #####: 1568:  if (ecma_is_value_object (arg2))
+        -: 1569:  {
+    #####: 1570:    ecma_object_t *obj_p = ecma_get_object_from_value (arg2);
+        -: 1571:
+        -: 1572:    /* 4.a */
+    #####: 1573:    if (ecma_op_is_callable (arg2))
+        -: 1574:    {
+    #####: 1575:      context.replacer_function_p = obj_p;
+        -: 1576:    }
+        -: 1577:    /* 4.b */
+        -: 1578:    else
+        -: 1579:    {
+    #####: 1580:      ecma_value_t is_array = ecma_is_value_array (arg2);
+        -: 1581:
+        -: 1582:#if JERRY_ESNEXT
+    #####: 1583:      if (ECMA_IS_VALUE_ERROR (is_array))
+        -: 1584:      {
+    #####: 1585:        return is_array;
+        -: 1586:      }
+        -: 1587:#endif /* JERRY_ESNEXT */
+        -: 1588:
+    #####: 1589:      if (ecma_is_value_true (is_array))
+        -: 1590:      {
+    #####: 1591:        ecma_length_t array_length;
+    #####: 1592:        ecma_value_t to_len = ecma_op_object_get_length (obj_p, &array_length);
+        -: 1593:
+        -: 1594:#if JERRY_BUILTIN_PROXY
+    #####: 1595:        if (ECMA_IS_VALUE_ERROR (to_len))
+        -: 1596:        {
+    #####: 1597:          return to_len;
+        -: 1598:        }
+        -: 1599:#endif /* JERRY_BUILTIN_PROXY */
+    #####: 1600:        JERRY_ASSERT (ecma_is_value_empty (to_len));
+        -: 1601:
+    #####: 1602:        context.property_list_p = ecma_new_collection ();
+        -: 1603:
+    #####: 1604:        uint32_t index = 0;
+        -: 1605:
+        -: 1606:        /* 4.b.iii.5 */
+    #####: 1607:        while (index < array_length)
+        -: 1608:        {
+    #####: 1609:          ecma_value_t value = ecma_op_object_get_by_index (obj_p, index);
+        -: 1610:
+    #####: 1611:          if (ECMA_IS_VALUE_ERROR (value))
+        -: 1612:          {
+    #####: 1613:            ecma_collection_free (context.property_list_p);
+    #####: 1614:            return value;
+        -: 1615:          }
+        -: 1616:
+        -: 1617:          /* 4.b.iii.5.c */
+    #####: 1618:          ecma_value_t item = ECMA_VALUE_UNDEFINED;
+        -: 1619:
+        -: 1620:          /* 4.b.iii.5.d */
+    #####: 1621:          if (ecma_is_value_string (value))
+        -: 1622:          {
+    #####: 1623:            ecma_ref_ecma_string (ecma_get_string_from_value (value));
+    #####: 1624:            item = value;
+        -: 1625:          }
+        -: 1626:          /* 4.b.iii.5.e */
+    #####: 1627:          else if (ecma_is_value_number (value))
+        -: 1628:          {
+    #####: 1629:            ecma_string_t *number_str_p = ecma_op_to_string (value);
+    #####: 1630:            JERRY_ASSERT (number_str_p != NULL);
+    #####: 1631:            item = ecma_make_string_value (number_str_p);
+        -: 1632:          }
+        -: 1633:          /* 4.b.iii.5.f */
+    #####: 1634:          else if (ecma_is_value_object (value))
+        -: 1635:          {
+    #####: 1636:            ecma_object_t *value_obj_p = ecma_get_object_from_value (value);
+        -: 1637:
+    #####: 1638:            if (ecma_get_object_base_type (value_obj_p) == ECMA_OBJECT_BASE_TYPE_CLASS)
+        -: 1639:            {
+    #####: 1640:              uint8_t class_type = ((ecma_extended_object_t *) value_obj_p)->u.cls.type;
+        -: 1641:
+    #####: 1642:              if (class_type == ECMA_OBJECT_CLASS_NUMBER || class_type == ECMA_OBJECT_CLASS_STRING)
+        -: 1643:              {
+    #####: 1644:                ecma_string_t *str_p = ecma_op_to_string (value);
+        -: 1645:
+    #####: 1646:                if (JERRY_UNLIKELY (str_p == NULL))
+        -: 1647:                {
+    #####: 1648:                  ecma_collection_free (context.property_list_p);
+    #####: 1649:                  ecma_free_value (value);
+    #####: 1650:                  return ECMA_VALUE_ERROR;
+        -: 1651:                }
+        -: 1652:
+    #####: 1653:                item = ecma_make_string_value (str_p);
+        -: 1654:              }
+        -: 1655:            }
+        -: 1656:          }
+        -: 1657:
+    #####: 1658:          ecma_free_value (value);
+        -: 1659:
+        -: 1660:          /* 4.b.iii.5.g */
+    #####: 1661:          if (!ecma_is_value_undefined (item))
+        -: 1662:          {
+    #####: 1663:            JERRY_ASSERT (ecma_is_value_string (item));
+    #####: 1664:            ecma_string_t *string_p = ecma_get_string_from_value (item);
+        -: 1665:
+    #####: 1666:            if (!ecma_collection_has_string_value (context.property_list_p, string_p))
+        -: 1667:            {
+    #####: 1668:              ecma_collection_push_back (context.property_list_p, item);
+        -: 1669:            }
+        -: 1670:            else
+        -: 1671:            {
+    #####: 1672:              ecma_deref_ecma_string (string_p);
+        -: 1673:            }
+        -: 1674:          }
+        -: 1675:
+    #####: 1676:          index++;
+        -: 1677:        }
+        -: 1678:      }
+        -: 1679:    }
+        -: 1680:  }
+        -: 1681:
+    #####: 1682:  ecma_value_t space = ECMA_VALUE_EMPTY;
+        -: 1683:
+        -: 1684:  /* 5. */
+    #####: 1685:  if (ecma_is_value_object (arg3))
+        -: 1686:  {
+    #####: 1687:    ecma_object_t *obj_p = ecma_get_object_from_value (arg3);
+        -: 1688:
+    #####: 1689:    if (ecma_get_object_base_type (obj_p) == ECMA_OBJECT_BASE_TYPE_CLASS)
+        -: 1690:    {
+    #####: 1691:      uint8_t class_type = ((ecma_extended_object_t *) obj_p)->u.cls.type;
+        -: 1692:
+        -: 1693:      /* 5.a */
+    #####: 1694:      if (class_type == ECMA_OBJECT_CLASS_NUMBER)
+        -: 1695:      {
+    #####: 1696:        ecma_number_t num;
+    #####: 1697:        ecma_value_t value = ecma_op_to_number (arg3, &num);
+        -: 1698:
+    #####: 1699:        if (ECMA_IS_VALUE_ERROR (value))
+        -: 1700:        {
+    #####: 1701:          if (context.property_list_p != NULL)
+        -: 1702:          {
+    #####: 1703:            ecma_collection_free (context.property_list_p);
+        -: 1704:          }
+    #####: 1705:          return value;
+        -: 1706:        }
+        -: 1707:
+    #####: 1708:        space = ecma_make_number_value (num);
+        -: 1709:      }
+        -: 1710:      /* 5.b */
+    #####: 1711:      else if (class_type == ECMA_OBJECT_CLASS_STRING)
+        -: 1712:      {
+    #####: 1713:        ecma_string_t *value_str_p = ecma_op_to_string (arg3);
+        -: 1714:
+    #####: 1715:        if (JERRY_UNLIKELY (value_str_p == NULL))
+        -: 1716:        {
+    #####: 1717:          if (context.property_list_p != NULL)
+        -: 1718:          {
+    #####: 1719:            ecma_collection_free (context.property_list_p);
+        -: 1720:          }
+    #####: 1721:          return ECMA_VALUE_ERROR;
+        -: 1722:        }
+        -: 1723:
+    #####: 1724:        space = ecma_make_string_value (value_str_p);
+        -: 1725:      }
+        -: 1726:    }
+        -: 1727:  }
+        -: 1728:
+    #####: 1729:  if (space == ECMA_VALUE_EMPTY)
+        -: 1730:  {
+    #####: 1731:    space = ecma_copy_value (arg3);
+        -: 1732:  }
+        -: 1733:
+        -: 1734:  /* 6. */
+    #####: 1735:  if (ecma_is_value_number (space))
+        -: 1736:  {
+        -: 1737:    /* 6.a */
+    #####: 1738:    ecma_number_t num_of_spaces;
+    #####: 1739:    ecma_op_to_integer (space, &num_of_spaces);
+        -: 1740:
+    #####: 1741:    num_of_spaces = JERRY_MIN (10, num_of_spaces);
+        -: 1742:
+        -: 1743:    /* 6.b */
+    #####: 1744:    if (num_of_spaces < 1)
+        -: 1745:    {
+    #####: 1746:      context.gap_str_p = ecma_get_magic_string (LIT_MAGIC_STRING__EMPTY);
+        -: 1747:    }
+        -: 1748:    else
+        -: 1749:    {
+    #####: 1750:      JMEM_DEFINE_LOCAL_ARRAY (space_buff, num_of_spaces, char);
+        -: 1751:
+    #####: 1752:      memset (space_buff, LIT_CHAR_SP, (size_t) num_of_spaces);
+    #####: 1753:      context.gap_str_p = ecma_new_ecma_string_from_utf8 ((lit_utf8_byte_t *) space_buff,
+        -: 1754:                                                          (lit_utf8_size_t) num_of_spaces);
+        -: 1755:
+    #####: 1756:      JMEM_FINALIZE_LOCAL_ARRAY (space_buff);
+        -: 1757:    }
+        -: 1758:  }
+        -: 1759:  /* 7. */
+    #####: 1760:  else if (ecma_is_value_string (space))
+        -: 1761:  {
+    #####: 1762:    ecma_string_t *space_str_p = ecma_get_string_from_value (space);
+    #####: 1763:    lit_utf8_size_t num_of_chars = ecma_string_get_length (space_str_p);
+        -: 1764:
+    #####: 1765:    if (num_of_chars < 10)
+        -: 1766:    {
+    #####: 1767:      ecma_ref_ecma_string (space_str_p);
+    #####: 1768:      context.gap_str_p = space_str_p;
+        -: 1769:    }
+        -: 1770:    else
+        -: 1771:    {
+    #####: 1772:      context.gap_str_p = ecma_string_substr (space_str_p, 0, 10);
+        -: 1773:    }
+        -: 1774:  }
+        -: 1775:  /* 8. */
+        -: 1776:  else
+        -: 1777:  {
+    #####: 1778:    context.gap_str_p = ecma_get_magic_string (LIT_MAGIC_STRING__EMPTY);
+        -: 1779:  }
+        -: 1780:
+    #####: 1781:  ecma_free_value (space);
+        -: 1782:
+        -: 1783:  /* 1., 2., 3. */
+    #####: 1784:  context.occurence_stack_last_p = NULL;
+    #####: 1785:  context.indent_builder = ecma_stringbuilder_create ();
+        -: 1786:
+        -: 1787:  /* 9. */
+    #####: 1788:  ecma_value_t ret_value = ecma_builtin_json_str_helper (&context, arg1);
+        -: 1789:
+    #####: 1790:  ecma_deref_ecma_string (context.gap_str_p);
+    #####: 1791:  ecma_stringbuilder_destroy (&context.indent_builder);
+        -: 1792:
+    #####: 1793:  if (context.property_list_p != NULL)
+        -: 1794:  {
+    #####: 1795:    ecma_collection_free (context.property_list_p);
+        -: 1796:  }
+        -: 1797:
+    #####: 1798:  return ret_value;
+        -: 1799:} /* ecma_builtin_json_stringify */
+        -: 1800:
+        -: 1801:/**
+        -: 1802: * Dispatcher of the built-in's routines
+        -: 1803: *
+        -: 1804: * @return ecma value
+        -: 1805: *         Returned value must be freed with ecma_free_value.
+        -: 1806: */
+        -: 1807:ecma_value_t
+    #####: 1808:ecma_builtin_json_dispatch_routine (uint8_t builtin_routine_id, /**< built-in wide routine identifier */
+        -: 1809:                                    ecma_value_t this_arg, /**< 'this' argument value */
+        -: 1810:                                    const ecma_value_t arguments_list_p[], /**< list of arguments
+        -: 1811:                                                                            *   passed to routine */
+        -: 1812:                                    uint32_t arguments_number) /**< length of arguments' list */
+        -: 1813:{
+        -: 1814:  JERRY_UNUSED_2 (this_arg, arguments_number);
+        -: 1815:
+    #####: 1816:  switch (builtin_routine_id)
+        -: 1817:  {
+    #####: 1818:    case ECMA_BUILTIN_JSON_PARSE:
+        -: 1819:    {
+    #####: 1820:      return ecma_builtin_json_parse (arguments_list_p[0], arguments_list_p[1]);
+        -: 1821:    }
+    #####: 1822:    case ECMA_BUILTIN_JSON_STRINGIFY:
+        -: 1823:    {
+    #####: 1824:      return ecma_builtin_json_stringify (arguments_list_p[0], arguments_list_p[1], arguments_list_p[2]);
+        -: 1825:    }
+    #####: 1826:    default:
+        -: 1827:    {
+    #####: 1828:      JERRY_UNREACHABLE ();
+        -: 1829:    }
+        -: 1830:  }
+        -: 1831:} /* ecma_builtin_json_dispatch_routine */
+        -: 1832:
+        -: 1833:/**
+        -: 1834: * @}
+        -: 1835: * @}
+        -: 1836: * @}
+        -: 1837: */
+        -: 1838:
+        -: 1839:#endif /* JERRY_BUILTIN_JSON */

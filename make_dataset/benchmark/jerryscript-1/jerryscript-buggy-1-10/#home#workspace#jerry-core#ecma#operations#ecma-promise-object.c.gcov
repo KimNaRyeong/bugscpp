@@ -1,0 +1,919 @@
+        -:    0:Source:/home/workspace/jerry-core/ecma/operations/ecma-promise-object.c
+        -:    0:Programs:274
+        -:    1:/* Copyright JS Foundation and other contributors, http://js.foundation
+        -:    2: *
+        -:    3: * Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4: * you may not use this file except in compliance with the License.
+        -:    5: * You may obtain a copy of the License at
+        -:    6: *
+        -:    7: *     http://www.apache.org/licenses/LICENSE-2.0
+        -:    8: *
+        -:    9: * Unless required by applicable law or agreed to in writing, software
+        -:   10: * distributed under the License is distributed on an "AS IS" BASIS
+        -:   11: * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12: * See the License for the specific language governing permissions and
+        -:   13: * limitations under the License.
+        -:   14: */
+        -:   15:
+        -:   16:#include "ecma-boolean-object.h"
+        -:   17:#include "ecma-builtins.h"
+        -:   18:#include "ecma-exceptions.h"
+        -:   19:#include "ecma-function-object.h"
+        -:   20:#include "ecma-gc.h"
+        -:   21:#include "ecma-globals.h"
+        -:   22:#include "ecma-helpers.h"
+        -:   23:#include "ecma-jobqueue.h"
+        -:   24:#include "ecma-objects.h"
+        -:   25:#include "ecma-objects-general.h"
+        -:   26:#include "ecma-promise-object.h"
+        -:   27:#include "jcontext.h"
+        -:   28:
+        -:   29:#if ENABLED (JERRY_ES2015_BUILTIN_PROMISE)
+        -:   30:
+        -:   31:/** \addtogroup ecma ECMA
+        -:   32: * @{
+        -:   33: *
+        -:   34: * \addtogroup ecmapromiseobject ECMA Promise object related routines
+        -:   35: * @{
+        -:   36: */
+        -:   37:
+        -:   38:/**
+        -:   39: * Check if an object is promise.
+        -:   40: *
+        -:   41: * @return true - if the object is a promise.
+        -:   42: *         false - otherwise.
+        -:   43: */
+        -:   44:inline bool JERRY_ATTR_ALWAYS_INLINE
+    #####:   45:ecma_is_promise (ecma_object_t *obj_p) /**< points to object */
+        -:   46:{
+     7848:   47:  return ecma_object_class_is (obj_p, LIT_MAGIC_STRING_PROMISE_UL);
+        -:   48:} /* ecma_is_promise */
+        -:   49:
+        -:   50:/**
+        -:   51: * Get the result of the promise.
+        -:   52: *
+        -:   53: * @return ecma value of the promise result.
+        -:   54: *         Returned value must be freed with ecma_free_value
+        -:   55: */
+        -:   56:ecma_value_t
+    #####:   57:ecma_promise_get_result (ecma_object_t *obj_p) /**< points to promise object */
+        -:   58:{
+    #####:   59:  JERRY_ASSERT (ecma_is_promise (obj_p));
+        -:   60:
+    #####:   61:  ecma_extended_object_t *ext_object_p = (ecma_extended_object_t *) obj_p;
+        -:   62:
+    #####:   63:  return ecma_copy_value (ext_object_p->u.class_prop.u.value);
+        -:   64:} /* ecma_promise_get_result */
+        -:   65:
+        -:   66:/**
+        -:   67: * Set the PromiseResult of promise.
+        -:   68: */
+        -:   69:static inline void JERRY_ATTR_ALWAYS_INLINE
+        -:   70:ecma_promise_set_result (ecma_object_t *obj_p, /**< points to promise object */
+        -:   71:                         ecma_value_t result) /**< the result value */
+        -:   72:{
+     1308:   73:  JERRY_ASSERT (ecma_is_promise (obj_p));
+        -:   74:
+     1308:   75:  ecma_extended_object_t *ext_object_p = (ecma_extended_object_t *) obj_p;
+        -:   76:
+     1308:   77:  JERRY_ASSERT (ext_object_p->u.class_prop.u.value == ECMA_VALUE_UNDEFINED);
+        -:   78:
+     1308:   79:  ext_object_p->u.class_prop.u.value = result;
+        -:   80:} /* ecma_promise_set_result */
+        -:   81:
+        -:   82:/**
+        -:   83: * Get the PromiseState of promise.
+        -:   84: *
+        -:   85: * @return the state's enum value
+        -:   86: */
+        -:   87:uint16_t
+     3924:   88:ecma_promise_get_flags (ecma_object_t *obj_p) /**< points to promise object */
+        -:   89:{
+     3924:   90:  JERRY_ASSERT (ecma_is_promise (obj_p));
+        -:   91:
+     3924:   92:  return ((ecma_extended_object_t *) obj_p)->u.class_prop.extra_info;
+        -:   93:} /* ecma_promise_get_flags */
+        -:   94:
+        -:   95:/**
+        -:   96: * Set the PromiseState of promise.
+        -:   97: */
+        -:   98:static inline void JERRY_ATTR_ALWAYS_INLINE
+        -:   99:ecma_promise_set_state (ecma_object_t *obj_p, /**< points to promise object */
+        -:  100:                        bool is_fulfilled) /**< new flags */
+        -:  101:{
+     1308:  102:  JERRY_ASSERT (ecma_is_promise (obj_p));
+     1308:  103:  JERRY_ASSERT (ecma_promise_get_flags (obj_p) & ECMA_PROMISE_IS_PENDING);
+        -:  104:
+     1308:  105:  uint16_t flags_to_invert = (is_fulfilled ? (ECMA_PROMISE_IS_PENDING | ECMA_PROMISE_IS_FULFILLED)
+        -:  106:                                           : ECMA_PROMISE_IS_PENDING);
+        -:  107:
+     1308:  108:  ((ecma_extended_object_t *) obj_p)->u.class_prop.extra_info ^= flags_to_invert;
+        -:  109:} /* ecma_promise_set_state */
+        -:  110:
+        -:  111:/**
+        -:  112: * Take a collection of Reactions and enqueue a new PromiseReactionJob for each Reaction.
+        -:  113: *
+        -:  114: * See also: ES2015 25.4.1.8
+        -:  115: */
+        -:  116:static void
+     1308:  117:ecma_promise_trigger_reactions (ecma_collection_t *reactions, /**< lists of reactions */
+        -:  118:                                ecma_value_t value, /**< value for resolve or reject */
+        -:  119:                                bool is_reject) /**< true if promise is rejected, false otherwise */
+        -:  120:{
+     1308:  121:  ecma_value_t *buffer_p = reactions->buffer_p;
+     1308:  122:  ecma_value_t *buffer_end_p = buffer_p + reactions->item_count;
+        -:  123:
+     2616:  124:  while (buffer_p < buffer_end_p)
+        -:  125:  {
+    #####:  126:    ecma_value_t capability_with_tag = *buffer_p++;
+    #####:  127:    ecma_object_t *capability_obj_p = ECMA_GET_NON_NULL_POINTER_FROM_POINTER_TAG (ecma_object_t, capability_with_tag);
+    #####:  128:    ecma_value_t capability = ecma_make_object_value (capability_obj_p);
+        -:  129:
+    #####:  130:    if (!is_reject)
+        -:  131:    {
+    #####:  132:      ecma_value_t handler = ECMA_VALUE_TRUE;
+        -:  133:
+    #####:  134:      if (JMEM_CP_GET_FIRST_BIT_FROM_POINTER_TAG (capability_with_tag))
+        -:  135:      {
+    #####:  136:        handler = *buffer_p++;
+        -:  137:      }
+        -:  138:
+    #####:  139:      ecma_enqueue_promise_reaction_job (capability, handler, value);
+        -:  140:    }
+    #####:  141:    else if (JMEM_CP_GET_FIRST_BIT_FROM_POINTER_TAG (capability_with_tag))
+        -:  142:    {
+    #####:  143:      buffer_p++;
+        -:  144:    }
+        -:  145:
+    #####:  146:    if (is_reject)
+        -:  147:    {
+    #####:  148:      ecma_value_t handler = ECMA_VALUE_FALSE;
+        -:  149:
+    #####:  150:      if (JMEM_CP_GET_SECOND_BIT_FROM_POINTER_TAG (capability_with_tag))
+        -:  151:      {
+    #####:  152:        handler = *buffer_p++;
+        -:  153:      }
+        -:  154:
+    #####:  155:      ecma_enqueue_promise_reaction_job (capability, handler, value);
+        -:  156:    }
+    #####:  157:    else if (JMEM_CP_GET_SECOND_BIT_FROM_POINTER_TAG (capability_with_tag))
+        -:  158:    {
+    #####:  159:      buffer_p++;
+        -:  160:    }
+        -:  161:  }
+     1308:  162:} /* ecma_promise_trigger_reactions */
+        -:  163:
+        -:  164:/**
+        -:  165: * Reject a Promise with a reason.
+        -:  166: *
+        -:  167: * See also: ES2015 25.4.1.7
+        -:  168: */
+        -:  169:static void
+     1308:  170:ecma_reject_promise (ecma_value_t promise, /**< promise */
+        -:  171:                     ecma_value_t reason) /**< reason for reject */
+        -:  172:{
+     1308:  173:  ecma_object_t *obj_p = ecma_get_object_from_value (promise);
+        -:  174:
+     1308:  175:  JERRY_ASSERT (ecma_promise_get_flags (obj_p) & ECMA_PROMISE_IS_PENDING);
+        -:  176:
+    #####:  177:  ecma_promise_set_state (obj_p, false);
+     1308:  178:  ecma_promise_set_result (obj_p, ecma_copy_value_if_not_object (reason));
+     1308:  179:  ecma_promise_object_t *promise_p = (ecma_promise_object_t *) obj_p;
+        -:  180:
+        -:  181:  /* GC can be triggered by ecma_new_collection so freeing the collection
+        -:  182:     first and creating a new one might cause a heap after use event. */
+     1308:  183:  ecma_collection_t *reactions = promise_p->reactions;
+        -:  184:
+        -:  185:  /* Fulfill reactions will never be triggered. */
+     1308:  186:  ecma_promise_trigger_reactions (reactions, reason, true);
+        -:  187:
+     1308:  188:  promise_p->reactions = ecma_new_collection ();
+        -:  189:
+     1308:  190:  ecma_collection_destroy (reactions);
+     1308:  191:} /* ecma_reject_promise */
+        -:  192:
+        -:  193:/**
+        -:  194: * Fulfill a Promise with a value.
+        -:  195: *
+        -:  196: * See also: ES2015 25.4.1.4
+        -:  197: */
+        -:  198:static void
+    #####:  199:ecma_fulfill_promise (ecma_value_t promise, /**< promise */
+        -:  200:                      ecma_value_t value) /**< fulfilled value */
+        -:  201:{
+    #####:  202:  ecma_object_t *obj_p = ecma_get_object_from_value (promise);
+        -:  203:
+    #####:  204:  JERRY_ASSERT (ecma_promise_get_flags (obj_p) & ECMA_PROMISE_IS_PENDING);
+        -:  205:
+    #####:  206:  ecma_promise_set_state (obj_p, true);
+    #####:  207:  ecma_promise_set_result (obj_p, ecma_copy_value_if_not_object (value));
+    #####:  208:  ecma_promise_object_t *promise_p = (ecma_promise_object_t *) obj_p;
+        -:  209:
+        -:  210:  /* GC can be triggered by ecma_new_collection so freeing the collection
+        -:  211:     first and creating a new one might cause a heap after use event. */
+    #####:  212:  ecma_collection_t *reactions = promise_p->reactions;
+        -:  213:
+        -:  214:  /* Reject reactions will never be triggered. */
+    #####:  215:  ecma_promise_trigger_reactions (reactions, value, false);
+        -:  216:
+    #####:  217:  promise_p->reactions = ecma_new_collection ();
+        -:  218:
+    #####:  219:  ecma_collection_destroy (reactions);
+    #####:  220:} /* ecma_fulfill_promise */
+        -:  221:
+        -:  222:/**
+        -:  223: * Native handler for Promise Reject Function.
+        -:  224: *
+        -:  225: * See also: ES2015 25.4.1.3.1
+        -:  226: *
+        -:  227: * @return ecma value of undefined.
+        -:  228: */
+        -:  229:static ecma_value_t
+     1308:  230:ecma_promise_reject_handler (const ecma_value_t function, /**< the function itself */
+        -:  231:                             const ecma_value_t this, /**< this_arg of the function */
+        -:  232:                             const ecma_value_t argv[], /**< argument list */
+        -:  233:                             const ecma_length_t argc) /**< argument number */
+        -:  234:{
+        -:  235:  JERRY_UNUSED (this);
+        -:  236:
+     1308:  237:  ecma_object_t *function_p = ecma_get_object_from_value (function);
+        -:  238:  /* 2. */
+     1308:  239:  ecma_value_t promise = ecma_op_object_get_by_magic_id (function_p, LIT_INTERNAL_MAGIC_STRING_PROMISE);
+        -:  240:  /* 1. */
+     1308:  241:  ecma_object_t *promise_obj_p = ecma_get_object_from_value (promise);
+     1308:  242:  JERRY_ASSERT (ecma_is_promise (promise_obj_p));
+        -:  243:
+        -:  244:  /* 3., 4. */
+     1308:  245:  if (ecma_promise_get_flags (promise_obj_p) & ECMA_PROMISE_ALREADY_RESOLVED)
+        -:  246:  {
+    #####:  247:    ecma_free_value (promise);
+    #####:  248:    return ECMA_VALUE_UNDEFINED;
+        -:  249:  }
+        -:  250:
+        -:  251:  /* 5. */
+     1308:  252:  ((ecma_extended_object_t *) promise_obj_p)->u.class_prop.extra_info |= ECMA_PROMISE_ALREADY_RESOLVED;
+        -:  253:
+        -:  254:  /* 6. */
+     1308:  255:  ecma_value_t reject_value = (argc == 0) ? ECMA_VALUE_UNDEFINED : argv[0];
+     1308:  256:  ecma_reject_promise (promise, reject_value);
+     1308:  257:  ecma_free_value (promise);
+     1308:  258:  return ECMA_VALUE_UNDEFINED;
+        -:  259:} /* ecma_promise_reject_handler */
+        -:  260:
+        -:  261:/**
+        -:  262: * Native handler for Promise Resolve Function.
+        -:  263: *
+        -:  264: * See also: ES2015 25.4.1.3.2
+        -:  265: *
+        -:  266: * @return ecma value of undefined.
+        -:  267: */
+        -:  268:static ecma_value_t
+    #####:  269:ecma_promise_resolve_handler (const ecma_value_t function, /**< the function itself */
+        -:  270:                              const ecma_value_t this, /**< this_arg of the function */
+        -:  271:                              const ecma_value_t argv[], /**< argument list */
+        -:  272:                              const ecma_length_t argc) /**< argument number */
+        -:  273:{
+        -:  274:  JERRY_UNUSED (this);
+        -:  275:
+    #####:  276:  ecma_object_t *function_p = ecma_get_object_from_value (function);
+        -:  277:  /* 2. */
+    #####:  278:  ecma_value_t promise = ecma_op_object_get_by_magic_id (function_p, LIT_INTERNAL_MAGIC_STRING_PROMISE);
+        -:  279:  /* 1. */
+    #####:  280:  ecma_object_t *promise_obj_p = ecma_get_object_from_value (promise);
+    #####:  281:  JERRY_ASSERT (ecma_is_promise (promise_obj_p));
+        -:  282:
+        -:  283:  /* 3., 4. */
+    #####:  284:  if (ecma_promise_get_flags (promise_obj_p) & ECMA_PROMISE_ALREADY_RESOLVED)
+        -:  285:  {
+    #####:  286:    goto end_of_resolve_function;
+        -:  287:  }
+        -:  288:
+        -:  289:  /* 5. */
+    #####:  290:  ((ecma_extended_object_t *) promise_obj_p)->u.class_prop.extra_info |= ECMA_PROMISE_ALREADY_RESOLVED;
+        -:  291:
+        -:  292:  /* If the argc is 0, then fulfill the `undefined`. */
+    #####:  293:  if (argc == 0)
+        -:  294:  {
+    #####:  295:    ecma_fulfill_promise (promise, ECMA_VALUE_UNDEFINED);
+    #####:  296:    goto end_of_resolve_function;
+        -:  297:  }
+        -:  298:
+        -:  299:  /* 6. */
+    #####:  300:  if (argv[0] == promise)
+        -:  301:  {
+    #####:  302:    ecma_object_t *error_p = ecma_new_standard_error (ECMA_ERROR_TYPE);
+    #####:  303:    ecma_reject_promise (promise, ecma_make_object_value (error_p));
+    #####:  304:    ecma_deref_object (error_p);
+    #####:  305:    goto end_of_resolve_function;
+        -:  306:  }
+        -:  307:
+        -:  308:  /* 7. */
+    #####:  309:  if (!ecma_is_value_object (argv[0]))
+        -:  310:  {
+    #####:  311:    ecma_fulfill_promise (promise, argv[0]);
+    #####:  312:    goto end_of_resolve_function;
+        -:  313:  }
+        -:  314:
+        -:  315:  /* 8. */
+    #####:  316:  ecma_value_t then = ecma_op_object_get_by_magic_id (ecma_get_object_from_value (argv[0]),
+        -:  317:                                                      LIT_MAGIC_STRING_THEN);
+        -:  318:
+    #####:  319:  if (ECMA_IS_VALUE_ERROR (then))
+        -:  320:  {
+        -:  321:    /* 9. */
+    #####:  322:    then = jcontext_take_exception ();
+    #####:  323:    ecma_reject_promise (promise, then);
+        -:  324:  }
+    #####:  325:  else if (!ecma_op_is_callable (then))
+        -:  326:  {
+        -:  327:    /* 11 .*/
+    #####:  328:    ecma_fulfill_promise (promise, argv[0]);
+        -:  329:  }
+        -:  330:  else
+        -:  331:  {
+        -:  332:    /* 12 */
+    #####:  333:    ecma_enqueue_promise_resolve_thenable_job (promise, argv[0], then);
+        -:  334:  }
+        -:  335:
+    #####:  336:  ecma_free_value (then);
+        -:  337:
+    #####:  338:end_of_resolve_function:
+    #####:  339:  ecma_free_value (promise);
+    #####:  340:  return ECMA_VALUE_UNDEFINED;
+        -:  341:} /* ecma_promise_resolve_handler */
+        -:  342:
+        -:  343:/**
+        -:  344: * CapabilitiesExecutor Function.
+        -:  345: *
+        -:  346: * See also: ES2015 25.4.1.5.1
+        -:  347: *
+        -:  348: * @return ecma value of undefined or typerror.
+        -:  349: *         Returned value must be freed with ecma_free_value
+        -:  350: */
+        -:  351:static ecma_value_t
+    #####:  352:ecma_call_builtin_executor (ecma_object_t *executor_p, /**< the executor object */
+        -:  353:                            ecma_value_t resolve_func, /**< the resolve function */
+        -:  354:                            ecma_value_t reject_func) /**< the reject function */
+        -:  355:{
+    #####:  356:  ecma_string_t *capability_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_CAPABILITY);
+    #####:  357:  ecma_string_t *resolve_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_RESOLVE);
+    #####:  358:  ecma_string_t *reject_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_REJECT);
+        -:  359:
+        -:  360:  /* 2. */
+    #####:  361:  ecma_value_t capability = ecma_op_object_get (executor_p, capability_str_p);
+        -:  362:  /* 3. */
+    #####:  363:  ecma_value_t resolve = ecma_op_object_get (ecma_get_object_from_value (capability), resolve_str_p);
+        -:  364:
+    #####:  365:  if (resolve != ECMA_VALUE_UNDEFINED)
+        -:  366:  {
+    #####:  367:    ecma_free_value (resolve);
+    #####:  368:    ecma_free_value (capability);
+        -:  369:
+    #####:  370:    return ecma_raise_type_error (ECMA_ERR_MSG ("'resolve' function should be undefined."));
+        -:  371:  }
+        -:  372:
+        -:  373:  /* 4. */
+    #####:  374:  ecma_value_t reject = ecma_op_object_get (ecma_get_object_from_value (capability), reject_str_p);
+        -:  375:
+    #####:  376:  if (reject != ECMA_VALUE_UNDEFINED)
+        -:  377:  {
+    #####:  378:    ecma_free_value (reject);
+    #####:  379:    ecma_free_value (capability);
+        -:  380:
+    #####:  381:    return ecma_raise_type_error (ECMA_ERR_MSG ("'reject' function should be undefined."));
+        -:  382:  }
+        -:  383:
+        -:  384:  /* 5. */
+    #####:  385:  ecma_op_object_put (ecma_get_object_from_value (capability),
+        -:  386:                      resolve_str_p,
+        -:  387:                      resolve_func,
+        -:  388:                      false);
+        -:  389:  /* 6. */
+    #####:  390:  ecma_op_object_put (ecma_get_object_from_value (capability),
+        -:  391:                      reject_str_p,
+        -:  392:                      reject_func,
+        -:  393:                      false);
+        -:  394:
+    #####:  395:  ecma_free_value (capability);
+        -:  396:
+    #####:  397:  return ECMA_VALUE_UNDEFINED;
+        -:  398:} /* ecma_call_builtin_executor */
+        -:  399:
+        -:  400:/**
+        -:  401: * Helper function for PromiseCreateResovingFucntions.
+        -:  402: *
+        -:  403: * See also: ES2015 25.4.1.3 2. - 7.
+        -:  404: *
+        -:  405: * @return pointer to the resolving function
+        -:  406: */
+        -:  407:static ecma_value_t
+     2618:  408:ecma_promise_create_resolving_functions_helper (ecma_object_t *obj_p, /**< Promise Object */
+        -:  409:                                                ecma_external_handler_t handler_cb) /**< Callback handler */
+        -:  410:{
+     2618:  411:  ecma_string_t *str_promise_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE);
+     2618:  412:  ecma_object_t *func_obj_p = ecma_op_create_external_function_object (handler_cb);
+        -:  413:
+     2618:  414:  ecma_op_object_put (func_obj_p,
+        -:  415:                      str_promise_p,
+        -:  416:                      ecma_make_object_value (obj_p),
+        -:  417:                      false);
+        -:  418:
+     2618:  419:  return ecma_make_object_value (func_obj_p);
+        -:  420:} /* ecma_promise_create_resolving_functions_helper */
+        -:  421:
+        -:  422:/**
+        -:  423: * Create a PromiseCreateResovingFucntions.
+        -:  424: *
+        -:  425: * See also: ES2015 25.4.1.3
+        -:  426: *
+        -:  427: * @return pointer to the resolving functions
+        -:  428: */
+        -:  429:void
+     1309:  430:ecma_promise_create_resolving_functions (ecma_object_t *object_p, /**< the promise object */
+        -:  431:                                         ecma_promise_resolving_functions_t *funcs) /**< [out] resolving functions */
+        -:  432:{
+        -:  433:  /* 2. - 4. */
+     1309:  434:  funcs->resolve = ecma_promise_create_resolving_functions_helper (object_p,
+        -:  435:                                                                   ecma_promise_resolve_handler);
+        -:  436:
+        -:  437:  /* 5. - 7. */
+     1309:  438:  funcs->reject = ecma_promise_create_resolving_functions_helper (object_p,
+        -:  439:                                                                  ecma_promise_reject_handler);
+     1309:  440:} /* ecma_promise_create_resolving_functions */
+        -:  441:
+        -:  442:/**
+        -:  443: * Free the heap and the member of the resolving functions.
+        -:  444: */
+        -:  445:void
+     1308:  446:ecma_promise_free_resolving_functions (ecma_promise_resolving_functions_t *funcs) /**< points to the functions */
+        -:  447:{
+     1308:  448:  ecma_free_value (funcs->resolve);
+     1308:  449:  ecma_free_value (funcs->reject);
+     1308:  450:} /* ecma_promise_free_resolving_functions */
+        -:  451:
+        -:  452:/**
+        -:  453: * Create a promise object.
+        -:  454: *
+        -:  455: * See also: ES2015 25.4.3.1
+        -:  456: *
+        -:  457: * @return ecma value of the new promise object
+        -:  458: *         Returned value must be freed with ecma_free_value
+        -:  459: */
+        -:  460:ecma_value_t
+     1309:  461:ecma_op_create_promise_object (ecma_value_t executor, /**< the executor function or object */
+        -:  462:                               ecma_promise_executor_type_t type) /**< indicates the type of executor */
+        -:  463:{
+     1309:  464:  JERRY_ASSERT (JERRY_CONTEXT (current_new_target) != NULL);
+        -:  465:  /* 3. */
+     1309:  466:  ecma_object_t *proto_p = ecma_op_get_prototype_from_constructor (JERRY_CONTEXT (current_new_target),
+        -:  467:                                                                   ECMA_BUILTIN_ID_PROMISE_PROTOTYPE);
+        -:  468:
+     1309:  469:  if (JERRY_UNLIKELY (proto_p == NULL))
+        -:  470:  {
+    #####:  471:    return ECMA_VALUE_ERROR;
+        -:  472:  }
+        -:  473:
+        -:  474:  /* Calling ecma_new_collection might trigger a GC call, so this
+        -:  475:   * allocation is performed before the object is constructed. */
+     1309:  476:  ecma_collection_t *reactions = ecma_new_collection ();
+        -:  477:
+     1309:  478:  ecma_object_t *object_p = ecma_create_object (proto_p,
+        -:  479:                                                sizeof (ecma_promise_object_t),
+        -:  480:                                                ECMA_OBJECT_TYPE_CLASS);
+     1309:  481:  ecma_deref_object (proto_p);
+     1309:  482:  ecma_extended_object_t *ext_object_p = (ecma_extended_object_t *) object_p;
+     1309:  483:  ext_object_p->u.class_prop.class_id = LIT_MAGIC_STRING_PROMISE_UL;
+        -:  484:  /* 5 */
+     1309:  485:  ext_object_p->u.class_prop.extra_info = ECMA_PROMISE_IS_PENDING;
+     1309:  486:  ext_object_p->u.class_prop.u.value = ECMA_VALUE_UNDEFINED;
+     1309:  487:  ecma_promise_object_t *promise_object_p = (ecma_promise_object_t *) object_p;
+        -:  488:
+        -:  489:  /* 6-7. */
+     1309:  490:  promise_object_p->reactions = reactions;
+        -:  491:  /* 8. */
+     1309:  492:  ecma_promise_resolving_functions_t funcs;
+     1309:  493:  ecma_promise_create_resolving_functions (object_p, &funcs);
+        -:  494:
+     1309:  495:  ecma_string_t *str_resolve_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_RESOLVE_FUNCTION);
+     1309:  496:  ecma_string_t *str_reject_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_REJECT_FUNCTION);
+        -:  497:
+     1309:  498:  ecma_op_object_put (object_p,
+        -:  499:                      str_resolve_p,
+        -:  500:                      funcs.resolve,
+        -:  501:                      false);
+     1309:  502:  ecma_op_object_put (object_p,
+        -:  503:                      str_reject_p,
+        -:  504:                      funcs.reject,
+        -:  505:                      false);
+        -:  506:
+        -:  507:  /* 9. */
+     1309:  508:  ecma_value_t completion = ECMA_VALUE_UNDEFINED;
+        -:  509:
+     1309:  510:  if (type == ECMA_PROMISE_EXECUTOR_FUNCTION)
+        -:  511:  {
+     1309:  512:    JERRY_ASSERT (ecma_op_is_callable (executor));
+        -:  513:
+     1309:  514:    ecma_value_t argv[] = { funcs.resolve, funcs.reject };
+     1309:  515:    completion = ecma_op_function_call (ecma_get_object_from_value (executor),
+        -:  516:                                        ECMA_VALUE_UNDEFINED,
+        -:  517:                                        argv,
+        -:  518:                                        2);
+        -:  519:  }
+    #####:  520:  else if (type == ECMA_PROMISE_EXECUTOR_OBJECT)
+        -:  521:  {
+    #####:  522:    JERRY_ASSERT (ecma_is_value_object (executor));
+        -:  523:
+    #####:  524:    completion = ecma_call_builtin_executor (ecma_get_object_from_value (executor),
+        -:  525:                                             funcs.resolve,
+        -:  526:                                             funcs.reject);
+        -:  527:  }
+        -:  528:  else
+        -:  529:  {
+    #####:  530:    JERRY_ASSERT (type == ECMA_PROMISE_EXECUTOR_EMPTY);
+        -:  531:    JERRY_UNUSED (executor);
+        -:  532:  }
+        -:  533:
+     1308:  534:  ecma_value_t status = ECMA_VALUE_EMPTY;
+        -:  535:
+     1308:  536:  if (ECMA_IS_VALUE_ERROR (completion))
+        -:  537:  {
+        -:  538:    /* 10.a. */
+     1308:  539:    completion = jcontext_take_exception ();
+     1308:  540:    status = ecma_op_function_call (ecma_get_object_from_value (funcs.reject),
+        -:  541:                                    ECMA_VALUE_UNDEFINED,
+        -:  542:                                    &completion,
+        -:  543:                                    1);
+        -:  544:  }
+        -:  545:
+     1308:  546:  ecma_promise_free_resolving_functions (&funcs);
+     1308:  547:  ecma_free_value (completion);
+        -:  548:
+        -:  549:  /* 10.b. */
+     1308:  550:  if (ECMA_IS_VALUE_ERROR (status))
+        -:  551:  {
+    #####:  552:    ecma_deref_object (object_p);
+    #####:  553:    return status;
+        -:  554:  }
+        -:  555:
+        -:  556:  /* 11. */
+     1308:  557:  ecma_free_value (status);
+        -:  558:
+     1308:  559:  return ecma_make_object_value (object_p);
+        -:  560:} /* ecma_op_create_promise_object */
+        -:  561:
+        -:  562:/**
+        -:  563: * 25.4.1.5.1 GetCapabilitiesExecutor Functions
+        -:  564: *
+        -:  565: * Checks and sets a promiseCapability's resolve and reject properties.
+        -:  566: *
+        -:  567: * @return ECMA_VALUE_UNDEFINED or TypeError
+        -:  568: *         returned value must be freed with ecma_free_value
+        -:  569: */
+        -:  570:static ecma_value_t
+    #####:  571:ecma_op_get_capabilities_executor_cb (const ecma_value_t function_obj, /**< the function itself */
+        -:  572:                                      const ecma_value_t this_val, /**< this_arg of the function */
+        -:  573:                                      const ecma_value_t args_p[], /**< argument list */
+        -:  574:                                      const ecma_length_t args_count) /**< argument number */
+        -:  575:{
+        -:  576:  JERRY_UNUSED (this_val);
+        -:  577:  /* 1. */
+    #####:  578:  ecma_value_t capability = ecma_op_object_get_by_magic_id (ecma_get_object_from_value (function_obj),
+        -:  579:                                                            LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_CAPABILITY);
+    #####:  580:  JERRY_ASSERT (ecma_is_value_object (capability));
+        -:  581:
+        -:  582:  /* 2. */
+    #####:  583:  ecma_object_t *capability_obj_p = ecma_get_object_from_value (capability);
+        -:  584:
+        -:  585:  /* 3. */
+    #####:  586:  ecma_value_t resolve = ecma_op_object_get_by_magic_id (capability_obj_p,
+        -:  587:                                                         LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_RESOLVE);
+        -:  588:
+    #####:  589:  if (!ecma_is_value_undefined (resolve))
+        -:  590:  {
+    #####:  591:    ecma_free_value (resolve);
+    #####:  592:    ecma_deref_object (capability_obj_p);
+        -:  593:
+    #####:  594:    return ecma_raise_type_error (ECMA_ERR_MSG ("Resolve must be undefined"));
+        -:  595:  }
+        -:  596:
+        -:  597:  /* 4. */
+    #####:  598:  ecma_value_t reject = ecma_op_object_get_by_magic_id (capability_obj_p,
+        -:  599:                                                        LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_REJECT);
+        -:  600:
+    #####:  601:  if (!ecma_is_value_undefined (reject))
+        -:  602:  {
+    #####:  603:    ecma_free_value (reject);
+    #####:  604:    ecma_deref_object (capability_obj_p);
+        -:  605:
+    #####:  606:    return ecma_raise_type_error (ECMA_ERR_MSG ("Reject must be undefined"));
+        -:  607:  }
+        -:  608:
+        -:  609:  /* 5. */
+    #####:  610:  ecma_op_object_put (capability_obj_p,
+        -:  611:                      ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_RESOLVE),
+        -:  612:                      args_count > 0 ? args_p[0] : ECMA_VALUE_UNDEFINED,
+        -:  613:                      false);
+        -:  614:
+        -:  615:  /* 6. */
+    #####:  616:  ecma_op_object_put (capability_obj_p,
+        -:  617:                      ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_REJECT),
+    #####:  618:                      args_count > 1 ? args_p[1] : ECMA_VALUE_UNDEFINED,
+        -:  619:                      false);
+        -:  620:
+    #####:  621:  ecma_deref_object (capability_obj_p);
+        -:  622:
+        -:  623:  /* 7. */
+    #####:  624:  return ECMA_VALUE_UNDEFINED;
+        -:  625:} /* ecma_op_get_capabilities_executor_cb */
+        -:  626:
+        -:  627:/**
+        -:  628: * Create a new PromiseCapability.
+        -:  629: *
+        -:  630: * See also: ES2015 25.4.1.5
+        -:  631: *
+        -:  632: * @return ecma value of the new PromiseCapability
+        -:  633: *         Returned value must be freed with ecma_free_value
+        -:  634: */
+        -:  635:ecma_value_t
+    #####:  636:ecma_promise_new_capability (ecma_value_t constructor)
+        -:  637:{
+        -:  638:  /* 1. */
+    #####:  639:  if (!ecma_is_constructor (constructor))
+        -:  640:  {
+    #####:  641:    return ecma_raise_type_error (ECMA_ERR_MSG ("Invalid capability"));
+        -:  642:  }
+        -:  643:
+    #####:  644:  ecma_object_t *constructor_obj_p = ecma_get_object_from_value (constructor);
+        -:  645:  /* 3. */
+    #####:  646:  ecma_object_t *capability_p = ecma_op_create_object_object_noarg ();
+        -:  647:
+    #####:  648:  ecma_string_t *capability_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_CAPABILITY);
+    #####:  649:  ecma_string_t *promise_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_PROMISE);
+        -:  650:  /* 4. */
+    #####:  651:  ecma_object_t *executor_p = ecma_op_create_external_function_object (ecma_op_get_capabilities_executor_cb);
+    #####:  652:  ecma_value_t executor = ecma_make_object_value (executor_p);
+        -:  653:  /* 5. */
+    #####:  654:  ecma_op_object_put (executor_p,
+        -:  655:                      capability_str_p,
+        -:  656:                      ecma_make_object_value (capability_p),
+        -:  657:                      false);
+        -:  658:
+        -:  659:  /* 6. */
+    #####:  660:  ecma_value_t promise = ecma_op_function_construct (constructor_obj_p,
+        -:  661:                                                     constructor_obj_p,
+        -:  662:                                                     &executor,
+        -:  663:                                                     1);
+    #####:  664:  ecma_deref_object (executor_p);
+        -:  665:
+        -:  666:  /* 7. */
+    #####:  667:  if (ECMA_IS_VALUE_ERROR (promise))
+        -:  668:  {
+    #####:  669:    ecma_deref_object (capability_p);
+    #####:  670:    return promise;
+        -:  671:  }
+        -:  672:
+        -:  673:  /* 10. */
+    #####:  674:  ecma_op_object_put (capability_p,
+        -:  675:                      promise_str_p,
+        -:  676:                      promise,
+        -:  677:                      false);
+        -:  678:
+    #####:  679:  ecma_free_value (promise);
+        -:  680:
+        -:  681:  /* 8. */
+    #####:  682:  ecma_string_t *resolve_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_RESOLVE);
+    #####:  683:  ecma_value_t resolve = ecma_op_object_get (capability_p, resolve_str_p);
+        -:  684:
+    #####:  685:  if (!ecma_op_is_callable (resolve))
+        -:  686:  {
+    #####:  687:    ecma_free_value (resolve);
+    #####:  688:    ecma_deref_object (capability_p);
+    #####:  689:    return ecma_raise_type_error (ECMA_ERR_MSG ("'resolve' parameter must be callable."));
+        -:  690:  }
+        -:  691:
+    #####:  692:  ecma_free_value (resolve);
+        -:  693:  /* 9. */
+    #####:  694:  ecma_string_t *reject_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_REJECT);
+    #####:  695:  ecma_value_t reject = ecma_op_object_get (capability_p, reject_str_p);
+        -:  696:
+    #####:  697:  if (!ecma_op_is_callable (reject))
+        -:  698:  {
+    #####:  699:    ecma_free_value (reject);
+    #####:  700:    ecma_deref_object (capability_p);
+    #####:  701:    return ecma_raise_type_error (ECMA_ERR_MSG ("'reject' parameter must be callable."));
+        -:  702:  }
+        -:  703:
+    #####:  704:  ecma_free_value (reject);
+        -:  705:  /* 11. */
+    #####:  706:  return ecma_make_object_value (capability_p);
+        -:  707:} /* ecma_promise_new_capability */
+        -:  708:
+        -:  709:/**
+        -:  710: * The common function for 'reject' and 'resolve'.
+        -:  711: *
+        -:  712: * @return ecma value
+        -:  713: *         Returned value must be freed with ecma_free_value.
+        -:  714: */
+        -:  715:ecma_value_t
+    #####:  716:ecma_promise_reject_or_resolve (ecma_value_t this_arg, /**< "this" argument */
+        -:  717:                                ecma_value_t value, /**< rejected or resolved value */
+        -:  718:                                bool is_resolve) /**< the operation is resolve */
+        -:  719:{
+    #####:  720:  if (!ecma_is_value_object (this_arg))
+        -:  721:  {
+    #####:  722:    return ecma_raise_type_error (ECMA_ERR_MSG ("'this' is not an object."));
+        -:  723:  }
+        -:  724:
+    #####:  725:  if (is_resolve
+    #####:  726:      && ecma_is_value_object (value)
+    #####:  727:      && ecma_is_promise (ecma_get_object_from_value (value)))
+        -:  728:  {
+    #####:  729:    ecma_object_t *object_p = ecma_get_object_from_value (value);
+    #####:  730:    ecma_value_t constructor = ecma_op_object_get_by_magic_id (object_p, LIT_MAGIC_STRING_CONSTRUCTOR);
+        -:  731:
+    #####:  732:    if (ECMA_IS_VALUE_ERROR (constructor))
+        -:  733:    {
+    #####:  734:      return constructor;
+        -:  735:    }
+        -:  736:
+        -:  737:    /* The this_arg must be an object. */
+    #####:  738:    bool is_same_value = (constructor == this_arg);
+    #####:  739:    ecma_free_value (constructor);
+        -:  740:
+    #####:  741:    if (is_same_value)
+        -:  742:    {
+    #####:  743:      return ecma_copy_value (value);
+        -:  744:    }
+        -:  745:  }
+        -:  746:
+    #####:  747:  ecma_value_t capability = ecma_promise_new_capability (this_arg);
+        -:  748:
+    #####:  749:  if (ECMA_IS_VALUE_ERROR (capability))
+        -:  750:  {
+    #####:  751:    return capability;
+        -:  752:  }
+        -:  753:
+        -:  754:  ecma_string_t *property_str_p;
+        -:  755:
+    #####:  756:  if (is_resolve)
+        -:  757:  {
+    #####:  758:    property_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_RESOLVE);
+        -:  759:  }
+        -:  760:  else
+        -:  761:  {
+    #####:  762:    property_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_REJECT);
+        -:  763:  }
+        -:  764:
+    #####:  765:  ecma_value_t func = ecma_op_object_get (ecma_get_object_from_value (capability), property_str_p);
+        -:  766:
+    #####:  767:  ecma_value_t call_ret = ecma_op_function_call (ecma_get_object_from_value (func),
+        -:  768:                                                 ECMA_VALUE_UNDEFINED,
+        -:  769:                                                 &value,
+        -:  770:                                                 1);
+        -:  771:
+    #####:  772:  ecma_free_value (func);
+        -:  773:
+    #####:  774:  if (ECMA_IS_VALUE_ERROR (call_ret))
+        -:  775:  {
+    #####:  776:    return call_ret;
+        -:  777:  }
+        -:  778:
+    #####:  779:  ecma_free_value (call_ret);
+        -:  780:
+    #####:  781:  ecma_string_t *promise_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_PROMISE);
+    #####:  782:  ecma_value_t promise = ecma_op_object_get (ecma_get_object_from_value (capability), promise_str_p);
+    #####:  783:  ecma_free_value (capability);
+        -:  784:
+    #####:  785:  return promise;
+        -:  786:} /* ecma_promise_reject_or_resolve */
+        -:  787:
+        -:  788:/**
+        -:  789: * It performs the "then" operation on promiFulfilled
+        -:  790: * and onRejected as its settlement actions.
+        -:  791: *
+        -:  792: * See also: 25.4.5.3.1
+        -:  793: *
+        -:  794: * @return ecma value of the new promise object
+        -:  795: *         Returned value must be freed with ecma_free_value
+        -:  796: */
+        -:  797:static ecma_value_t
+    #####:  798:ecma_promise_do_then (ecma_value_t promise, /**< the promise which call 'then' */
+        -:  799:                      ecma_value_t on_fulfilled, /**< on_fulfilled function */
+        -:  800:                      ecma_value_t on_rejected, /**< on_rejected function */
+        -:  801:                      ecma_value_t result_capability) /**< promise capability */
+        -:  802:{
+    #####:  803:  ecma_string_t *promise_str_p = ecma_get_magic_string (LIT_INTERNAL_MAGIC_STRING_PROMISE_PROPERTY_PROMISE);
+        -:  804:
+        -:  805:  /* 3. boolean true indicates "indentity" */
+    #####:  806:  if (!ecma_op_is_callable (on_fulfilled))
+        -:  807:  {
+    #####:  808:    on_fulfilled = ECMA_VALUE_TRUE;
+        -:  809:  }
+        -:  810:
+        -:  811:  /* 4. boolean false indicates "thrower" */
+    #####:  812:  if (!ecma_op_is_callable (on_rejected))
+        -:  813:  {
+    #####:  814:    on_rejected = ECMA_VALUE_FALSE;
+        -:  815:  }
+        -:  816:
+    #####:  817:  ecma_object_t *promise_obj_p = ecma_get_object_from_value (promise);
+    #####:  818:  ecma_promise_object_t *promise_p = (ecma_promise_object_t *) promise_obj_p;
+        -:  819:
+    #####:  820:  uint16_t flags = ecma_promise_get_flags (promise_obj_p);
+        -:  821:
+    #####:  822:  if (flags & ECMA_PROMISE_IS_PENDING)
+        -:  823:  {
+        -:  824:    /* 7. */
+        -:  825:    ecma_value_t capability_with_tag;
+    #####:  826:    ECMA_SET_NON_NULL_POINTER_TAG (capability_with_tag, ecma_get_object_from_value (result_capability), 0);
+        -:  827:
+    #####:  828:    if (on_fulfilled != ECMA_VALUE_TRUE)
+        -:  829:    {
+    #####:  830:      ECMA_SET_FIRST_BIT_TO_POINTER_TAG (capability_with_tag);
+        -:  831:    }
+        -:  832:
+    #####:  833:    if (on_rejected != ECMA_VALUE_FALSE)
+        -:  834:    {
+    #####:  835:      ECMA_SET_SECOND_BIT_TO_POINTER_TAG (capability_with_tag);
+        -:  836:    }
+        -:  837:
+    #####:  838:    ecma_collection_push_back (promise_p->reactions, capability_with_tag);
+        -:  839:
+    #####:  840:    if (on_fulfilled != ECMA_VALUE_TRUE)
+        -:  841:    {
+    #####:  842:      ecma_collection_push_back (promise_p->reactions, on_fulfilled);
+        -:  843:    }
+        -:  844:
+    #####:  845:    if (on_rejected != ECMA_VALUE_FALSE)
+        -:  846:    {
+    #####:  847:      ecma_collection_push_back (promise_p->reactions, on_rejected);
+        -:  848:    }
+        -:  849:  }
+    #####:  850:  else if (flags & ECMA_PROMISE_IS_FULFILLED)
+        -:  851:  {
+        -:  852:    /* 8. */
+    #####:  853:    ecma_value_t value = ecma_promise_get_result (promise_obj_p);
+    #####:  854:    ecma_enqueue_promise_reaction_job (result_capability, on_fulfilled, value);
+    #####:  855:    ecma_free_value (value);
+        -:  856:  }
+        -:  857:  else
+        -:  858:  {
+        -:  859:    /* 9. */
+    #####:  860:    ecma_value_t reason = ecma_promise_get_result (promise_obj_p);
+    #####:  861:    ecma_enqueue_promise_reaction_job (result_capability, on_rejected, reason);
+    #####:  862:    ecma_free_value (reason);
+        -:  863:  }
+        -:  864:
+        -:  865:  /* 10. */
+    #####:  866:  return ecma_op_object_get (ecma_get_object_from_value (result_capability), promise_str_p);
+        -:  867:} /* ecma_promise_do_then */
+        -:  868:
+        -:  869:/**
+        -:  870: * The common function for ecma_builtin_promise_prototype_then
+        -:  871: * and ecma_builtin_promise_prototype_catch.
+        -:  872: *
+        -:  873: * @return ecma value of a new promise object.
+        -:  874: *         Returned value must be freed with ecma_free_value.
+        -:  875: */
+        -:  876:ecma_value_t
+    #####:  877:ecma_promise_then (ecma_value_t promise, /**< the promise which call 'then' */
+        -:  878:                   ecma_value_t on_fulfilled, /**< on_fulfilled function */
+        -:  879:                   ecma_value_t on_rejected) /**< on_rejected function */
+        -:  880:{
+    #####:  881:  if (!ecma_is_value_object (promise))
+        -:  882:  {
+    #####:  883:    return ecma_raise_type_error (ECMA_ERR_MSG ("'this' is not an object."));
+        -:  884:  }
+        -:  885:
+    #####:  886:  ecma_object_t *obj = ecma_get_object_from_value (promise);
+        -:  887:
+    #####:  888:  if (!ecma_is_promise (obj))
+        -:  889:  {
+    #####:  890:    return ecma_raise_type_error (ECMA_ERR_MSG ("'this' is not a Promise."));
+        -:  891:  }
+        -:  892:
+    #####:  893:  ecma_value_t species = ecma_op_species_constructor (obj, ECMA_BUILTIN_ID_PROMISE);
+    #####:  894:  if (ECMA_IS_VALUE_ERROR (species))
+        -:  895:  {
+    #####:  896:    return species;
+        -:  897:  }
+        -:  898:
+    #####:  899:  ecma_value_t result_capability = ecma_promise_new_capability (species);
+    #####:  900:  ecma_free_value (species);
+        -:  901:
+    #####:  902:  if (ECMA_IS_VALUE_ERROR (result_capability))
+        -:  903:  {
+    #####:  904:    return result_capability;
+        -:  905:  }
+        -:  906:
+    #####:  907:  ecma_value_t ret = ecma_promise_do_then (promise, on_fulfilled, on_rejected, result_capability);
+    #####:  908:  ecma_free_value (result_capability);
+        -:  909:
+    #####:  910:  return ret;
+        -:  911:} /* ecma_promise_then */
+        -:  912:
+        -:  913:/**
+        -:  914: * @}
+        -:  915: * @}
+        -:  916: */
+        -:  917:#endif /* ENABLED (JERRY_ES2015_BUILTIN_PROMISE) */
