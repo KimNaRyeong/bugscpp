@@ -4,7 +4,9 @@ import sys
 sys.path.insert(0, '../bugscpp')
 from command import CommandList
 
+import json
 from whatthepatch import parse_patch
+import clang.cindex
 
 class BugscppInterface():
     def __init__(self, project, bug_index):
@@ -13,6 +15,7 @@ class BugscppInterface():
         self._bug_index = bug_index
         self._path_to_repo = f'benchmark/{self._project}/buggy-{self._bug_index}'
         self._prepare_test_output_directory()
+        self._compile_options = self._load_compile_commands()
     
     def __str__(self):
         return f'{self._project}-{self._bug_index}'
@@ -30,6 +33,17 @@ class BugscppInterface():
                     os.remove(file_path)
         except Exception as e:
             print(f"An error occurred while clearing test output: {e}")
+
+    def _load_compile_commands(self):
+        path_to_commands = os.path.join(self._path_to_repo, 'compile_commands.json')
+        with open(path_to_commands) as f:
+            return json.load(f)
+    
+    def get_corresponding_compile_options(self, target_file):
+        for options in self._compile_options:
+            if options['file'].endswith(target_file):
+                return sorted([arg for arg in options['arguments'] if arg.startswith('-D') or arg.startswith('-I') or arg.startswith('-std')])
+        return list()
 
     def checkout(self):
         checkout_args = [self._project, self._bug_index, '--buggy', '--target=benchmark']
@@ -80,10 +94,6 @@ class BugscppInterface():
                 patch_data[path] = fixed_lines
         return patch_data
     
-
-import json
-import clang.cindex
-
 def get_corresponding_code(cursor):
     start_location = cursor.extent.start
     end_location = cursor.extent.end
@@ -138,8 +148,12 @@ def get_coverage_file(coverage_dir, src_file, root_dir):
 def collect_snippet(target_bugs):
     def iterate_over_source(src_path, consider_coverage=True):
         index = clang.cindex.Index.create()
-        standard = 'c11'
-        translation_unit = index.parse(src_path, args=[f'-std={standard}'])
+        compile_options = bugscpp.get_corresponding_compile_options(src_path)
+        if not compile_options[-1].startswith('-std'):
+            standard = 'c11'
+            compile_options.append(f'-std={standard}') # assume only C for now
+
+        translation_unit = index.parse(src_path, args=compile_options)
 
         relative_path = src_path[len(repo_path) + 1:]
         gcov_path = get_coverage_file(coverage_path, relative_path, src_dir)
@@ -147,7 +161,6 @@ def collect_snippet(target_bugs):
             return
         execution_count = parse_gcov_file(gcov_path)
         class_name = relative_path[:-2].replace('/', '.') # should I trim src, too? -> no
-
         for node in translation_unit.cursor.walk_preorder():
             if node.kind == clang.cindex.CursorKind.FUNCTION_DECL and node.is_definition(): # to exclude empty functions that came from headers
                 start_line = node.extent.start.line
@@ -195,7 +208,7 @@ def collect_snippet(target_bugs):
         coverage_path = bugscpp.get_path_to_coverages()
         patch_info = bugscpp.extract_patch_info()
 
-        src_dir = 'libyara' # for libchewing, libyara for yara
+        src_dir = 'jerry-core' # for libchewing, libyara for yara
         test_dir = 'tests' # for libchewing, tests for yara
         
         data = list()
@@ -279,4 +292,4 @@ def collect_jerryscript_extra_test(bug_index):
         json.dump(data, f, indent=4)
 
 if __name__ == "__main__":
-    collect_jerryscript_extra_test(1)
+    collect_snippet([('jerryscript', '1')])
