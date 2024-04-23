@@ -36,8 +36,11 @@ class BugscppInterface():
 
     def _load_compile_commands(self):
         path_to_commands = os.path.join(self._path_to_repo, 'compile_commands.json')
-        with open(path_to_commands) as f:
-            return json.load(f)
+        try:
+            with open(path_to_commands) as f:
+                return json.load(f)
+        except:
+            return list()
     
     def get_corresponding_compile_options(self, target_file):
         for options in self._compile_options:
@@ -149,7 +152,7 @@ def collect_snippet(target_bugs):
     def iterate_over_source(src_path, consider_coverage=True):
         index = clang.cindex.Index.create()
         compile_options = bugscpp.get_corresponding_compile_options(src_path)
-        if not compile_options[-1].startswith('-std'):
+        if not compile_options or not compile_options[-1].startswith('-std'):
             standard = 'c11'
             compile_options.append(f'-std={standard}') # assume only C for now
 
@@ -208,7 +211,7 @@ def collect_snippet(target_bugs):
         coverage_path = bugscpp.get_path_to_coverages()
         patch_info = bugscpp.extract_patch_info()
 
-        src_dir = 'jerry-core' # for libchewing, libyara for yara
+        src_dir = 'md4c' # for libchewing, libyara for yara, md4c and md2html for md4c
         test_dir = 'tests' # for libchewing, tests for yara
         
         data = list()
@@ -291,5 +294,23 @@ def collect_jerryscript_extra_test(bug_index):
     with open(os.path.join(data_dir, 'test_snippet.json'), 'w') as f:
         json.dump(data, f, indent=4)
 
+def collect_md4c_extra_test(bug_index, start_line, end_line):
+    path_to_repo = f'benchmark/md4c/buggy-{bug_index}'
+    data = list()
+    with open(os.path.join(path_to_repo, 'test', 'tables.txt')) as f: # source file depends on bug e.g. test/coverage.txt for 3 & 10
+        test_code = f.readlines()[start_line - 1:end_line]
+        line_count = len(test_code)
+        data.append({'name' : 'test.test#1', \
+                     'src_path': 'test.md', \
+                     'class_name': 'test', \
+                     'signature': 'test.test()', \
+                     'snippet': ''.join(test_code), \
+                     'begin_line': 1, \
+                     'end_line': line_count, \
+                     'is_bug': False})   
+    data_dir = f'data/md4c-{bug_index}'
+    with open(os.path.join(data_dir, 'test_snippet.json'), 'w') as f:
+        json.dump(data, f, indent=4)
+
 if __name__ == "__main__":
-    collect_snippet([('jerryscript', '1')])
+    collect_md4c_extra_test(1, 290, 309)
