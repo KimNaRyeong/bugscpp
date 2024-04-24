@@ -211,7 +211,7 @@ def collect_snippet(target_bugs):
         coverage_path = bugscpp.get_path_to_coverages()
         patch_info = bugscpp.extract_patch_info()
 
-        src_dir = 'md4c' # for libchewing, libyara for yara, md4c and md2html for md4c
+        src_dir = 'libtiff' # for libchewing, libyara for yara, md4c and md2html for md4c, libtiff and tools for libtiff_sanitizer
         test_dir = 'tests' # for libchewing, tests for yara
         
         data = list()
@@ -312,5 +312,23 @@ def collect_md4c_extra_test(bug_index, start_line, end_line):
     with open(os.path.join(data_dir, 'test_snippet.json'), 'w') as f:
         json.dump(data, f, indent=4)
 
+
+def collect_libtiff_sanitizer_extra_test(bug_index):
+    data = list()
+    test_script = 'bash -c \"tools/tiff2pdf 00112-libtiff-heapoverflow-_TIFFmemcpy 2>&1 | tee test_result; grep -q AddressSanitizer test_result; [ $? -eq 1 ]\"'
+    # manually copied from the meta.json, removed dpp prefix for clarity
+
+    data.append({'name' : 'test.test#1', \
+                    'src_path': 'test.sh', \
+                    'class_name': 'test', \
+                    'signature': 'test.test()', \
+                    'snippet': test_script, \
+                    'begin_line': 1, \
+                    'end_line': 1, \
+                    'is_bug': False})   
+    data_dir = f'data/libtiff_sanitizer-{bug_index}'
+    with open(os.path.join(data_dir, 'test_snippet.json'), 'w') as f:
+        json.dump(data, f, indent=4)
+
 if __name__ == "__main__":
-    collect_md4c_extra_test(1, 290, 309)
+    collect_libtiff_sanitizer_extra_test(2)

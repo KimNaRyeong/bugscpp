@@ -1,0 +1,890 @@
+        -:    0:Source:tiffdump.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1988-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:#include "tif_config.h"
+        -:   28:
+        -:   29:#include <stdio.h>
+        -:   30:#include <stdlib.h>
+        -:   31:#include <string.h>
+        -:   32:
+        -:   33:#ifdef HAVE_UNISTD_H
+        -:   34:# include <unistd.h>
+        -:   35:#endif
+        -:   36:
+        -:   37:#include "tiffiop.h"
+        -:   38:
+        -:   39:#ifdef HAVE_FCNTL_H
+        -:   40:# include <fcntl.h>
+        -:   41:#endif
+        -:   42:
+        -:   43:#ifdef HAVE_SYS_TYPES_H
+        -:   44:# include <sys/types.h>
+        -:   45:#endif
+        -:   46:
+        -:   47:#ifdef HAVE_IO_H
+        -:   48:# include <io.h>
+        -:   49:#endif
+        -:   50:
+        -:   51:#ifdef NEED_LIBPORT
+        -:   52:# include "libport.h"
+        -:   53:#endif
+        -:   54:
+        -:   55:#ifndef HAVE_GETOPT
+        -:   56:extern int getopt(int, char**, char*);
+        -:   57:#endif
+        -:   58:
+        -:   59:#include "tiffio.h"
+        -:   60:
+        -:   61:#ifndef O_BINARY
+        -:   62:# define O_BINARY	0
+        -:   63:#endif
+        -:   64:
+        -:   65:static union
+        -:   66:{
+        -:   67:	TIFFHeaderClassic classic;
+        -:   68:	TIFFHeaderBig big;
+        -:   69:	TIFFHeaderCommon common;
+        -:   70:} hdr;
+        -:   71:char* appname;
+        -:   72:char* curfile;
+        -:   73:int swabflag;
+        -:   74:int bigendian;
+        -:   75:int bigtiff;
+        -:   76:uint32 maxitems = 24;   /* maximum indirect data items to print */
+        -:   77:
+        -:   78:const char* bytefmt = "%s%#02x";	/* BYTE */
+        -:   79:const char* sbytefmt = "%s%d";		/* SBYTE */
+        -:   80:const char* shortfmt = "%s%u";		/* SHORT */
+        -:   81:const char* sshortfmt = "%s%d";		/* SSHORT */
+        -:   82:const char* longfmt = "%s%lu";		/* LONG */
+        -:   83:const char* slongfmt = "%s%ld";		/* SLONG */
+        -:   84:const char* ifdfmt = "%s%#04lx";	/* IFD offset */
+        -:   85:#if defined(__WIN32__) && (defined(_MSC_VER) || defined(__MINGW32__))
+        -:   86:const char* long8fmt = "%s%I64u";	/* LONG8 */
+        -:   87:const char* slong8fmt = "%s%I64d";	/* SLONG8 */
+        -:   88:const char* ifd8fmt = "%s%#08I64x";	/* IFD offset8*/
+        -:   89:#else
+        -:   90:const char* long8fmt = "%s%llu";	/* LONG8 */
+        -:   91:const char* slong8fmt = "%s%lld";	/* SLONG8 */
+        -:   92:const char* ifd8fmt = "%s%#08llx";	/* IFD offset8*/
+        -:   93:#endif
+        -:   94:const char* rationalfmt = "%s%g";	/* RATIONAL */
+        -:   95:const char* srationalfmt = "%s%g";	/* SRATIONAL */
+        -:   96:const char* floatfmt = "%s%g";		/* FLOAT */
+        -:   97:const char* doublefmt = "%s%g";		/* DOUBLE */
+        -:   98:
+        -:   99:static void dump(int, uint64);
+        -:  100:
+        -:  101:#if !HAVE_DECL_OPTARG
+        -:  102:extern int optind;
+        -:  103:extern char* optarg;
+        -:  104:#endif
+        -:  105:
+        -:  106:void
+    #####:  107:usage()
+        -:  108:{
+    #####:  109:	fprintf(stderr, "usage: %s [-h] [-o offset] [-m maxitems] file.tif ...\n", appname);
+    #####:  110:	exit(-1);
+        -:  111:}
+        -:  112:
+        -:  113:int
+    #####:  114:main(int argc, char* argv[])
+        -:  115:{
+    #####:  116:	int one = 1, fd;
+    #####:  117:	int multiplefiles = (argc > 1);
+        -:  118:	int c;
+    #####:  119:	uint64 diroff = 0;
+    #####:  120:	bigendian = (*(char *)&one == 0);
+        -:  121:
+    #####:  122:	appname = argv[0];
+    #####:  123:	while ((c = getopt(argc, argv, "m:o:h")) != -1) {
+    #####:  124:		switch (c) {
+    #####:  125:		case 'h':			/* print values in hex */
+    #####:  126:			shortfmt = "%s%#x";
+    #####:  127:			sshortfmt = "%s%#x";
+    #####:  128:			longfmt = "%s%#lx";
+    #####:  129:			slongfmt = "%s%#lx";
+    #####:  130:			break;
+    #####:  131:		case 'o':
+    #####:  132:			diroff = (uint64) strtoul(optarg, NULL, 0);
+    #####:  133:			break;
+    #####:  134:		case 'm':
+    #####:  135:			maxitems = strtoul(optarg, NULL, 0);
+    #####:  136:			break;
+    #####:  137:		default:
+    #####:  138:			usage();
+        -:  139:		}
+        -:  140:	}
+    #####:  141:	if (optind >= argc)
+    #####:  142:		usage();
+    #####:  143:	for (; optind < argc; optind++) {
+    #####:  144:		fd = open(argv[optind], O_RDONLY|O_BINARY, 0);
+    #####:  145:		if (fd < 0) {
+    #####:  146:			perror(argv[0]);
+    #####:  147:			return (-1);
+        -:  148:		}
+    #####:  149:		if (multiplefiles)
+    #####:  150:			printf("%s:\n", argv[optind]);
+    #####:  151:		curfile = argv[optind];
+    #####:  152:		swabflag = 0;
+    #####:  153:		bigtiff = 0;
+    #####:  154:		dump(fd, diroff);
+    #####:  155:		close(fd);
+        -:  156:	}
+    #####:  157:	return (0);
+        -:  158:}
+        -:  159:
+        -:  160:#define ord(e) ((int)e)
+        -:  161:
+        -:  162:static uint64 ReadDirectory(int, unsigned, uint64);
+        -:  163:static void ReadError(char*);
+        -:  164:static void Error(const char*, ...);
+        -:  165:static void Fatal(const char*, ...);
+        -:  166:
+        -:  167:static void
+    #####:  168:dump(int fd, uint64 diroff)
+        -:  169:{
+        -:  170:	unsigned i, j;
+    #####:  171:	uint64* visited_diroff = NULL;
+    #####:  172:	unsigned int count_visited_dir = 0;
+        -:  173:
+    #####:  174:	_TIFF_lseek_f(fd, (_TIFF_off_t) 0, 0);
+    #####:  175:	if (read(fd, (char*) &hdr, sizeof (TIFFHeaderCommon)) != sizeof (TIFFHeaderCommon))
+    #####:  176:		ReadError("TIFF header");
+    #####:  177:	if (hdr.common.tiff_magic != TIFF_BIGENDIAN
+    #####:  178:	    && hdr.common.tiff_magic != TIFF_LITTLEENDIAN &&
+        -:  179:#if HOST_BIGENDIAN
+        -:  180:	    /* MDI is sensitive to the host byte order, unlike TIFF */
+        -:  181:	    MDI_BIGENDIAN != hdr.common.tiff_magic
+        -:  182:#else
+    #####:  183:	    MDI_LITTLEENDIAN != hdr.common.tiff_magic
+        -:  184:#endif
+        -:  185:	   ) {
+    #####:  186:		Fatal("Not a TIFF or MDI file, bad magic number %u (%#x)",
+    #####:  187:		    hdr.common.tiff_magic, hdr.common.tiff_magic);
+        -:  188:	}
+    #####:  189:	if (hdr.common.tiff_magic == TIFF_BIGENDIAN
+    #####:  190:	    || hdr.common.tiff_magic == MDI_BIGENDIAN)
+    #####:  191:		swabflag = !bigendian;
+        -:  192:	else
+    #####:  193:		swabflag = bigendian;
+    #####:  194:	if (swabflag)
+    #####:  195:		TIFFSwabShort(&hdr.common.tiff_version);
+    #####:  196:	if (hdr.common.tiff_version==42)
+        -:  197:	{
+    #####:  198:		if (read(fd, (char*) &hdr.classic.tiff_diroff, 4) != 4)
+    #####:  199:			ReadError("TIFF header");
+    #####:  200:		if (swabflag)
+    #####:  201:			TIFFSwabLong(&hdr.classic.tiff_diroff);
+    #####:  202:		printf("Magic: %#x <%s-endian> Version: %#x <%s>\n",
+    #####:  203:		    hdr.classic.tiff_magic,
+    #####:  204:		    hdr.classic.tiff_magic == TIFF_BIGENDIAN ? "big" : "little",
+        -:  205:		    42,"ClassicTIFF");
+    #####:  206:		if (diroff == 0)
+    #####:  207:			diroff = hdr.classic.tiff_diroff;
+        -:  208:	}
+    #####:  209:	else if (hdr.common.tiff_version==43)
+        -:  210:	{
+    #####:  211:		if (read(fd, (char*) &hdr.big.tiff_offsetsize, 12) != 12)
+    #####:  212:			ReadError("TIFF header");
+    #####:  213:		if (swabflag)
+        -:  214:		{
+    #####:  215:			TIFFSwabShort(&hdr.big.tiff_offsetsize);
+    #####:  216:			TIFFSwabShort(&hdr.big.tiff_unused);
+    #####:  217:			TIFFSwabLong8(&hdr.big.tiff_diroff);
+        -:  218:		}
+    #####:  219:		printf("Magic: %#x <%s-endian> Version: %#x <%s>\n",
+    #####:  220:		    hdr.big.tiff_magic,
+    #####:  221:		    hdr.big.tiff_magic == TIFF_BIGENDIAN ? "big" : "little",
+        -:  222:		    43,"BigTIFF");
+    #####:  223:		printf("OffsetSize: %#x Unused: %#x\n",
+    #####:  224:		    hdr.big.tiff_offsetsize,hdr.big.tiff_unused);
+    #####:  225:		if (diroff == 0)
+    #####:  226:			diroff = hdr.big.tiff_diroff;
+    #####:  227:		bigtiff = 1;
+        -:  228:	}
+        -:  229:	else
+    #####:  230:		Fatal("Not a TIFF file, bad version number %u (%#x)",
+    #####:  231:		    hdr.common.tiff_version, hdr.common.tiff_version);
+    #####:  232:	for (i = 0; diroff != 0; i++) {
+    #####:  233:		for(j=0; j<count_visited_dir; j++)
+        -:  234:		{
+    #####:  235:		    if( visited_diroff[j] == diroff )
+        -:  236:		    {
+    #####:  237:			free(visited_diroff);
+    #####:  238:			Fatal("Cycle detected in chaining of TIFF directories!");
+        -:  239:		    }
+        -:  240:		}
+        -:  241:                {
+        -:  242:                    size_t alloc_size;
+    #####:  243:                    alloc_size=TIFFSafeMultiply(tmsize_t,(count_visited_dir + 1),
+        -:  244:                                                sizeof(uint64));
+    #####:  245:                    if (alloc_size == 0)
+        -:  246:                    {
+    #####:  247:                        if (visited_diroff)
+    #####:  248:                            free(visited_diroff);
+    #####:  249:                        visited_diroff = 0;
+        -:  250:                    }
+        -:  251:                    else
+        -:  252:                    {
+    #####:  253:                        visited_diroff = (uint64*) realloc(visited_diroff,alloc_size);
+        -:  254:                    }
+        -:  255:                }
+    #####:  256:		if( !visited_diroff )
+    #####:  257:		    Fatal("Out of memory");
+    #####:  258:		visited_diroff[count_visited_dir] = diroff;
+    #####:  259:		count_visited_dir ++;
+        -:  260:
+    #####:  261:		if (i > 0)
+    #####:  262:			putchar('\n');
+    #####:  263:		diroff = ReadDirectory(fd, i, diroff);
+        -:  264:	}
+    #####:  265:	if( visited_diroff )
+    #####:  266:	    free(visited_diroff);
+    #####:  267:}
+        -:  268:
+        -:  269:static const int datawidth[] = {
+        -:  270:	0, /* 00 = undefined */
+        -:  271:	1, /* 01 = TIFF_BYTE */
+        -:  272:	1, /* 02 = TIFF_ASCII */
+        -:  273:	2, /* 03 = TIFF_SHORT */
+        -:  274:	4, /* 04 = TIFF_LONG */
+        -:  275:	8, /* 05 = TIFF_RATIONAL */
+        -:  276:	1, /* 06 = TIFF_SBYTE */
+        -:  277:	1, /* 07 = TIFF_UNDEFINED */
+        -:  278:	2, /* 08 = TIFF_SSHORT */
+        -:  279:	4, /* 09 = TIFF_SLONG */
+        -:  280:	8, /* 10 = TIFF_SRATIONAL */
+        -:  281:	4, /* 11 = TIFF_FLOAT */
+        -:  282:	8, /* 12 = TIFF_DOUBLE */
+        -:  283:	4, /* 13 = TIFF_IFD */
+        -:  284:	0, /* 14 = undefined */
+        -:  285:	0, /* 15 = undefined */
+        -:  286:	8, /* 16 = TIFF_LONG8 */
+        -:  287:	8, /* 17 = TIFF_SLONG8 */
+        -:  288:	8, /* 18 = TIFF_IFD8 */
+        -:  289:};
+        -:  290:#define NWIDTHS (sizeof (datawidth) / sizeof (datawidth[0]))
+        -:  291:static void PrintTag(FILE*, uint16);
+        -:  292:static void PrintType(FILE*, uint16);
+        -:  293:static void PrintData(FILE*, uint16, uint32, unsigned char*);
+        -:  294:
+        -:  295:/*
+        -:  296: * Read the next TIFF directory from a file
+        -:  297: * and convert it to the internal format.
+        -:  298: * We read directories sequentially.
+        -:  299: */
+        -:  300:static uint64
+    #####:  301:ReadDirectory(int fd, unsigned int ix, uint64 off)
+        -:  302:{
+    #####:  303:	uint16 dircount;
+        -:  304:	uint32 direntrysize;
+    #####:  305:	void* dirmem = NULL;
+    #####:  306:	uint64 nextdiroff = 0;
+        -:  307:	uint32 n;
+        -:  308:	uint8* dp;
+        -:  309:
+    #####:  310:	if (off == 0)			/* no more directories */
+    #####:  311:		goto done;
+    #####:  312:	if (_TIFF_lseek_f(fd, (_TIFF_off_t)off, SEEK_SET) != (_TIFF_off_t)off) {
+    #####:  313:		Fatal("Seek error accessing TIFF directory");
+    #####:  314:		goto done;
+        -:  315:	}
+    #####:  316:	if (!bigtiff) {
+    #####:  317:		if (read(fd, (char*) &dircount, sizeof (uint16)) != sizeof (uint16)) {
+    #####:  318:			ReadError("directory count");
+    #####:  319:			goto done;
+        -:  320:		}
+    #####:  321:		if (swabflag)
+    #####:  322:			TIFFSwabShort(&dircount);
+    #####:  323:		direntrysize = 12;
+        -:  324:	} else {
+    #####:  325:		uint64 dircount64 = 0;
+    #####:  326:		if (read(fd, (char*) &dircount64, sizeof (uint64)) != sizeof (uint64)) {
+    #####:  327:			ReadError("directory count");
+    #####:  328:			goto done;
+        -:  329:		}
+    #####:  330:		if (swabflag)
+    #####:  331:			TIFFSwabLong8(&dircount64);
+    #####:  332:		if (dircount64>0xFFFF) {
+    #####:  333:			Error("Sanity check on directory count failed");
+    #####:  334:			goto done;
+        -:  335:		}
+    #####:  336:		dircount = (uint16)dircount64;
+    #####:  337:		direntrysize = 20;
+        -:  338:	}
+    #####:  339:	dirmem = _TIFFmalloc(TIFFSafeMultiply(tmsize_t,dircount,direntrysize));
+    #####:  340:	if (dirmem == NULL) {
+    #####:  341:		Fatal("No space for TIFF directory");
+    #####:  342:		goto done;
+        -:  343:	}
+    #####:  344:	n = read(fd, (char*) dirmem, dircount*direntrysize);
+    #####:  345:	if (n != dircount*direntrysize) {
+    #####:  346:		n /= direntrysize;
+    #####:  347:		Error(
+        -:  348:#if defined(__WIN32__) && defined(_MSC_VER)
+        -:  349:	    "Could only read %lu of %u entries in directory at offset %#I64x",
+        -:  350:		      (unsigned long)n, dircount, (unsigned __int64) off);
+        -:  351:#else
+        -:  352:	    "Could only read %lu of %u entries in directory at offset %#llx",
+        -:  353:		      (unsigned long)n, dircount, (unsigned long long) off);
+        -:  354:#endif
+    #####:  355:		dircount = n;
+    #####:  356:		nextdiroff = 0;
+        -:  357:	} else {
+    #####:  358:		if (!bigtiff) {
+    #####:  359:			uint32 nextdiroff32;
+    #####:  360:			if (read(fd, (char*) &nextdiroff32, sizeof (uint32)) != sizeof (uint32))
+    #####:  361:				nextdiroff32 = 0;
+    #####:  362:			if (swabflag)
+    #####:  363:				TIFFSwabLong(&nextdiroff32);
+    #####:  364:			nextdiroff = nextdiroff32;
+        -:  365:		} else {
+    #####:  366:			if (read(fd, (char*) &nextdiroff, sizeof (uint64)) != sizeof (uint64))
+    #####:  367:				nextdiroff = 0;
+    #####:  368:			if (swabflag)
+    #####:  369:				TIFFSwabLong8(&nextdiroff);
+        -:  370:		}
+        -:  371:	}
+        -:  372:#if defined(__WIN32__) && (defined(_MSC_VER) || defined(__MINGW32__))
+        -:  373:	printf("Directory %u: offset %I64u (%#I64x) next %I64u (%#I64x)\n", ix,
+        -:  374:	    (unsigned __int64)off, (unsigned __int64)off,
+        -:  375:	    (unsigned __int64)nextdiroff, (unsigned __int64)nextdiroff);
+        -:  376:#else
+    #####:  377:	printf("Directory %u: offset %llu (%#llx) next %llu (%#llx)\n", ix,
+        -:  378:	    (unsigned long long)off, (unsigned long long)off,
+        -:  379:	    (unsigned long long)nextdiroff, (unsigned long long)nextdiroff);
+        -:  380:#endif
+    #####:  381:	for (dp = (uint8*)dirmem, n = dircount; n > 0; n--) {
+    #####:  382:		uint16 tag;
+    #####:  383:		uint16 type;
+        -:  384:		uint16 typewidth;
+    #####:  385:		uint64 count;
+        -:  386:		uint64 datasize;
+        -:  387:		int datafits;
+        -:  388:		void* datamem;
+    #####:  389:		uint64 dataoffset;
+        -:  390:		int datatruncated;
+        -:  391:                int datasizeoverflow;
+        -:  392:
+    #####:  393:		tag = *(uint16*)dp;
+    #####:  394:		if (swabflag)
+    #####:  395:			TIFFSwabShort(&tag);
+    #####:  396:		dp += sizeof(uint16);
+    #####:  397:		type = *(uint16*)dp;
+    #####:  398:		dp += sizeof(uint16);
+    #####:  399:		if (swabflag)
+    #####:  400:			TIFFSwabShort(&type);
+    #####:  401:		PrintTag(stdout, tag);
+    #####:  402:		putchar(' ');
+    #####:  403:		PrintType(stdout, type);
+    #####:  404:		putchar(' ');
+    #####:  405:		if (!bigtiff)
+        -:  406:		{
+    #####:  407:			uint32 count32;
+    #####:  408:			count32 = *(uint32*)dp;
+    #####:  409:			if (swabflag)
+    #####:  410:				TIFFSwabLong(&count32);
+    #####:  411:			dp += sizeof(uint32);
+    #####:  412:			count = count32;
+        -:  413:		}
+        -:  414:		else
+        -:  415:		{
+    #####:  416:			memcpy(&count, dp, sizeof(uint64));
+    #####:  417:			if (swabflag)
+    #####:  418:				TIFFSwabLong8(&count);
+    #####:  419:			dp += sizeof(uint64);
+        -:  420:		}
+        -:  421:#if defined(__WIN32__) && (defined(_MSC_VER) || defined(__MINGW32__))
+        -:  422:		printf("%I64u<", (unsigned __int64)count);
+        -:  423:#else
+    #####:  424:		printf("%llu<", (unsigned long long)count);
+        -:  425:#endif
+    #####:  426:		if (type >= NWIDTHS)
+    #####:  427:			typewidth = 0;
+        -:  428:		else
+    #####:  429:			typewidth = datawidth[type];
+    #####:  430:		datasize = TIFFSafeMultiply(tmsize_t,count,typewidth);
+    #####:  431:                datasizeoverflow = (typewidth > 0 && datasize / typewidth != count);
+    #####:  432:		datafits = 1;
+    #####:  433:		datamem = dp;
+    #####:  434:		dataoffset = 0;
+    #####:  435:		datatruncated = 0;
+    #####:  436:		if (!bigtiff)
+        -:  437:		{
+    #####:  438:			if (datasizeoverflow || datasize>4)
+        -:  439:			{
+    #####:  440:				uint32 dataoffset32;
+    #####:  441:				datafits = 0;
+    #####:  442:				datamem = NULL;
+    #####:  443:				dataoffset32 = *(uint32*)dp;
+    #####:  444:				if (swabflag)
+    #####:  445:					TIFFSwabLong(&dataoffset32);
+    #####:  446:				dataoffset = dataoffset32;
+        -:  447:			}
+    #####:  448:			dp += sizeof(uint32);
+        -:  449:		}
+        -:  450:		else
+        -:  451:		{
+    #####:  452:			if (datasizeoverflow || datasize>8)
+        -:  453:			{
+    #####:  454:				datafits = 0;
+    #####:  455:				datamem = NULL;
+    #####:  456:				dataoffset = *(uint64*)dp;
+    #####:  457:				if (swabflag)
+    #####:  458:					TIFFSwabLong8(&dataoffset);
+        -:  459:			}
+    #####:  460:			dp += sizeof(uint64);
+        -:  461:		}
+    #####:  462:		if (datasizeoverflow || datasize>0x10000)
+        -:  463:		{
+    #####:  464:			datatruncated = 1;
+    #####:  465:			count = 0x10000/typewidth;
+    #####:  466:			datasize = TIFFSafeMultiply(tmsize_t,count,typewidth);
+        -:  467:		}
+    #####:  468:		if (count>maxitems)
+        -:  469:		{
+    #####:  470:			datatruncated = 1;
+    #####:  471:			count = maxitems;
+    #####:  472:                        datasize = TIFFSafeMultiply(tmsize_t,count,typewidth);
+        -:  473:		}
+    #####:  474:		if (!datafits)
+        -:  475:		{
+    #####:  476:			datamem = _TIFFmalloc(datasize);
+    #####:  477:			if (datamem) {
+    #####:  478:				if (_TIFF_lseek_f(fd, (_TIFF_off_t)dataoffset, 0) !=
+        -:  479:				    (_TIFF_off_t)dataoffset)
+        -:  480:				{
+    #####:  481:					Error(
+        -:  482:				"Seek error accessing tag %u value", tag);
+    #####:  483:					_TIFFfree(datamem);
+    #####:  484:					datamem = NULL;
+        -:  485:				}
+    #####:  486:				else if (read(fd, datamem, (size_t)datasize) != (TIFF_SSIZE_T)datasize)
+        -:  487:				{
+    #####:  488:					Error(
+        -:  489:				"Read error accessing tag %u value", tag);
+    #####:  490:					_TIFFfree(datamem);
+    #####:  491:					datamem = NULL;
+        -:  492:				}
+        -:  493:			} else
+    #####:  494:				Error("No space for data for tag %u",tag);
+        -:  495:		}
+    #####:  496:		if (datamem)
+        -:  497:		{
+    #####:  498:			if (swabflag)
+        -:  499:			{
+    #####:  500:				switch (type)
+        -:  501:				{
+    #####:  502:					case TIFF_BYTE:
+        -:  503:					case TIFF_ASCII:
+        -:  504:					case TIFF_SBYTE:
+        -:  505:					case TIFF_UNDEFINED:
+    #####:  506:						break;
+    #####:  507:					case TIFF_SHORT:
+        -:  508:					case TIFF_SSHORT:
+    #####:  509:						TIFFSwabArrayOfShort((uint16*)datamem,(tmsize_t)count);
+    #####:  510:						break;
+    #####:  511:					case TIFF_LONG:
+        -:  512:					case TIFF_SLONG:
+        -:  513:					case TIFF_FLOAT:
+        -:  514:					case TIFF_IFD:
+    #####:  515:						TIFFSwabArrayOfLong((uint32*)datamem,(tmsize_t)count);
+    #####:  516:						break;
+    #####:  517:					case TIFF_RATIONAL:
+        -:  518:					case TIFF_SRATIONAL:
+    #####:  519:						TIFFSwabArrayOfLong((uint32*)datamem,(tmsize_t)count*2);
+    #####:  520:						break;
+    #####:  521:					case TIFF_DOUBLE:
+        -:  522:					case TIFF_LONG8:
+        -:  523:					case TIFF_SLONG8:
+        -:  524:					case TIFF_IFD8:
+    #####:  525:						TIFFSwabArrayOfLong8((uint64*)datamem,(tmsize_t)count);
+    #####:  526:						break;
+        -:  527:				}
+    #####:  528:			}
+    #####:  529:			PrintData(stdout,type,(uint32)count,datamem);
+    #####:  530:			if (datatruncated)
+    #####:  531:				printf(" ...");
+    #####:  532:			if (!datafits)
+        -:  533:                                {
+    #####:  534:                                        _TIFFfree(datamem);
+    #####:  535:                                        datamem = NULL;
+        -:  536:                                }
+        -:  537:		}
+    #####:  538:		printf(">\n");
+        -:  539:	}
+    #####:  540:done:
+    #####:  541:	if (dirmem)
+    #####:  542:		_TIFFfree((char *)dirmem);
+    #####:  543:	return (nextdiroff);
+        -:  544:}
+        -:  545:
+        -:  546:static const struct tagname {
+        -:  547:	uint16 tag;
+        -:  548:	const char* name;
+        -:  549:} tagnames[] = {
+        -:  550:    { TIFFTAG_SUBFILETYPE,	"SubFileType" },
+        -:  551:    { TIFFTAG_OSUBFILETYPE,	"OldSubFileType" },
+        -:  552:    { TIFFTAG_IMAGEWIDTH,	"ImageWidth" },
+        -:  553:    { TIFFTAG_IMAGELENGTH,	"ImageLength" },
+        -:  554:    { TIFFTAG_BITSPERSAMPLE,	"BitsPerSample" },
+        -:  555:    { TIFFTAG_COMPRESSION,	"Compression" },
+        -:  556:    { TIFFTAG_PHOTOMETRIC,	"Photometric" },
+        -:  557:    { TIFFTAG_THRESHHOLDING,	"Threshholding" },
+        -:  558:    { TIFFTAG_CELLWIDTH,	"CellWidth" },
+        -:  559:    { TIFFTAG_CELLLENGTH,	"CellLength" },
+        -:  560:    { TIFFTAG_FILLORDER,	"FillOrder" },
+        -:  561:    { TIFFTAG_DOCUMENTNAME,	"DocumentName" },
+        -:  562:    { TIFFTAG_IMAGEDESCRIPTION,	"ImageDescription" },
+        -:  563:    { TIFFTAG_MAKE,		"Make" },
+        -:  564:    { TIFFTAG_MODEL,		"Model" },
+        -:  565:    { TIFFTAG_STRIPOFFSETS,	"StripOffsets" },
+        -:  566:    { TIFFTAG_ORIENTATION,	"Orientation" },
+        -:  567:    { TIFFTAG_SAMPLESPERPIXEL,	"SamplesPerPixel" },
+        -:  568:    { TIFFTAG_ROWSPERSTRIP,	"RowsPerStrip" },
+        -:  569:    { TIFFTAG_STRIPBYTECOUNTS,	"StripByteCounts" },
+        -:  570:    { TIFFTAG_MINSAMPLEVALUE,	"MinSampleValue" },
+        -:  571:    { TIFFTAG_MAXSAMPLEVALUE,	"MaxSampleValue" },
+        -:  572:    { TIFFTAG_XRESOLUTION,	"XResolution" },
+        -:  573:    { TIFFTAG_YRESOLUTION,	"YResolution" },
+        -:  574:    { TIFFTAG_PLANARCONFIG,	"PlanarConfig" },
+        -:  575:    { TIFFTAG_PAGENAME,		"PageName" },
+        -:  576:    { TIFFTAG_XPOSITION,	"XPosition" },
+        -:  577:    { TIFFTAG_YPOSITION,	"YPosition" },
+        -:  578:    { TIFFTAG_FREEOFFSETS,	"FreeOffsets" },
+        -:  579:    { TIFFTAG_FREEBYTECOUNTS,	"FreeByteCounts" },
+        -:  580:    { TIFFTAG_GRAYRESPONSEUNIT,	"GrayResponseUnit" },
+        -:  581:    { TIFFTAG_GRAYRESPONSECURVE,"GrayResponseCurve" },
+        -:  582:    { TIFFTAG_GROUP3OPTIONS,	"Group3Options" },
+        -:  583:    { TIFFTAG_GROUP4OPTIONS,	"Group4Options" },
+        -:  584:    { TIFFTAG_RESOLUTIONUNIT,	"ResolutionUnit" },
+        -:  585:    { TIFFTAG_PAGENUMBER,	"PageNumber" },
+        -:  586:    { TIFFTAG_COLORRESPONSEUNIT,"ColorResponseUnit" },
+        -:  587:    { TIFFTAG_TRANSFERFUNCTION,	"TransferFunction" },
+        -:  588:    { TIFFTAG_SOFTWARE,		"Software" },
+        -:  589:    { TIFFTAG_DATETIME,		"DateTime" },
+        -:  590:    { TIFFTAG_ARTIST,		"Artist" },
+        -:  591:    { TIFFTAG_HOSTCOMPUTER,	"HostComputer" },
+        -:  592:    { TIFFTAG_PREDICTOR,	"Predictor" },
+        -:  593:    { TIFFTAG_WHITEPOINT,	"Whitepoint" },
+        -:  594:    { TIFFTAG_PRIMARYCHROMATICITIES,"PrimaryChromaticities" },
+        -:  595:    { TIFFTAG_COLORMAP,		"Colormap" },
+        -:  596:    { TIFFTAG_HALFTONEHINTS,	"HalftoneHints" },
+        -:  597:    { TIFFTAG_TILEWIDTH,	"TileWidth" },
+        -:  598:    { TIFFTAG_TILELENGTH,	"TileLength" },
+        -:  599:    { TIFFTAG_TILEOFFSETS,	"TileOffsets" },
+        -:  600:    { TIFFTAG_TILEBYTECOUNTS,	"TileByteCounts" },
+        -:  601:    { TIFFTAG_BADFAXLINES,	"BadFaxLines" },
+        -:  602:    { TIFFTAG_CLEANFAXDATA,	"CleanFaxData" },
+        -:  603:    { TIFFTAG_CONSECUTIVEBADFAXLINES, "ConsecutiveBadFaxLines" },
+        -:  604:    { TIFFTAG_SUBIFD,		"SubIFD" },
+        -:  605:    { TIFFTAG_INKSET,		"InkSet" },
+        -:  606:    { TIFFTAG_INKNAMES,		"InkNames" },
+        -:  607:    { TIFFTAG_NUMBEROFINKS,	"NumberOfInks" },
+        -:  608:    { TIFFTAG_DOTRANGE,		"DotRange" },
+        -:  609:    { TIFFTAG_TARGETPRINTER,	"TargetPrinter" },
+        -:  610:    { TIFFTAG_EXTRASAMPLES,	"ExtraSamples" },
+        -:  611:    { TIFFTAG_SAMPLEFORMAT,	"SampleFormat" },
+        -:  612:    { TIFFTAG_SMINSAMPLEVALUE,	"SMinSampleValue" },
+        -:  613:    { TIFFTAG_SMAXSAMPLEVALUE,	"SMaxSampleValue" },
+        -:  614:    { TIFFTAG_JPEGPROC,		"JPEGProcessingMode" },
+        -:  615:    { TIFFTAG_JPEGIFOFFSET,	"JPEGInterchangeFormat" },
+        -:  616:    { TIFFTAG_JPEGIFBYTECOUNT,	"JPEGInterchangeFormatLength" },
+        -:  617:    { TIFFTAG_JPEGRESTARTINTERVAL,"JPEGRestartInterval" },
+        -:  618:    { TIFFTAG_JPEGLOSSLESSPREDICTORS,"JPEGLosslessPredictors" },
+        -:  619:    { TIFFTAG_JPEGPOINTTRANSFORM,"JPEGPointTransform" },
+        -:  620:    { TIFFTAG_JPEGTABLES,       "JPEGTables" },
+        -:  621:    { TIFFTAG_JPEGQTABLES,	"JPEGQTables" },
+        -:  622:    { TIFFTAG_JPEGDCTABLES,	"JPEGDCTables" },
+        -:  623:    { TIFFTAG_JPEGACTABLES,	"JPEGACTables" },
+        -:  624:    { TIFFTAG_YCBCRCOEFFICIENTS,"YCbCrCoefficients" },
+        -:  625:    { TIFFTAG_YCBCRSUBSAMPLING,	"YCbCrSubsampling" },
+        -:  626:    { TIFFTAG_YCBCRPOSITIONING,	"YCbCrPositioning" },
+        -:  627:    { TIFFTAG_REFERENCEBLACKWHITE, "ReferenceBlackWhite" },
+        -:  628:    { TIFFTAG_REFPTS,		"IgReferencePoints (Island Graphics)" },
+        -:  629:    { TIFFTAG_REGIONTACKPOINT,	"IgRegionTackPoint (Island Graphics)" },
+        -:  630:    { TIFFTAG_REGIONWARPCORNERS,"IgRegionWarpCorners (Island Graphics)" },
+        -:  631:    { TIFFTAG_REGIONAFFINE,	"IgRegionAffine (Island Graphics)" },
+        -:  632:    { TIFFTAG_MATTEING,		"OBSOLETE Matteing (Silicon Graphics)" },
+        -:  633:    { TIFFTAG_DATATYPE,		"OBSOLETE DataType (Silicon Graphics)" },
+        -:  634:    { TIFFTAG_IMAGEDEPTH,	"ImageDepth (Silicon Graphics)" },
+        -:  635:    { TIFFTAG_TILEDEPTH,	"TileDepth (Silicon Graphics)" },
+        -:  636:    { 32768,			"OLD BOGUS Matteing tag" },
+        -:  637:    { TIFFTAG_COPYRIGHT,	"Copyright" },
+        -:  638:    { TIFFTAG_ICCPROFILE,	"ICC Profile" },
+        -:  639:    { TIFFTAG_JBIGOPTIONS,	"JBIG Options" },
+        -:  640:    { TIFFTAG_STONITS,		"StoNits" },
+        -:  641:};
+        -:  642:#define	NTAGS	(sizeof (tagnames) / sizeof (tagnames[0]))
+        -:  643:
+        -:  644:static void
+    #####:  645:PrintTag(FILE* fd, uint16 tag)
+        -:  646:{
+        -:  647:	const struct tagname *tp;
+        -:  648:
+    #####:  649:	for (tp = tagnames; tp < &tagnames[NTAGS]; tp++)
+    #####:  650:		if (tp->tag == tag) {
+    #####:  651:			fprintf(fd, "%s (%u)", tp->name, tag);
+    #####:  652:			return;
+        -:  653:		}
+    #####:  654:	fprintf(fd, "%u (%#x)", tag, tag);
+        -:  655:}
+        -:  656:
+        -:  657:static void
+    #####:  658:PrintType(FILE* fd, uint16 type)
+        -:  659:{
+        -:  660:	static const char *typenames[] = {
+        -:  661:	    "0",
+        -:  662:	    "BYTE",
+        -:  663:	    "ASCII",
+        -:  664:	    "SHORT",
+        -:  665:	    "LONG",
+        -:  666:	    "RATIONAL",
+        -:  667:	    "SBYTE",
+        -:  668:	    "UNDEFINED",
+        -:  669:	    "SSHORT",
+        -:  670:	    "SLONG",
+        -:  671:	    "SRATIONAL",
+        -:  672:	    "FLOAT",
+        -:  673:	    "DOUBLE",
+        -:  674:	    "IFD",
+        -:  675:	    "14",
+        -:  676:	    "15",
+        -:  677:	    "LONG8",
+        -:  678:	    "SLONG8",
+        -:  679:	    "IFD8"
+        -:  680:	};
+        -:  681:#define	NTYPES	(sizeof (typenames) / sizeof (typenames[0]))
+        -:  682:
+    #####:  683:	if (type < NTYPES)
+    #####:  684:		fprintf(fd, "%s (%u)", typenames[type], type);
+        -:  685:	else
+    #####:  686:		fprintf(fd, "%u (%#x)", type, type);
+    #####:  687:}
+        -:  688:#undef	NTYPES
+        -:  689:
+        -:  690:#include <ctype.h>
+        -:  691:
+        -:  692:static void
+    #####:  693:PrintASCII(FILE* fd, uint32 cc, const unsigned char* cp)
+        -:  694:{
+    #####:  695:	for (; cc > 0; cc--, cp++) {
+        -:  696:		const char* tp;
+        -:  697:
+    #####:  698:		if (isprint(*cp)) {
+    #####:  699:			fputc(*cp, fd);
+    #####:  700:			continue;
+        -:  701:		}
+    #####:  702:		for (tp = "\tt\bb\rr\nn\vv"; *tp; tp++)
+    #####:  703:			if (*tp++ == *cp)
+    #####:  704:				break;
+    #####:  705:		if (*tp)
+    #####:  706:			fprintf(fd, "\\%c", *tp);
+    #####:  707:		else if (*cp)
+    #####:  708:			fprintf(fd, "\\%03o", *cp);
+        -:  709:		else
+    #####:  710:			fprintf(fd, "\\0");
+        -:  711:	}
+    #####:  712:}
+        -:  713:
+        -:  714:static void
+    #####:  715:PrintData(FILE* fd, uint16 type, uint32 count, unsigned char* data)
+        -:  716:{
+    #####:  717:	char* sep = "";
+        -:  718:
+    #####:  719:	switch (type) {
+    #####:  720:	case TIFF_BYTE:
+    #####:  721:		while (count-- > 0)
+    #####:  722:			fprintf(fd, bytefmt, sep, *data++), sep = " ";
+    #####:  723:		break;
+    #####:  724:	case TIFF_SBYTE:
+    #####:  725:		while (count-- > 0)
+    #####:  726:			fprintf(fd, sbytefmt, sep, *(char *)data++), sep = " ";
+    #####:  727:		break;
+    #####:  728:	case TIFF_UNDEFINED:
+    #####:  729:		while (count-- > 0)
+    #####:  730:			fprintf(fd, bytefmt, sep, *data++), sep = " ";
+    #####:  731:		break;
+    #####:  732:	case TIFF_ASCII:
+    #####:  733:		PrintASCII(fd, count, data);
+    #####:  734:		break;
+    #####:  735:	case TIFF_SHORT: {
+    #####:  736:		uint16 *wp = (uint16*)data;
+    #####:  737:		while (count-- > 0)
+    #####:  738:			fprintf(fd, shortfmt, sep, *wp++), sep = " ";
+    #####:  739:		break;
+        -:  740:	}
+    #####:  741:	case TIFF_SSHORT: {
+    #####:  742:		int16 *wp = (int16*)data;
+    #####:  743:		while (count-- > 0)
+    #####:  744:			fprintf(fd, sshortfmt, sep, *wp++), sep = " ";
+    #####:  745:		break;
+        -:  746:	}
+    #####:  747:	case TIFF_LONG: {
+    #####:  748:		uint32 *lp = (uint32*)data;
+    #####:  749:		while (count-- > 0) {
+    #####:  750:			fprintf(fd, longfmt, sep, (unsigned long) *lp++);
+    #####:  751:			sep = " ";
+        -:  752:		}
+    #####:  753:		break;
+        -:  754:	}
+    #####:  755:	case TIFF_SLONG: {
+    #####:  756:		int32 *lp = (int32*)data;
+    #####:  757:		while (count-- > 0)
+    #####:  758:			fprintf(fd, slongfmt, sep, (long) *lp++), sep = " ";
+    #####:  759:		break;
+        -:  760:	}
+    #####:  761:	case TIFF_LONG8: {
+    #####:  762:		uint64 *llp = (uint64*)data;
+    #####:  763:		while (count-- > 0) {
+    #####:  764:                        uint64 val;
+    #####:  765:                        memcpy(&val, llp, sizeof(uint64));
+    #####:  766:                        llp ++;
+    #####:  767:			fprintf(fd, long8fmt, sep, val);
+    #####:  768:			sep = " ";
+        -:  769:		}
+    #####:  770:		break;
+        -:  771:	}
+    #####:  772:	case TIFF_SLONG8: {
+    #####:  773:		int64 *llp = (int64*)data;
+    #####:  774:		while (count-- > 0) {
+    #####:  775:                        int64 val;
+    #####:  776:                        memcpy(&val, llp, sizeof(int64));
+    #####:  777:                        llp ++;
+    #####:  778:                        fprintf(fd, slong8fmt, sep, val);
+    #####:  779:                        sep = " ";
+        -:  780:                }
+    #####:  781:		break;
+        -:  782:	}
+    #####:  783:	case TIFF_RATIONAL: {
+    #####:  784:		uint32 *lp = (uint32*)data;
+    #####:  785:		while (count-- > 0) {
+    #####:  786:			if (lp[1] == 0)
+    #####:  787:				fprintf(fd, "%sNan (%lu/%lu)", sep,
+    #####:  788:				    (unsigned long) lp[0],
+    #####:  789:				    (unsigned long) lp[1]);
+        -:  790:			else
+    #####:  791:				fprintf(fd, rationalfmt, sep,
+    #####:  792:				    (double)lp[0] / (double)lp[1]);
+    #####:  793:			sep = " ";
+    #####:  794:			lp += 2;
+        -:  795:		}
+    #####:  796:		break;
+        -:  797:	}
+    #####:  798:	case TIFF_SRATIONAL: {
+    #####:  799:		int32 *lp = (int32*)data;
+    #####:  800:		while (count-- > 0) {
+    #####:  801:			if (lp[1] == 0)
+    #####:  802:				fprintf(fd, "%sNan (%ld/%ld)", sep,
+    #####:  803:				    (long) lp[0], (long) lp[1]);
+        -:  804:			else
+    #####:  805:				fprintf(fd, srationalfmt, sep,
+    #####:  806:				    (double)lp[0] / (double)lp[1]);
+    #####:  807:			sep = " ";
+    #####:  808:			lp += 2;
+        -:  809:		}
+    #####:  810:		break;
+        -:  811:	}
+    #####:  812:	case TIFF_FLOAT: {
+    #####:  813:		float *fp = (float *)data;
+    #####:  814:		while (count-- > 0)
+    #####:  815:			fprintf(fd, floatfmt, sep, *fp++), sep = " ";
+    #####:  816:		break;
+        -:  817:	}
+    #####:  818:	case TIFF_DOUBLE: {
+    #####:  819:		double *dp = (double *)data;
+    #####:  820:		while (count-- > 0)
+    #####:  821:			fprintf(fd, doublefmt, sep, *dp++), sep = " ";
+    #####:  822:		break;
+        -:  823:	}
+    #####:  824:	case TIFF_IFD: {
+    #####:  825:		uint32 *lp = (uint32*)data;
+    #####:  826:		while (count-- > 0) {
+    #####:  827:			fprintf(fd, ifdfmt, sep, (unsigned long) *lp++);
+    #####:  828:			sep = " ";
+        -:  829:		}
+    #####:  830:		break;
+        -:  831:	}
+    #####:  832:	case TIFF_IFD8: {
+    #####:  833:		uint64 *llp = (uint64*)data;
+    #####:  834:		while (count-- > 0) {
+        -:  835:#if defined(__WIN32__) && defined(_MSC_VER)
+        -:  836:			fprintf(fd, ifd8fmt, sep, (unsigned __int64) *llp++);
+        -:  837:#else
+    #####:  838:			fprintf(fd, ifd8fmt, sep, (unsigned long long) *llp++);
+        -:  839:#endif
+    #####:  840:			sep = " ";
+        -:  841:		}
+    #####:  842:		break;
+        -:  843:	}
+        -:  844:	}
+    #####:  845:}
+        -:  846:
+        -:  847:static void
+    #####:  848:ReadError(char* what)
+        -:  849:{
+    #####:  850:	Fatal("Error while reading %s", what);
+    #####:  851:}
+        -:  852:
+        -:  853:#include <stdarg.h>
+        -:  854:
+        -:  855:static void
+    #####:  856:vError(FILE* fd, const char* fmt, va_list ap)
+        -:  857:{
+    #####:  858:	fprintf(fd, "%s: ", curfile);
+    #####:  859:	vfprintf(fd, fmt, ap);
+    #####:  860:	fprintf(fd, ".\n");
+    #####:  861:}
+        -:  862:
+        -:  863:static void
+    #####:  864:Error(const char* fmt, ...)
+        -:  865:{
+    #####:  866:	va_list ap;
+    #####:  867:	va_start(ap, fmt);
+    #####:  868:	vError(stderr, fmt, ap);
+    #####:  869:	va_end(ap);
+    #####:  870:}
+        -:  871:
+        -:  872:static void
+    #####:  873:Fatal(const char* fmt, ...)
+        -:  874:{
+    #####:  875:	va_list ap;
+    #####:  876:	va_start(ap, fmt);
+    #####:  877:	vError(stderr, fmt, ap);
+    #####:  878:	va_end(ap);
+    #####:  879:	exit(-1);
+        -:  880:}
+        -:  881:
+        -:  882:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  883:/*
+        -:  884: * Local Variables:
+        -:  885: * mode: c
+        -:  886: * c-basic-offset: 8
+        -:  887: * fill-column: 78
+        -:  888: * End:
+        -:  889: */

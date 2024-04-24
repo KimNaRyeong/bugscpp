@@ -1,0 +1,489 @@
+        -:    0:Source:fax2tiff.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1990-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:/* 
+        -:   28: * Convert a CCITT Group 3 or 4 FAX file to TIFF Group 3 or 4 format.
+        -:   29: */
+        -:   30:#include "tif_config.h"
+        -:   31:
+        -:   32:#include <stdio.h>
+        -:   33:#include <stdlib.h>		/* should have atof & getopt */
+        -:   34:
+        -:   35:#ifdef HAVE_UNISTD_H
+        -:   36:# include <unistd.h>
+        -:   37:#endif
+        -:   38:
+        -:   39:#ifdef HAVE_FCNTL_H
+        -:   40:# include <fcntl.h>
+        -:   41:#endif
+        -:   42:
+        -:   43:#ifdef HAVE_IO_H
+        -:   44:# include <io.h>
+        -:   45:#endif
+        -:   46:
+        -:   47:#ifdef NEED_LIBPORT
+        -:   48:# include "libport.h"
+        -:   49:#endif
+        -:   50:
+        -:   51:#include "tiffiop.h"
+        -:   52:
+        -:   53:#ifndef EXIT_SUCCESS
+        -:   54:# define EXIT_SUCCESS	0
+        -:   55:#endif
+        -:   56:#ifndef EXIT_FAILURE
+        -:   57:# define EXIT_FAILURE	1
+        -:   58:#endif
+        -:   59:
+        -:   60:#define TIFFhowmany8(x) (((x)&0x07)?((uint32)(x)>>3)+1:(uint32)(x)>>3)
+        -:   61:
+        -:   62:TIFF	*faxTIFF;
+        -:   63:char	*rowbuf;
+        -:   64:char	*refbuf;
+        -:   65:
+        -:   66:uint32	xsize = 1728;
+        -:   67:int	verbose;
+        -:   68:int	stretch;
+        -:   69:uint16	badfaxrun;
+        -:   70:uint32	badfaxlines;
+        -:   71:
+        -:   72:int	copyFaxFile(TIFF* tifin, TIFF* tifout);
+        -:   73:static	void usage(void);
+        -:   74:
+        -:   75:/*
+        -:   76:  Struct to carry client data.  Note that it does not appear that the client
+        -:   77:  data is actually used in this program.
+        -:   78:*/
+        -:   79:typedef struct _FAX_Client_Data
+        -:   80:{
+        -:   81:#if defined(_WIN32) && defined(USE_WIN32_FILEIO)
+        -:   82:        intptr_t fh; /* Operating system file handle */
+        -:   83:#else
+        -:   84:        int fd;      /* Integer file descriptor */
+        -:   85:#endif
+        -:   86:
+        -:   87:} FAX_Client_Data;
+        -:   88:
+        -:   89:int
+    #####:   90:main(int argc, char* argv[])
+        -:   91:{
+        -:   92:	FILE *in;
+    #####:   93:	TIFF *out = NULL;
+        -:   94:        FAX_Client_Data client_data;
+    #####:   95:	TIFFErrorHandler whandler = NULL;
+    #####:   96:	int compression_in = COMPRESSION_CCITTFAX3;
+    #####:   97:	int compression_out = COMPRESSION_CCITTFAX3;
+    #####:   98:	int fillorder_in = FILLORDER_LSB2MSB;
+    #####:   99:	int fillorder_out = FILLORDER_LSB2MSB;
+    #####:  100:	uint32 group3options_in = 0;	/* 1d-encoded */
+    #####:  101:	uint32 group3options_out = 0;	/* 1d-encoded */
+    #####:  102:	uint32 group4options_in = 0;	/* compressed */
+    #####:  103:	uint32 group4options_out = 0;	/* compressed */
+    #####:  104:	uint32 defrowsperstrip = (uint32) 0;
+        -:  105:	uint32 rowsperstrip;
+    #####:  106:	int photometric_in = PHOTOMETRIC_MINISWHITE;
+    #####:  107:	int photometric_out = PHOTOMETRIC_MINISWHITE;
+    #####:  108:	int mode = FAXMODE_CLASSF;
+        -:  109:	int rows;
+        -:  110:	int c;
+        -:  111:	int pn, npages;
+    #####:  112:	float resY = 196.0;
+        -:  113:
+        -:  114:#if !HAVE_DECL_OPTARG
+        -:  115:	extern int optind;
+        -:  116:	extern char* optarg;
+        -:  117:#endif
+        -:  118:
+    #####:  119:	while ((c = getopt(argc, argv, "R:X:o:r:1234ABLMPUW5678abcflmprsuvwz?")) != -1)
+    #####:  120:		switch (c) {
+        -:  121:			/* input-related options */
+    #####:  122:		case '3':		/* input is g3-encoded */
+    #####:  123:			compression_in = COMPRESSION_CCITTFAX3;
+    #####:  124:			break;
+    #####:  125:		case '4':		/* input is g4-encoded */
+    #####:  126:			compression_in = COMPRESSION_CCITTFAX4;
+    #####:  127:			break;
+    #####:  128:		case 'U':		/* input is uncompressed (g3 and g4) */
+    #####:  129:			group3options_in |= GROUP3OPT_UNCOMPRESSED;
+    #####:  130:			group4options_in |= GROUP4OPT_UNCOMPRESSED;
+    #####:  131:			break;
+    #####:  132:		case '1':		/* input is 1d-encoded (g3 only) */
+    #####:  133:			group3options_in &= ~GROUP3OPT_2DENCODING;
+    #####:  134:			break;
+    #####:  135:		case '2':		/* input is 2d-encoded (g3 only) */
+    #####:  136:			group3options_in |= GROUP3OPT_2DENCODING;
+    #####:  137:			break;
+    #####:  138:		case 'P':	/* input has not-aligned EOL (g3 only) */
+    #####:  139:			group3options_in &= ~GROUP3OPT_FILLBITS;
+    #####:  140:			break;
+    #####:  141:		case 'A':		/* input has aligned EOL (g3 only) */
+    #####:  142:			group3options_in |= GROUP3OPT_FILLBITS;
+    #####:  143:			break;
+    #####:  144:		case 'W':		/* input has 0 mean white */
+    #####:  145:			photometric_in = PHOTOMETRIC_MINISWHITE;
+    #####:  146:			break;
+    #####:  147:		case 'B':		/* input has 0 mean black */
+    #####:  148:			photometric_in = PHOTOMETRIC_MINISBLACK;
+    #####:  149:			break;
+    #####:  150:		case 'L':		/* input has lsb-to-msb fillorder */
+    #####:  151:			fillorder_in = FILLORDER_LSB2MSB;
+    #####:  152:			break;
+    #####:  153:		case 'M':		/* input has msb-to-lsb fillorder */
+    #####:  154:			fillorder_in = FILLORDER_MSB2LSB;
+    #####:  155:			break;
+    #####:  156:		case 'R':		/* input resolution */
+    #####:  157:			resY = (float) atof(optarg);
+    #####:  158:			break;
+    #####:  159:		case 'X':		/* input width */
+    #####:  160:			xsize = (uint32) atoi(optarg);
+    #####:  161:			break;
+        -:  162:
+        -:  163:			/* output-related options */
+    #####:  164:		case '7':		/* generate g3-encoded output */
+    #####:  165:			compression_out = COMPRESSION_CCITTFAX3;
+    #####:  166:			break;
+    #####:  167:		case '8':		/* generate g4-encoded output */
+    #####:  168:			compression_out = COMPRESSION_CCITTFAX4;
+    #####:  169:			break;
+    #####:  170:		case 'u':	/* generate uncompressed output (g3 and g4) */
+    #####:  171:			group3options_out |= GROUP3OPT_UNCOMPRESSED;
+    #####:  172:			group4options_out |= GROUP4OPT_UNCOMPRESSED;
+    #####:  173:			break;
+    #####:  174:		case '5':	/* generate 1d-encoded output (g3 only) */
+    #####:  175:			group3options_out &= ~GROUP3OPT_2DENCODING;
+    #####:  176:			break;
+    #####:  177:		case '6':	/* generate 2d-encoded output (g3 only) */
+    #####:  178:			group3options_out |= GROUP3OPT_2DENCODING;
+    #####:  179:			break;
+    #####:  180:		case 'c':		/* generate "classic" g3 format */
+    #####:  181:			mode = FAXMODE_CLASSIC;
+    #####:  182:			break;
+    #####:  183:		case 'f':		/* generate Class F format */
+    #####:  184:			mode = FAXMODE_CLASSF;
+    #####:  185:			break;
+    #####:  186:		case 'm':		/* output's fillorder is msb-to-lsb */
+    #####:  187:			fillorder_out = FILLORDER_MSB2LSB;
+    #####:  188:			break;
+    #####:  189:		case 'l':		/* output's fillorder is lsb-to-msb */
+    #####:  190:			fillorder_out = FILLORDER_LSB2MSB;
+    #####:  191:			break;
+    #####:  192:		case 'o':
+    #####:  193:			out = TIFFOpen(optarg, "w");
+    #####:  194:			if (out == NULL) {
+    #####:  195:				fprintf(stderr,
+        -:  196:				    "%s: Can not create or open %s\n",
+        -:  197:				    argv[0], optarg);
+    #####:  198:				return EXIT_FAILURE;
+        -:  199:			}
+    #####:  200:			break;
+    #####:  201:		case 'a':	/* generate EOL-aligned output (g3 only) */
+    #####:  202:			group3options_out |= GROUP3OPT_FILLBITS;
+    #####:  203:			break;
+    #####:  204:		case 'p':	/* generate not EOL-aligned output (g3 only) */
+    #####:  205:			group3options_out &= ~GROUP3OPT_FILLBITS;
+    #####:  206:			break;
+    #####:  207:		case 'r':		/* rows/strip */
+    #####:  208:			defrowsperstrip = atol(optarg);
+    #####:  209:			break;
+    #####:  210:		case 's':		/* stretch image by dup'ng scanlines */
+    #####:  211:			stretch = 1;
+    #####:  212:			break;
+    #####:  213:		case 'w':		/* undocumented -- for testing */
+    #####:  214:			photometric_out = PHOTOMETRIC_MINISWHITE;
+    #####:  215:			break;
+    #####:  216:		case 'b':		/* undocumented -- for testing */
+    #####:  217:			photometric_out = PHOTOMETRIC_MINISBLACK;
+    #####:  218:			break;
+    #####:  219:		case 'z':		/* undocumented -- for testing */
+    #####:  220:			compression_out = COMPRESSION_LZW;
+    #####:  221:			break;
+    #####:  222:		case 'v':		/* -v for info */
+    #####:  223:			verbose++;
+    #####:  224:			break;
+    #####:  225:		case '?':
+    #####:  226:			usage();
+        -:  227:			/*NOTREACHED*/
+        -:  228:		}
+    #####:  229:	npages = argc - optind;
+    #####:  230:	if (npages < 1)
+    #####:  231:		usage();
+        -:  232:
+    #####:  233:	rowbuf = _TIFFmalloc(TIFFhowmany8(xsize));
+    #####:  234:	refbuf = _TIFFmalloc(TIFFhowmany8(xsize));
+    #####:  235:	if (rowbuf == NULL || refbuf == NULL) {
+    #####:  236:		fprintf(stderr, "%s: Not enough memory\n", argv[0]);
+    #####:  237:		return (EXIT_FAILURE);
+        -:  238:	}
+        -:  239:
+    #####:  240:	if (out == NULL) {
+    #####:  241:		out = TIFFOpen("fax.tif", "w");
+    #####:  242:		if (out == NULL) {
+    #####:  243:			fprintf(stderr, "%s: Can not create fax.tif\n",
+        -:  244:			    argv[0]);
+    #####:  245:			return (EXIT_FAILURE);
+        -:  246:		}
+        -:  247:	}
+        -:  248:		
+    #####:  249:	faxTIFF = TIFFClientOpen("(FakeInput)", "w",
+        -:  250:	/* TIFFClientOpen() fails if we don't set existing value here */
+        -:  251:				 TIFFClientdata(out),
+        -:  252:				 TIFFGetReadProc(out), TIFFGetWriteProc(out),
+        -:  253:				 TIFFGetSeekProc(out), TIFFGetCloseProc(out),
+        -:  254:				 TIFFGetSizeProc(out), TIFFGetMapFileProc(out),
+        -:  255:				 TIFFGetUnmapFileProc(out));
+    #####:  256:	if (faxTIFF == NULL) {
+    #####:  257:		fprintf(stderr, "%s: Can not create fake input file\n",
+        -:  258:		    argv[0]);
+    #####:  259:		return (EXIT_FAILURE);
+        -:  260:	}
+    #####:  261:	TIFFSetMode(faxTIFF, O_RDONLY);
+    #####:  262:	TIFFSetField(faxTIFF, TIFFTAG_IMAGEWIDTH,	xsize);
+    #####:  263:	TIFFSetField(faxTIFF, TIFFTAG_SAMPLESPERPIXEL,	1);
+    #####:  264:	TIFFSetField(faxTIFF, TIFFTAG_BITSPERSAMPLE,	1);
+    #####:  265:	TIFFSetField(faxTIFF, TIFFTAG_FILLORDER,	fillorder_in);
+    #####:  266:	TIFFSetField(faxTIFF, TIFFTAG_PLANARCONFIG,	PLANARCONFIG_CONTIG);
+    #####:  267:	TIFFSetField(faxTIFF, TIFFTAG_PHOTOMETRIC,	photometric_in);
+    #####:  268:	TIFFSetField(faxTIFF, TIFFTAG_YRESOLUTION,	resY);
+    #####:  269:	TIFFSetField(faxTIFF, TIFFTAG_RESOLUTIONUNIT,	RESUNIT_INCH);
+        -:  270:	
+        -:  271:	/* NB: this must be done after directory info is setup */
+    #####:  272:	TIFFSetField(faxTIFF, TIFFTAG_COMPRESSION, compression_in);
+    #####:  273:	if (compression_in == COMPRESSION_CCITTFAX3)
+    #####:  274:		TIFFSetField(faxTIFF, TIFFTAG_GROUP3OPTIONS, group3options_in);
+    #####:  275:	else if (compression_in == COMPRESSION_CCITTFAX4)
+    #####:  276:		TIFFSetField(faxTIFF, TIFFTAG_GROUP4OPTIONS, group4options_in);
+    #####:  277:	for (pn = 0; optind < argc; pn++, optind++) {
+    #####:  278:		in = fopen(argv[optind], "rb");
+    #####:  279:		if (in == NULL) {
+    #####:  280:			fprintf(stderr,
+    #####:  281:			    "%s: %s: Can not open\n", argv[0], argv[optind]);
+    #####:  282:			continue;
+        -:  283:		}
+        -:  284:#if defined(_WIN32) && defined(USE_WIN32_FILEIO)
+        -:  285:                client_data.fh = _get_osfhandle(fileno(in));
+        -:  286:                TIFFSetClientdata(faxTIFF, (thandle_t) client_data.fh);
+        -:  287:#else
+    #####:  288:                client_data.fd = fileno(in);
+    #####:  289:                TIFFSetClientdata(faxTIFF, (thandle_t) client_data.fd);
+        -:  290:#endif
+    #####:  291:		TIFFSetFileName(faxTIFF, (const char*)argv[optind]);
+    #####:  292:		TIFFSetField(out, TIFFTAG_IMAGEWIDTH, xsize);
+    #####:  293:		TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 1);
+    #####:  294:		TIFFSetField(out, TIFFTAG_COMPRESSION, compression_out);
+    #####:  295:		TIFFSetField(out, TIFFTAG_PHOTOMETRIC, photometric_out);
+    #####:  296:		TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    #####:  297:		TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 1);
+    #####:  298:		switch (compression_out) {
+        -:  299:			/* g3 */
+    #####:  300:			case COMPRESSION_CCITTFAX3:
+    #####:  301:			TIFFSetField(out, TIFFTAG_GROUP3OPTIONS,
+        -:  302:				     group3options_out);
+    #####:  303:			TIFFSetField(out, TIFFTAG_FAXMODE, mode);
+    #####:  304:			rowsperstrip =
+    #####:  305:				(defrowsperstrip)?defrowsperstrip:(uint32)-1L;
+    #####:  306:			break;
+        -:  307:
+        -:  308:			/* g4 */
+    #####:  309:			case COMPRESSION_CCITTFAX4:
+    #####:  310:			TIFFSetField(out, TIFFTAG_GROUP4OPTIONS,
+        -:  311:				     group4options_out);
+    #####:  312:			TIFFSetField(out, TIFFTAG_FAXMODE, mode);
+    #####:  313:			rowsperstrip =
+    #####:  314:				(defrowsperstrip)?defrowsperstrip:(uint32)-1L;
+    #####:  315:			break;
+        -:  316:
+    #####:  317:			default:
+    #####:  318:			rowsperstrip = (defrowsperstrip) ?
+    #####:  319:				defrowsperstrip : TIFFDefaultStripSize(out, 0);
+        -:  320:		}
+    #####:  321:		TIFFSetField(out, TIFFTAG_ROWSPERSTRIP, rowsperstrip);
+    #####:  322:		TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    #####:  323:		TIFFSetField(out, TIFFTAG_FILLORDER, fillorder_out);
+    #####:  324:		TIFFSetField(out, TIFFTAG_SOFTWARE, "fax2tiff");
+    #####:  325:		TIFFSetField(out, TIFFTAG_XRESOLUTION, 204.0);
+    #####:  326:		if (!stretch) {
+    #####:  327:			TIFFGetField(faxTIFF, TIFFTAG_YRESOLUTION, &resY);
+    #####:  328:			TIFFSetField(out, TIFFTAG_YRESOLUTION, resY);
+        -:  329:		} else
+    #####:  330:			TIFFSetField(out, TIFFTAG_YRESOLUTION, 196.);
+    #####:  331:		TIFFSetField(out, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
+    #####:  332:		TIFFSetField(out, TIFFTAG_PAGENUMBER, pn, npages);
+        -:  333:
+    #####:  334:		if (!verbose)
+    #####:  335:		    whandler = TIFFSetWarningHandler(NULL);
+    #####:  336:		rows = copyFaxFile(faxTIFF, out);
+    #####:  337:		fclose(in);
+    #####:  338:		if (!verbose)
+    #####:  339:		    (void) TIFFSetWarningHandler(whandler);
+        -:  340:
+    #####:  341:		TIFFSetField(out, TIFFTAG_IMAGELENGTH, rows);
+        -:  342:
+    #####:  343:		if (verbose) {
+    #####:  344:			fprintf(stderr, "%s:\n", argv[optind]);
+    #####:  345:			fprintf(stderr, "%d rows in input\n", rows);
+    #####:  346:			fprintf(stderr, "%ld total bad rows\n",
+        -:  347:			    (long) badfaxlines);
+    #####:  348:			fprintf(stderr, "%d max consecutive bad rows\n", badfaxrun);
+        -:  349:		}
+    #####:  350:		if (compression_out == COMPRESSION_CCITTFAX3 &&
+        -:  351:		    mode == FAXMODE_CLASSF) {
+    #####:  352:			TIFFSetField(out, TIFFTAG_BADFAXLINES, badfaxlines);
+    #####:  353:			TIFFSetField(out, TIFFTAG_CLEANFAXDATA, badfaxlines ?
+        -:  354:			    CLEANFAXDATA_REGENERATED : CLEANFAXDATA_CLEAN);
+    #####:  355:			TIFFSetField(out, TIFFTAG_CONSECUTIVEBADFAXLINES, badfaxrun);
+        -:  356:		}
+    #####:  357:		TIFFWriteDirectory(out);
+        -:  358:	}
+    #####:  359:	TIFFClose(out);
+    #####:  360:	_TIFFfree(rowbuf);
+    #####:  361:	_TIFFfree(refbuf);
+    #####:  362:	return (EXIT_SUCCESS);
+        -:  363:}
+        -:  364:
+        -:  365:int
+    #####:  366:copyFaxFile(TIFF* tifin, TIFF* tifout)
+        -:  367:{
+        -:  368:	uint32 row;
+    #####:  369:	uint32 linesize = TIFFhowmany8(xsize);
+        -:  370:	uint16 badrun;
+        -:  371:	int ok;
+        -:  372:
+    #####:  373:	tifin->tif_rawdatasize = (tmsize_t)TIFFGetFileSize(tifin);
+    #####:  374:	tifin->tif_rawdata = _TIFFmalloc(tifin->tif_rawdatasize);
+    #####:  375:	if (tifin->tif_rawdata == NULL) {
+    #####:  376:		TIFFError(tifin->tif_name, "Not enough memory");
+    #####:  377:		return (0);
+        -:  378:	}
+    #####:  379:	if (!ReadOK(tifin, tifin->tif_rawdata, tifin->tif_rawdatasize)) {
+    #####:  380:		TIFFError(tifin->tif_name, "Read error at scanline 0");
+    #####:  381:		return (0);
+        -:  382:	}
+    #####:  383:	tifin->tif_rawcp = tifin->tif_rawdata;
+    #####:  384:	tifin->tif_rawcc = tifin->tif_rawdatasize;
+        -:  385:
+    #####:  386:	(*tifin->tif_setupdecode)(tifin);
+    #####:  387:	(*tifin->tif_predecode)(tifin, (tsample_t) 0);
+    #####:  388:	tifin->tif_row = 0;
+    #####:  389:	badfaxlines = 0;
+    #####:  390:	badfaxrun = 0;
+        -:  391:
+    #####:  392:	_TIFFmemset(refbuf, 0, linesize);
+    #####:  393:	row = 0;
+    #####:  394:	badrun = 0;		/* current run of bad lines */
+    #####:  395:	while (tifin->tif_rawcc > 0) {
+    #####:  396:		ok = (*tifin->tif_decoderow)(tifin, (tdata_t) rowbuf, 
+        -:  397:					     linesize, 0);
+    #####:  398:		if (!ok) {
+    #####:  399:			badfaxlines++;
+    #####:  400:			badrun++;
+        -:  401:			/* regenerate line from previous good line */
+    #####:  402:			_TIFFmemcpy(rowbuf, refbuf, linesize);
+        -:  403:		} else {
+    #####:  404:			if (badrun > badfaxrun)
+    #####:  405:				badfaxrun = badrun;
+    #####:  406:			badrun = 0;
+    #####:  407:			_TIFFmemcpy(refbuf, rowbuf, linesize);
+        -:  408:		}
+    #####:  409:		tifin->tif_row++;
+        -:  410:
+    #####:  411:		if (TIFFWriteScanline(tifout, rowbuf, row, 0) < 0) {
+    #####:  412:			fprintf(stderr, "%s: Write error at row %ld.\n",
+        -:  413:			    tifout->tif_name, (long) row);
+    #####:  414:			break;
+        -:  415:		}
+    #####:  416:		row++;
+    #####:  417:		if (stretch) {
+    #####:  418:			if (TIFFWriteScanline(tifout, rowbuf, row, 0) < 0) {
+    #####:  419:				fprintf(stderr, "%s: Write error at row %ld.\n",
+        -:  420:				    tifout->tif_name, (long) row);
+    #####:  421:				break;
+        -:  422:			}
+    #####:  423:			row++;
+        -:  424:		}
+        -:  425:	}
+    #####:  426:	if (badrun > badfaxrun)
+    #####:  427:		badfaxrun = badrun;
+    #####:  428:	_TIFFfree(tifin->tif_rawdata);
+    #####:  429:	return (row);
+        -:  430:}
+        -:  431:
+        -:  432:char* stuff[] = {
+        -:  433:"usage: fax2tiff [options] input.raw...",
+        -:  434:"where options are:",
+        -:  435:" -3		input data is G3-encoded		[default]",
+        -:  436:" -4		input data is G4-encoded",
+        -:  437:" -U		input data is uncompressed (G3 or G4)",
+        -:  438:" -1		input data is 1D-encoded (G3 only)	[default]",
+        -:  439:" -2		input data is 2D-encoded (G3 only)",
+        -:  440:" -P		input is not EOL-aligned (G3 only)	[default]",
+        -:  441:" -A		input is EOL-aligned (G3 only)",
+        -:  442:" -M		input data has MSB2LSB bit order",
+        -:  443:" -L		input data has LSB2MSB bit order	[default]",
+        -:  444:" -B		input data has min 0 means black",
+        -:  445:" -W		input data has min 0 means white	[default]",
+        -:  446:" -R #		input data has # resolution (lines/inch) [default is 196]",
+        -:  447:" -X #		input data has # width			[default is 1728]",
+        -:  448:"",
+        -:  449:" -o out.tif	write output to out.tif",
+        -:  450:" -7		generate G3-encoded output		[default]",
+        -:  451:" -8		generate G4-encoded output",
+        -:  452:" -u		generate uncompressed output (G3 or G4)",
+        -:  453:" -5		generate 1D-encoded output (G3 only)",
+        -:  454:" -6		generate 2D-encoded output (G3 only)	[default]",
+        -:  455:" -p		generate not EOL-aligned output (G3 only)",
+        -:  456:" -a		generate EOL-aligned output (G3 only)	[default]",
+        -:  457:" -c		generate \"classic\" TIFF format",
+        -:  458:" -f		generate TIFF Class F (TIFF/F) format	[default]",
+        -:  459:" -m		output fill order is MSB2LSB",
+        -:  460:" -l		output fill order is LSB2MSB		[default]",
+        -:  461:" -r #		make each strip have no more than # rows",
+        -:  462:" -s		stretch image by duplicating scanlines",
+        -:  463:" -v		print information about conversion work",
+        -:  464:" -z		generate LZW compressed output",
+        -:  465:NULL
+        -:  466:};
+        -:  467:
+        -:  468:static void
+    #####:  469:usage(void)
+        -:  470:{
+    #####:  471:	char buf[BUFSIZ];
+        -:  472:	int i;
+        -:  473:
+    #####:  474:	setbuf(stderr, buf);
+    #####:  475:        fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:  476:	for (i = 0; stuff[i] != NULL; i++)
+    #####:  477:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:  478:	exit(EXIT_FAILURE);
+        -:  479:}
+        -:  480:
+        -:  481:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  482:/*
+        -:  483: * Local Variables:
+        -:  484: * mode: c
+        -:  485: * c-basic-offset: 8
+        -:  486: * fill-column: 78
+        -:  487: * End:
+        -:  488: */

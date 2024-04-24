@@ -1,0 +1,339 @@
+        -:    0:Source:ras2tiff.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1988-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:#include "tif_config.h"
+        -:   28:
+        -:   29:#include <stdio.h>
+        -:   30:#include <stdlib.h>
+        -:   31:#include <string.h>
+        -:   32:#include <ctype.h>
+        -:   33:#include <limits.h>
+        -:   34:
+        -:   35:#ifdef HAVE_UNISTD_H
+        -:   36:# include <unistd.h>
+        -:   37:#endif
+        -:   38:
+        -:   39:#ifdef NEED_LIBPORT
+        -:   40:# include "libport.h"
+        -:   41:#endif
+        -:   42:
+        -:   43:#include "rasterfile.h"
+        -:   44:#include "tiffio.h"
+        -:   45:
+        -:   46:#ifndef howmany
+        -:   47:#define	howmany(x, y)	(((x)+((y)-1))/(y))
+        -:   48:#endif
+        -:   49:#define	streq(a,b)	(strcmp(a,b) == 0)
+        -:   50:#define	strneq(a,b,n)	(strncmp(a,b,n) == 0)
+        -:   51:
+        -:   52:static	uint16 compression = (uint16) -1;
+        -:   53:static	int jpegcolormode = JPEGCOLORMODE_RGB;
+        -:   54:static	int quality = 75;		/* JPEG quality */
+        -:   55:static	uint16 predictor = 0;
+        -:   56:
+        -:   57:static void usage(void);
+        -:   58:static	int processCompressOptions(char*);
+        -:   59:
+        -:   60:int
+    #####:   61:main(int argc, char* argv[])
+        -:   62:{
+        -:   63:	unsigned char* buf;
+        -:   64:	long row;
+        -:   65:	tsize_t linebytes, scanline;
+        -:   66:	TIFF *out;
+        -:   67:	FILE *in;
+    #####:   68:	struct rasterfile h;
+        -:   69:	uint16 photometric;
+    #####:   70:	uint16 config = PLANARCONFIG_CONTIG;
+    #####:   71:	uint32 rowsperstrip = (uint32) -1;
+        -:   72:	int c;
+        -:   73:#if !HAVE_DECL_OPTARG
+        -:   74:	extern int optind;
+        -:   75:	extern char* optarg;
+        -:   76:#endif
+        -:   77:
+    #####:   78:	while ((c = getopt(argc, argv, "c:r:h")) != -1)
+    #####:   79:		switch (c) {
+    #####:   80:		case 'c':		/* compression scheme */
+    #####:   81:			if (!processCompressOptions(optarg))
+    #####:   82:				usage();
+    #####:   83:			break;
+    #####:   84:		case 'r':		/* rows/strip */
+    #####:   85:			rowsperstrip = atoi(optarg);
+    #####:   86:			break;
+    #####:   87:		case 'h':
+    #####:   88:			usage();
+        -:   89:			/*NOTREACHED*/
+        -:   90:		}
+    #####:   91:	if (argc - optind != 2)
+    #####:   92:		usage();
+    #####:   93:	in = fopen(argv[optind], "rb");
+    #####:   94:	if (in == NULL) {
+    #####:   95:		fprintf(stderr, "%s: Can not open.\n", argv[optind]);
+    #####:   96:		return (-1);
+        -:   97:	}
+    #####:   98:	if (fread(&h, sizeof (h), 1, in) != 1) {
+    #####:   99:		fprintf(stderr, "%s: Can not read header.\n", argv[optind]);
+    #####:  100:		fclose(in);
+    #####:  101:		return (-2);
+        -:  102:	}
+    #####:  103:	if (strcmp(h.ras_magic, RAS_MAGIC) == 0) {
+        -:  104:#ifndef WORDS_BIGENDIAN
+    #####:  105:			TIFFSwabLong((uint32 *)&h.ras_width);
+    #####:  106:			TIFFSwabLong((uint32 *)&h.ras_height);
+    #####:  107:			TIFFSwabLong((uint32 *)&h.ras_depth);
+    #####:  108:			TIFFSwabLong((uint32 *)&h.ras_length);
+    #####:  109:			TIFFSwabLong((uint32 *)&h.ras_type);
+    #####:  110:			TIFFSwabLong((uint32 *)&h.ras_maptype);
+    #####:  111:			TIFFSwabLong((uint32 *)&h.ras_maplength);
+        -:  112:#endif
+    #####:  113:	} else if (strcmp(h.ras_magic, RAS_MAGIC_INV) == 0) {
+        -:  114:#ifdef WORDS_BIGENDIAN
+        -:  115:			TIFFSwabLong((uint32 *)&h.ras_width);
+        -:  116:			TIFFSwabLong((uint32 *)&h.ras_height);
+        -:  117:			TIFFSwabLong((uint32 *)&h.ras_depth);
+        -:  118:			TIFFSwabLong((uint32 *)&h.ras_length);
+        -:  119:			TIFFSwabLong((uint32 *)&h.ras_type);
+        -:  120:			TIFFSwabLong((uint32 *)&h.ras_maptype);
+        -:  121:			TIFFSwabLong((uint32 *)&h.ras_maplength);
+        -:  122:#endif
+        -:  123:	} else {
+    #####:  124:		fprintf(stderr, "%s: Not a rasterfile.\n", argv[optind]);
+    #####:  125:		fclose(in);
+    #####:  126:		return (-3);
+        -:  127:	}
+    #####:  128:        if ((h.ras_width <= 0) || (h.ras_width >= INT_MAX) ||
+    #####:  129:            (h.ras_height <= 0) || (h.ras_height >= INT_MAX) ||
+    #####:  130:            (h.ras_depth <= 0) || (h.ras_depth >= INT_MAX) ||
+    #####:  131:            (h.ras_length <= 0) || (h.ras_length >= INT_MAX) ||
+    #####:  132:            (h.ras_type <= 0) ||
+    #####:  133:            (h.ras_maptype <= 0) ||
+    #####:  134:            (h.ras_maplength <= 0) || (h.ras_maplength >= INT_MAX)) {
+    #####:  135:                fprintf(stderr, "%s: Improper image header.\n", argv[optind]);
+    #####:  136:                fclose(in);
+    #####:  137:		return (-2);
+        -:  138:        }
+    #####:  139:        if ((h.ras_depth != 1) &&
+    #####:  140:            (h.ras_depth != 8) &&
+    #####:  141:            (h.ras_depth != 24)) {
+    #####:  142:                fprintf(stderr, "%s: Improper image depth (%d).\n",
+    #####:  143:                        argv[optind], h.ras_depth);
+    #####:  144:                fclose(in);
+    #####:  145:		return (-2);
+        -:  146:        }
+    #####:  147:	out = TIFFOpen(argv[optind+1], "w");
+    #####:  148:	if (out == NULL)
+        -:  149:	{
+    #####:  150:		fclose(in);
+    #####:  151:		return (-4);
+        -:  152:	}
+    #####:  153:	TIFFSetField(out, TIFFTAG_IMAGEWIDTH, (uint32) h.ras_width);
+    #####:  154:	TIFFSetField(out, TIFFTAG_IMAGELENGTH, (uint32) h.ras_height);
+    #####:  155:	TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    #####:  156:	TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, h.ras_depth > 8 ? 3 : 1);
+    #####:  157:	TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, h.ras_depth > 1 ? 8 : 1);
+    #####:  158:	TIFFSetField(out, TIFFTAG_PLANARCONFIG, config);
+    #####:  159:	if (h.ras_maptype != RMT_NONE) {
+        -:  160:		uint16* red;
+        -:  161:		register uint16* map;
+        -:  162:		register int i, j;
+        -:  163:		int mapsize;
+        -:  164:
+    #####:  165:		buf = (unsigned char *)_TIFFmalloc(h.ras_maplength);
+    #####:  166:		if (buf == NULL) {
+    #####:  167:			fprintf(stderr, "No space to read in colormap.\n");
+    #####:  168:			return (-5);
+        -:  169:		}
+    #####:  170:		if (fread(buf, h.ras_maplength, 1, in) != 1) {
+    #####:  171:			fprintf(stderr, "%s: Read error on colormap.\n",
+    #####:  172:			    argv[optind]);
+    #####:  173:			return (-6);
+        -:  174:		}
+    #####:  175:		mapsize = 1<<h.ras_depth; 
+    #####:  176:		if (h.ras_maplength > mapsize*3) {
+    #####:  177:			fprintf(stderr,
+        -:  178:			    "%s: Huh, %d colormap entries, should be %d?\n",
+    #####:  179:			    argv[optind], h.ras_maplength, mapsize*3);
+    #####:  180:			return (-7);
+        -:  181:		}
+    #####:  182:		red = (uint16*)_TIFFmalloc(mapsize * 3 * sizeof (uint16));
+    #####:  183:		if (red == NULL) {
+    #####:  184:			fprintf(stderr, "No space for colormap.\n");
+    #####:  185:			return (-8);
+        -:  186:		}
+    #####:  187:		map = red;
+    #####:  188:		for (j = 0; j < 3; j++) {
+        -:  189:#define	SCALE(x)	(((x)*((1L<<16)-1))/255)
+    #####:  190:			for (i = h.ras_maplength/3; i-- > 0;)
+    #####:  191:				*map++ = SCALE(*buf++);
+    #####:  192:			if ((i = h.ras_maplength/3) < mapsize) {
+    #####:  193:				i = mapsize - i;
+    #####:  194:				_TIFFmemset(map, 0, i*sizeof (uint16));
+    #####:  195:				map += i;
+        -:  196:			}
+        -:  197:		}
+    #####:  198:		TIFFSetField(out, TIFFTAG_COLORMAP,
+    #####:  199:		     red, red + mapsize, red + 2*mapsize);
+    #####:  200:		photometric = PHOTOMETRIC_PALETTE;
+    #####:  201:		if (compression == (uint16) -1)
+    #####:  202:			compression = COMPRESSION_PACKBITS;
+    #####:  203:		TIFFSetField(out, TIFFTAG_COMPRESSION, compression);
+        -:  204:	} else {
+        -:  205:		/* XXX this is bogus... */
+    #####:  206:		photometric = h.ras_depth == 24 ?
+        -:  207:		    PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK;
+    #####:  208:		if (compression == (uint16) -1)
+    #####:  209:			compression = COMPRESSION_LZW;
+    #####:  210:		TIFFSetField(out, TIFFTAG_COMPRESSION, compression);
+        -:  211:	}
+    #####:  212:	switch (compression) {
+    #####:  213:	case COMPRESSION_JPEG:
+    #####:  214:		if (photometric == PHOTOMETRIC_RGB && jpegcolormode == JPEGCOLORMODE_RGB)
+    #####:  215:			photometric = PHOTOMETRIC_YCBCR;
+    #####:  216:		TIFFSetField(out, TIFFTAG_JPEGQUALITY, quality);
+    #####:  217:		TIFFSetField(out, TIFFTAG_JPEGCOLORMODE, jpegcolormode);
+    #####:  218:		break;
+    #####:  219:	case COMPRESSION_LZW:
+        -:  220:	case COMPRESSION_DEFLATE:
+    #####:  221:		if (predictor != 0)
+    #####:  222:			TIFFSetField(out, TIFFTAG_PREDICTOR, predictor);
+    #####:  223:		break;
+        -:  224:	}
+    #####:  225:	TIFFSetField(out, TIFFTAG_PHOTOMETRIC, photometric);
+    #####:  226:	linebytes = ((h.ras_depth*h.ras_width+15) >> 3) &~ 1;
+    #####:  227:	scanline = TIFFScanlineSize(out);
+    #####:  228:	if (scanline > linebytes) {
+    #####:  229:		buf = (unsigned char *)_TIFFmalloc(scanline);
+    #####:  230:		_TIFFmemset(buf+linebytes, 0, scanline-linebytes);
+        -:  231:	} else
+    #####:  232:		buf = (unsigned char *)_TIFFmalloc(linebytes);
+    #####:  233:	TIFFSetField(out, TIFFTAG_ROWSPERSTRIP,
+        -:  234:	    TIFFDefaultStripSize(out, rowsperstrip));
+    #####:  235:	for (row = 0; row < h.ras_height; row++) {
+    #####:  236:		if (fread(buf, linebytes, 1, in) != 1) {
+    #####:  237:			fprintf(stderr, "%s: scanline %ld: Read error.\n",
+    #####:  238:			    argv[optind], row);
+    #####:  239:			break;
+        -:  240:		}
+    #####:  241:		if (h.ras_type == RT_STANDARD && h.ras_depth == 24) {
+    #####:  242:			tsize_t cc = h.ras_width;
+    #####:  243:			unsigned char* cp = buf;
+        -:  244:#define	SWAP(a,b)	{ unsigned char t = (a); (a) = (b); (b) = t; }
+        -:  245:			do {
+    #####:  246:				SWAP(cp[0], cp[2]);
+    #####:  247:				cp += 3;
+    #####:  248:			} while (--cc);
+        -:  249:		}
+    #####:  250:		if (TIFFWriteScanline(out, buf, row, 0) < 0)
+    #####:  251:			break;
+        -:  252:	}
+    #####:  253:	(void) TIFFClose(out);
+    #####:  254:	fclose(in);
+    #####:  255:	return (0);
+        -:  256:}
+        -:  257:
+        -:  258:static int
+    #####:  259:processCompressOptions(char* opt)
+        -:  260:{
+    #####:  261:	if (streq(opt, "none"))
+    #####:  262:		compression = COMPRESSION_NONE;
+    #####:  263:	else if (streq(opt, "packbits"))
+    #####:  264:		compression = COMPRESSION_PACKBITS;
+    #####:  265:	else if (strneq(opt, "jpeg", 4)) {
+    #####:  266:		char* cp = strchr(opt, ':');
+        -:  267:
+    #####:  268:                compression = COMPRESSION_JPEG;
+    #####:  269:                while( cp )
+        -:  270:                {
+    #####:  271:                    if (isdigit((int)cp[1]))
+    #####:  272:			quality = atoi(cp+1);
+    #####:  273:                    else if (cp[1] == 'r' )
+    #####:  274:			jpegcolormode = JPEGCOLORMODE_RAW;
+        -:  275:                    else
+    #####:  276:                        usage();
+        -:  277:
+    #####:  278:                    cp = strchr(cp+1,':');
+        -:  279:                }
+    #####:  280:	} else if (strneq(opt, "lzw", 3)) {
+    #####:  281:		char* cp = strchr(opt, ':');
+    #####:  282:		if (cp)
+    #####:  283:			predictor = atoi(cp+1);
+    #####:  284:		compression = COMPRESSION_LZW;
+    #####:  285:	} else if (strneq(opt, "zip", 3)) {
+    #####:  286:		char* cp = strchr(opt, ':');
+    #####:  287:		if (cp)
+    #####:  288:			predictor = atoi(cp+1);
+    #####:  289:		compression = COMPRESSION_DEFLATE;
+        -:  290:	} else
+    #####:  291:		return (0);
+    #####:  292:	return (1);
+        -:  293:}
+        -:  294:
+        -:  295:char* stuff[] = {
+        -:  296:"usage: ras2tiff [options] input.ras output.tif",
+        -:  297:"where options are:",
+        -:  298:" -r #		make each strip have no more than # rows",
+        -:  299:"",
+        -:  300:" -c lzw[:opts]	compress output with Lempel-Ziv & Welch encoding",
+        -:  301:" -c zip[:opts]	compress output with deflate encoding",
+        -:  302:" -c jpeg[:opts]	compress output with JPEG encoding",
+        -:  303:" -c packbits	compress output with packbits encoding",
+        -:  304:" -c none	use no compression algorithm on output",
+        -:  305:"",
+        -:  306:"JPEG options:",
+        -:  307:" #		set compression quality level (0-100, default 75)",
+        -:  308:" r		output color image as RGB rather than YCbCr",
+        -:  309:"For example, -c jpeg:r:50 to get JPEG-encoded RGB data with 50% comp. quality",
+        -:  310:"",
+        -:  311:"LZW and deflate options:",
+        -:  312:" #		set predictor value",
+        -:  313:"For example, -c lzw:2 to get LZW-encoded data with horizontal differencing",
+        -:  314:" -h		this help message",
+        -:  315:NULL
+        -:  316:};
+        -:  317:
+        -:  318:static void
+    #####:  319:usage(void)
+        -:  320:{
+    #####:  321:	char buf[BUFSIZ];
+        -:  322:	int i;
+        -:  323:
+    #####:  324:	setbuf(stderr, buf);
+    #####:  325:        fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:  326:	for (i = 0; stuff[i] != NULL; i++)
+    #####:  327:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:  328:	exit(-1);
+        -:  329:}
+        -:  330:
+        -:  331:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  332:/*
+        -:  333: * Local Variables:
+        -:  334: * mode: c
+        -:  335: * c-basic-offset: 8
+        -:  336: * fill-column: 78
+        -:  337: * End:
+        -:  338: */

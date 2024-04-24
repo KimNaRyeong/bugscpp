@@ -1,0 +1,209 @@
+        -:    0:Source:tif_thunder.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1988-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:#include "tiffiop.h"
+        -:   28:#include <assert.h>
+        -:   29:#ifdef THUNDER_SUPPORT
+        -:   30:/*
+        -:   31: * TIFF Library.
+        -:   32: *
+        -:   33: * ThunderScan 4-bit Compression Algorithm Support
+        -:   34: */
+        -:   35:
+        -:   36:/*
+        -:   37: * ThunderScan uses an encoding scheme designed for
+        -:   38: * 4-bit pixel values.  Data is encoded in bytes, with
+        -:   39: * each byte split into a 2-bit code word and a 6-bit
+        -:   40: * data value.  The encoding gives raw data, runs of
+        -:   41: * pixels, or pixel values encoded as a delta from the
+        -:   42: * previous pixel value.  For the latter, either 2-bit
+        -:   43: * or 3-bit delta values are used, with the deltas packed
+        -:   44: * into a single byte.
+        -:   45: */
+        -:   46:#define	THUNDER_DATA		0x3f	/* mask for 6-bit data */
+        -:   47:#define	THUNDER_CODE		0xc0	/* mask for 2-bit code word */
+        -:   48:/* code values */
+        -:   49:#define	THUNDER_RUN		0x00	/* run of pixels w/ encoded count */
+        -:   50:#define	THUNDER_2BITDELTAS	0x40	/* 3 pixels w/ encoded 2-bit deltas */
+        -:   51:#define	    DELTA2_SKIP		2	/* skip code for 2-bit deltas */
+        -:   52:#define	THUNDER_3BITDELTAS	0x80	/* 2 pixels w/ encoded 3-bit deltas */
+        -:   53:#define	    DELTA3_SKIP		4	/* skip code for 3-bit deltas */
+        -:   54:#define	THUNDER_RAW		0xc0	/* raw data encoded */
+        -:   55:
+        -:   56:static const int twobitdeltas[4] = { 0, 1, 0, -1 };
+        -:   57:static const int threebitdeltas[8] = { 0, 1, 2, 3, 0, -3, -2, -1 };
+        -:   58:
+        -:   59:#define	SETPIXEL(op, v) {                     \
+        -:   60:	lastpixel = (v) & 0xf;                \
+        -:   61:        if ( npixels < maxpixels )         \
+        -:   62:        {                                     \
+        -:   63:	  if (npixels++ & 1)                  \
+        -:   64:	    *op++ |= lastpixel;               \
+        -:   65:	  else                                \
+        -:   66:	    op[0] = (uint8) (lastpixel << 4); \
+        -:   67:        }                                     \
+        -:   68:}
+        -:   69:
+        -:   70:static int
+    #####:   71:ThunderSetupDecode(TIFF* tif)
+        -:   72:{
+        -:   73:	static const char module[] = "ThunderSetupDecode";
+        -:   74:
+    #####:   75:        if( tif->tif_dir.td_bitspersample != 4 )
+        -:   76:        {
+    #####:   77:                TIFFErrorExt(tif->tif_clientdata, module,
+        -:   78:                             "Wrong bitspersample value (%d), Thunder decoder only supports 4bits per sample.",
+    #####:   79:                             (int) tif->tif_dir.td_bitspersample );
+    #####:   80:                return 0;
+        -:   81:        }
+        -:   82:        
+        -:   83:
+    #####:   84:	return (1);
+        -:   85:}
+        -:   86:
+        -:   87:static int
+    #####:   88:ThunderDecode(TIFF* tif, uint8* op, tmsize_t maxpixels)
+        -:   89:{
+        -:   90:	static const char module[] = "ThunderDecode";
+        -:   91:	register unsigned char *bp;
+        -:   92:	register tmsize_t cc;
+        -:   93:	unsigned int lastpixel;
+        -:   94:	tmsize_t npixels;
+        -:   95:
+    #####:   96:	bp = (unsigned char *)tif->tif_rawcp;
+    #####:   97:	cc = tif->tif_rawcc;
+    #####:   98:	lastpixel = 0;
+    #####:   99:	npixels = 0;
+    #####:  100:	while (cc > 0 && npixels < maxpixels) {
+        -:  101:		int n, delta;
+        -:  102:
+    #####:  103:		n = *bp++;
+    #####:  104:		cc--;
+    #####:  105:		switch (n & THUNDER_CODE) {
+    #####:  106:		case THUNDER_RUN:		/* pixel run */
+        -:  107:			/*
+        -:  108:			 * Replicate the last pixel n times,
+        -:  109:			 * where n is the lower-order 6 bits.
+        -:  110:			 */
+    #####:  111:			if (npixels & 1) {
+    #####:  112:				op[0] |= lastpixel;
+    #####:  113:				lastpixel = *op++; npixels++; n--;
+        -:  114:			} else
+    #####:  115:				lastpixel |= lastpixel << 4;
+    #####:  116:			npixels += n;
+    #####:  117:			if (npixels < maxpixels) {
+    #####:  118:				for (; n > 0; n -= 2)
+    #####:  119:					*op++ = (uint8) lastpixel;
+        -:  120:			}
+    #####:  121:			if (n == -1)
+    #####:  122:				*--op &= 0xf0;
+    #####:  123:			lastpixel &= 0xf;
+    #####:  124:			break;
+    #####:  125:		case THUNDER_2BITDELTAS:	/* 2-bit deltas */
+    #####:  126:			if ((delta = ((n >> 4) & 3)) != DELTA2_SKIP)
+    #####:  127:				SETPIXEL(op, lastpixel + twobitdeltas[delta]);
+    #####:  128:			if ((delta = ((n >> 2) & 3)) != DELTA2_SKIP)
+    #####:  129:				SETPIXEL(op, lastpixel + twobitdeltas[delta]);
+    #####:  130:			if ((delta = (n & 3)) != DELTA2_SKIP)
+    #####:  131:				SETPIXEL(op, lastpixel + twobitdeltas[delta]);
+    #####:  132:			break;
+    #####:  133:		case THUNDER_3BITDELTAS:	/* 3-bit deltas */
+    #####:  134:			if ((delta = ((n >> 3) & 7)) != DELTA3_SKIP)
+    #####:  135:				SETPIXEL(op, lastpixel + threebitdeltas[delta]);
+    #####:  136:			if ((delta = (n & 7)) != DELTA3_SKIP)
+    #####:  137:				SETPIXEL(op, lastpixel + threebitdeltas[delta]);
+    #####:  138:			break;
+    #####:  139:		case THUNDER_RAW:		/* raw data */
+    #####:  140:			SETPIXEL(op, n);
+    #####:  141:			break;
+        -:  142:		}
+    #####:  143:	}
+    #####:  144:	tif->tif_rawcp = (uint8*) bp;
+    #####:  145:	tif->tif_rawcc = cc;
+    #####:  146:	if (npixels != maxpixels) {
+        -:  147:#if defined(__WIN32__) && (defined(_MSC_VER) || defined(__MINGW32__))
+        -:  148:		TIFFErrorExt(tif->tif_clientdata, module,
+        -:  149:			     "%s data at scanline %lu (%I64u != %I64u)",
+        -:  150:			     npixels < maxpixels ? "Not enough" : "Too much",
+        -:  151:			     (unsigned long) tif->tif_row,
+        -:  152:			     (unsigned __int64) npixels,
+        -:  153:			     (unsigned __int64) maxpixels);
+        -:  154:#else
+    #####:  155:		TIFFErrorExt(tif->tif_clientdata, module,
+        -:  156:			     "%s data at scanline %lu (%llu != %llu)",
+        -:  157:			     npixels < maxpixels ? "Not enough" : "Too much",
+    #####:  158:			     (unsigned long) tif->tif_row,
+        -:  159:			     (unsigned long long) npixels,
+        -:  160:			     (unsigned long long) maxpixels);
+        -:  161:#endif
+    #####:  162:		return (0);
+        -:  163:	}
+        -:  164:
+    #####:  165:        return (1);
+        -:  166:}
+        -:  167:
+        -:  168:static int
+    #####:  169:ThunderDecodeRow(TIFF* tif, uint8* buf, tmsize_t occ, uint16 s)
+        -:  170:{
+        -:  171:	static const char module[] = "ThunderDecodeRow";
+    #####:  172:	uint8* row = buf;
+        -:  173:	
+        -:  174:	(void) s;
+    #####:  175:	if (occ % tif->tif_scanlinesize)
+        -:  176:	{
+    #####:  177:		TIFFErrorExt(tif->tif_clientdata, module, "Fractional scanlines cannot be read");
+    #####:  178:		return (0);
+        -:  179:	}
+    #####:  180:	while (occ > 0) {
+    #####:  181:		if (!ThunderDecode(tif, row, tif->tif_dir.td_imagewidth))
+    #####:  182:			return (0);
+    #####:  183:		occ -= tif->tif_scanlinesize;
+    #####:  184:		row += tif->tif_scanlinesize;
+        -:  185:	}
+    #####:  186:	return (1);
+        -:  187:}
+        -:  188:
+        -:  189:int
+    #####:  190:TIFFInitThunderScan(TIFF* tif, int scheme)
+        -:  191:{
+        -:  192:	(void) scheme;
+        -:  193:
+    #####:  194:        tif->tif_setupdecode = ThunderSetupDecode;
+    #####:  195:	tif->tif_decoderow = ThunderDecodeRow;
+    #####:  196:	tif->tif_decodestrip = ThunderDecodeRow; 
+    #####:  197:	return (1);
+        -:  198:}
+        -:  199:#endif /* THUNDER_SUPPORT */
+        -:  200:
+        -:  201:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  202:/*
+        -:  203: * Local Variables:
+        -:  204: * mode: c
+        -:  205: * c-basic-offset: 8
+        -:  206: * fill-column: 78
+        -:  207: * End:
+        -:  208: */

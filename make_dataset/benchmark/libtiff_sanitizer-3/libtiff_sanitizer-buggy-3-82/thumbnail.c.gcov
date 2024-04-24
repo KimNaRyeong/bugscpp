@@ -1,0 +1,692 @@
+        -:    0:Source:thumbnail.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1994-1997 Sam Leffler
+        -:    5: * Copyright (c) 1994-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:#include "tif_config.h"
+        -:   28:
+        -:   29:#include <stdio.h>
+        -:   30:#include <stdlib.h>
+        -:   31:#include <string.h>
+        -:   32:#include <math.h>
+        -:   33:
+        -:   34:#ifdef HAVE_UNISTD_H
+        -:   35:# include <unistd.h>
+        -:   36:#endif
+        -:   37:
+        -:   38:#ifdef NEED_LIBPORT
+        -:   39:# include "libport.h"
+        -:   40:#endif
+        -:   41:
+        -:   42:#include "tiffio.h"
+        -:   43:
+        -:   44:#ifndef HAVE_GETOPT
+        -:   45:extern int getopt(int, char**, char*);
+        -:   46:#endif
+        -:   47:
+        -:   48:#define	streq(a,b)	(strcmp(a,b) == 0)
+        -:   49:
+        -:   50:#ifndef TIFFhowmany8
+        -:   51:# define TIFFhowmany8(x) (((x)&0x07)?((uint32)(x)>>3)+1:(uint32)(x)>>3)
+        -:   52:#endif
+        -:   53:
+        -:   54:typedef enum {
+        -:   55:    EXP50,
+        -:   56:    EXP60,
+        -:   57:    EXP70,
+        -:   58:    EXP80,
+        -:   59:    EXP90,
+        -:   60:    EXP,
+        -:   61:    LINEAR
+        -:   62:} Contrast;
+        -:   63:
+        -:   64:static	uint32 tnw = 216;		/* thumbnail width */
+        -:   65:static	uint32 tnh = 274;		/* thumbnail height */
+        -:   66:static	Contrast contrast = LINEAR;	/* current contrast */
+        -:   67:static	uint8* thumbnail;
+        -:   68:
+        -:   69:static	int cpIFD(TIFF*, TIFF*);
+        -:   70:static	int generateThumbnail(TIFF*, TIFF*);
+        -:   71:static	void initScale();
+        -:   72:static	void usage(void);
+        -:   73:
+        -:   74:#if !HAVE_DECL_OPTARG
+        -:   75:extern	char* optarg;
+        -:   76:extern	int optind;
+        -:   77:#endif
+        -:   78:
+        -:   79:int
+    #####:   80:main(int argc, char* argv[])
+        -:   81:{
+        -:   82:    TIFF* in;
+        -:   83:    TIFF* out;
+        -:   84:    int c;
+        -:   85:
+    #####:   86:    while ((c = getopt(argc, argv, "w:h:c:")) != -1) {
+    #####:   87:	switch (c) {
+    #####:   88:	case 'w':	tnw = strtoul(optarg, NULL, 0); break;
+    #####:   89:	case 'h':	tnh = strtoul(optarg, NULL, 0); break;
+    #####:   90:	case 'c':	contrast = streq(optarg, "exp50") ? EXP50 :
+    #####:   91:				   streq(optarg, "exp60") ? EXP60 :
+    #####:   92:				   streq(optarg, "exp70") ? EXP70 :
+    #####:   93:				   streq(optarg, "exp80") ? EXP80 :
+    #####:   94:				   streq(optarg, "exp90") ? EXP90 :
+    #####:   95:				   streq(optarg, "exp")   ? EXP :
+    #####:   96:				   streq(optarg, "linear")? LINEAR :
+        -:   97:							    EXP;
+    #####:   98:			break;
+    #####:   99:	default:	usage();
+        -:  100:	}
+        -:  101:    }
+    #####:  102:    if (argc-optind != 2)
+    #####:  103:	usage();
+        -:  104:
+    #####:  105:    out = TIFFOpen(argv[optind+1], "w");
+    #####:  106:    if (out == NULL)
+    #####:  107:	return 2;
+    #####:  108:    in = TIFFOpen(argv[optind], "r");
+    #####:  109:    if( in == NULL )
+    #####:  110:        return 2;
+        -:  111:
+    #####:  112:    thumbnail = (uint8*) _TIFFmalloc(tnw * tnh);
+    #####:  113:    if (!thumbnail) {
+    #####:  114:	    TIFFError(TIFFFileName(in),
+        -:  115:		      "Can't allocate space for thumbnail buffer.");
+    #####:  116:	    return 1;
+        -:  117:    }
+        -:  118:
+    #####:  119:    if (in != NULL) {
+    #####:  120:	initScale();
+        -:  121:	do {
+    #####:  122:	    if (!generateThumbnail(in, out))
+    #####:  123:		goto bad;
+    #####:  124:	    if (!cpIFD(in, out) || !TIFFWriteDirectory(out))
+    #####:  125:		goto bad;
+    #####:  126:	} while (TIFFReadDirectory(in));
+    #####:  127:	(void) TIFFClose(in);
+        -:  128:    }
+    #####:  129:    (void) TIFFClose(out);
+    #####:  130:    return 0;
+    #####:  131:bad:
+    #####:  132:    (void) TIFFClose(out);
+    #####:  133:    return 1;
+        -:  134:}
+        -:  135:
+        -:  136:#define	CopyField(tag, v) \
+        -:  137:    if (TIFFGetField(in, tag, &v)) TIFFSetField(out, tag, v)
+        -:  138:#define	CopyField2(tag, v1, v2) \
+        -:  139:    if (TIFFGetField(in, tag, &v1, &v2)) TIFFSetField(out, tag, v1, v2)
+        -:  140:#define	CopyField3(tag, v1, v2, v3) \
+        -:  141:    if (TIFFGetField(in, tag, &v1, &v2, &v3)) TIFFSetField(out, tag, v1, v2, v3)
+        -:  142:#define	CopyField4(tag, v1, v2, v3, v4) \
+        -:  143:    if (TIFFGetField(in, tag, &v1, &v2, &v3, &v4)) TIFFSetField(out, tag, v1, v2, v3, v4)
+        -:  144:
+        -:  145:static void
+    #####:  146:cpTag(TIFF* in, TIFF* out, uint16 tag, uint16 count, TIFFDataType type)
+        -:  147:{
+    #####:  148:	switch (type) {
+    #####:  149:	case TIFF_SHORT:
+    #####:  150:		if (count == 1) {
+    #####:  151:			uint16 shortv;
+    #####:  152:			CopyField(tag, shortv);
+    #####:  153:		} else if (count == 2) {
+    #####:  154:			uint16 shortv1, shortv2;
+    #####:  155:			CopyField2(tag, shortv1, shortv2);
+    #####:  156:		} else if (count == 4) {
+    #####:  157:			uint16 *tr, *tg, *tb, *ta;
+    #####:  158:			CopyField4(tag, tr, tg, tb, ta);
+    #####:  159:		} else if (count == (uint16) -1) {
+    #####:  160:			uint16 shortv1;
+    #####:  161:			uint16* shortav;
+    #####:  162:			CopyField2(tag, shortv1, shortav);
+        -:  163:		}
+    #####:  164:		break;
+    #####:  165:	case TIFF_LONG:
+    #####:  166:		{ uint32 longv;
+    #####:  167:		  CopyField(tag, longv);
+        -:  168:		}
+        -:  169:		break;
+    #####:  170:	case TIFF_LONG8:
+    #####:  171:		{ uint64 longv8;
+    #####:  172:		  CopyField(tag, longv8);
+        -:  173:		}
+        -:  174:		break;
+    #####:  175:	case TIFF_SLONG8:
+    #####:  176:		{ int64 longv8;
+    #####:  177:		  CopyField(tag, longv8);
+        -:  178:		}
+        -:  179:		break;
+    #####:  180:	case TIFF_RATIONAL:
+    #####:  181:		if (count == 1) {
+    #####:  182:			float floatv;
+    #####:  183:			CopyField(tag, floatv);
+    #####:  184:		} else if (count == (uint16) -1) {
+    #####:  185:			float* floatav;
+    #####:  186:			CopyField(tag, floatav);
+        -:  187:		}
+    #####:  188:		break;
+    #####:  189:	case TIFF_ASCII:
+    #####:  190:		{ char* stringv;
+    #####:  191:		  CopyField(tag, stringv);
+        -:  192:		}
+        -:  193:		break;
+    #####:  194:	case TIFF_DOUBLE:
+    #####:  195:		if (count == 1) {
+    #####:  196:			double doublev;
+    #####:  197:			CopyField(tag, doublev);
+    #####:  198:		} else if (count == (uint16) -1) {
+    #####:  199:			double* doubleav;
+    #####:  200:			CopyField(tag, doubleav);
+        -:  201:		}
+    #####:  202:		break;
+    #####:  203:	case TIFF_IFD8:
+    #####:  204:		{ toff_t ifd8;
+    #####:  205:		  CopyField(tag, ifd8);
+        -:  206:		}
+    #####:  207:		break;          default:
+    #####:  208:                TIFFError(TIFFFileName(in),
+        -:  209:                          "Data type %d is not supported, tag %d skipped.",
+        -:  210:                          tag, type);
+        -:  211:	}
+    #####:  212:}
+        -:  213:
+        -:  214:#undef CopyField4
+        -:  215:#undef CopyField3
+        -:  216:#undef CopyField2
+        -:  217:#undef CopyField
+        -:  218:
+        -:  219:static struct cpTag {
+        -:  220:    uint16	tag;
+        -:  221:    uint16	count;
+        -:  222:    TIFFDataType type;
+        -:  223:} tags[] = {
+        -:  224:    { TIFFTAG_IMAGEWIDTH,		1, TIFF_LONG },
+        -:  225:    { TIFFTAG_IMAGELENGTH,		1, TIFF_LONG },
+        -:  226:    { TIFFTAG_BITSPERSAMPLE,		1, TIFF_SHORT },
+        -:  227:    { TIFFTAG_COMPRESSION,		1, TIFF_SHORT },
+        -:  228:    { TIFFTAG_FILLORDER,		1, TIFF_SHORT },
+        -:  229:    { TIFFTAG_SAMPLESPERPIXEL,		1, TIFF_SHORT },
+        -:  230:    { TIFFTAG_ROWSPERSTRIP,		1, TIFF_LONG },
+        -:  231:    { TIFFTAG_PLANARCONFIG,		1, TIFF_SHORT },
+        -:  232:    { TIFFTAG_GROUP3OPTIONS,		1, TIFF_LONG },
+        -:  233:    { TIFFTAG_SUBFILETYPE,		1, TIFF_LONG },
+        -:  234:    { TIFFTAG_PHOTOMETRIC,		1, TIFF_SHORT },
+        -:  235:    { TIFFTAG_THRESHHOLDING,		1, TIFF_SHORT },
+        -:  236:    { TIFFTAG_DOCUMENTNAME,		1, TIFF_ASCII },
+        -:  237:    { TIFFTAG_IMAGEDESCRIPTION,		1, TIFF_ASCII },
+        -:  238:    { TIFFTAG_MAKE,			1, TIFF_ASCII },
+        -:  239:    { TIFFTAG_MODEL,			1, TIFF_ASCII },
+        -:  240:    { TIFFTAG_ORIENTATION,		1, TIFF_SHORT },
+        -:  241:    { TIFFTAG_MINSAMPLEVALUE,		1, TIFF_SHORT },
+        -:  242:    { TIFFTAG_MAXSAMPLEVALUE,		1, TIFF_SHORT },
+        -:  243:    { TIFFTAG_XRESOLUTION,		1, TIFF_RATIONAL },
+        -:  244:    { TIFFTAG_YRESOLUTION,		1, TIFF_RATIONAL },
+        -:  245:    { TIFFTAG_PAGENAME,			1, TIFF_ASCII },
+        -:  246:    { TIFFTAG_XPOSITION,		1, TIFF_RATIONAL },
+        -:  247:    { TIFFTAG_YPOSITION,		1, TIFF_RATIONAL },
+        -:  248:    { TIFFTAG_GROUP4OPTIONS,		1, TIFF_LONG },
+        -:  249:    { TIFFTAG_RESOLUTIONUNIT,		1, TIFF_SHORT },
+        -:  250:    { TIFFTAG_PAGENUMBER,		2, TIFF_SHORT },
+        -:  251:    { TIFFTAG_SOFTWARE,			1, TIFF_ASCII },
+        -:  252:    { TIFFTAG_DATETIME,			1, TIFF_ASCII },
+        -:  253:    { TIFFTAG_ARTIST,			1, TIFF_ASCII },
+        -:  254:    { TIFFTAG_HOSTCOMPUTER,		1, TIFF_ASCII },
+        -:  255:    { TIFFTAG_WHITEPOINT,		2, TIFF_RATIONAL },
+        -:  256:    { TIFFTAG_PRIMARYCHROMATICITIES,	(uint16) -1,TIFF_RATIONAL },
+        -:  257:    { TIFFTAG_HALFTONEHINTS,		2, TIFF_SHORT },
+        -:  258:    { TIFFTAG_BADFAXLINES,		1, TIFF_LONG },
+        -:  259:    { TIFFTAG_CLEANFAXDATA,		1, TIFF_SHORT },
+        -:  260:    { TIFFTAG_CONSECUTIVEBADFAXLINES,	1, TIFF_LONG },
+        -:  261:    { TIFFTAG_INKSET,			1, TIFF_SHORT },
+        -:  262:    /*{ TIFFTAG_INKNAMES,			1, TIFF_ASCII },*/ /* Needs much more complicated logic. See tiffcp */
+        -:  263:    { TIFFTAG_DOTRANGE,			2, TIFF_SHORT },
+        -:  264:    { TIFFTAG_TARGETPRINTER,		1, TIFF_ASCII },
+        -:  265:    { TIFFTAG_SAMPLEFORMAT,		1, TIFF_SHORT },
+        -:  266:    { TIFFTAG_YCBCRCOEFFICIENTS,	(uint16) -1,TIFF_RATIONAL },
+        -:  267:    { TIFFTAG_YCBCRSUBSAMPLING,		2, TIFF_SHORT },
+        -:  268:    { TIFFTAG_YCBCRPOSITIONING,		1, TIFF_SHORT },
+        -:  269:    { TIFFTAG_REFERENCEBLACKWHITE,	(uint16) -1,TIFF_RATIONAL },
+        -:  270:    { TIFFTAG_EXTRASAMPLES,		(uint16) -1, TIFF_SHORT },
+        -:  271:};
+        -:  272:#define	NTAGS	(sizeof (tags) / sizeof (tags[0]))
+        -:  273:
+        -:  274:static void
+    #####:  275:cpTags(TIFF* in, TIFF* out)
+        -:  276:{
+        -:  277:    struct cpTag *p;
+    #####:  278:    for (p = tags; p < &tags[NTAGS]; p++)
+        -:  279:	{
+        -:  280:		/* Horrible: but TIFFGetField() expects 2 arguments to be passed */
+        -:  281:		/* if we request a tag that is defined in a codec, but that codec */
+        -:  282:		/* isn't used */
+    #####:  283:		if( p->tag == TIFFTAG_GROUP3OPTIONS )
+        -:  284:		{
+    #####:  285:			uint16 compression;
+    #####:  286:			if( !TIFFGetField(in, TIFFTAG_COMPRESSION, &compression) ||
+    #####:  287:				compression != COMPRESSION_CCITTFAX3 )
+    #####:  288:				continue;
+        -:  289:		}
+    #####:  290:		if( p->tag == TIFFTAG_GROUP4OPTIONS )
+        -:  291:		{
+    #####:  292:			uint16 compression;
+    #####:  293:			if( !TIFFGetField(in, TIFFTAG_COMPRESSION, &compression) ||
+    #####:  294:				compression != COMPRESSION_CCITTFAX4 )
+    #####:  295:				continue;
+        -:  296:		}
+    #####:  297:		cpTag(in, out, p->tag, p->count, p->type);
+        -:  298:	}
+    #####:  299:}
+        -:  300:#undef NTAGS
+        -:  301:
+        -:  302:static int
+    #####:  303:cpStrips(TIFF* in, TIFF* out)
+        -:  304:{
+    #####:  305:    tsize_t bufsize  = TIFFStripSize(in);
+    #####:  306:    unsigned char *buf = (unsigned char *)_TIFFmalloc(bufsize);
+        -:  307:
+    #####:  308:    if (buf) {
+    #####:  309:	tstrip_t s, ns = TIFFNumberOfStrips(in);
+    #####:  310:	uint64 *bytecounts;
+        -:  311:
+    #####:  312:	TIFFGetField(in, TIFFTAG_STRIPBYTECOUNTS, &bytecounts);
+    #####:  313:	for (s = 0; s < ns; s++) {
+    #####:  314:	  if (bytecounts[s] > (uint64) bufsize) {
+    #####:  315:		buf = (unsigned char *)_TIFFrealloc(buf, (tmsize_t)bytecounts[s]);
+    #####:  316:		if (!buf)
+    #####:  317:		    goto bad;
+    #####:  318:		bufsize = (tmsize_t)bytecounts[s];
+        -:  319:	    }
+    #####:  320:	    if (TIFFReadRawStrip(in, s, buf, (tmsize_t)bytecounts[s]) < 0 ||
+    #####:  321:		TIFFWriteRawStrip(out, s, buf, (tmsize_t)bytecounts[s]) < 0) {
+    #####:  322:		_TIFFfree(buf);
+    #####:  323:		return 0;
+        -:  324:	    }
+        -:  325:	}
+    #####:  326:	_TIFFfree(buf);
+    #####:  327:	return 1;
+        -:  328:    }
+        -:  329:
+    #####:  330:bad:
+    #####:  331:	TIFFError(TIFFFileName(in),
+        -:  332:		  "Can't allocate space for strip buffer.");
+    #####:  333:	return 0;
+        -:  334:}
+        -:  335:
+        -:  336:static int
+    #####:  337:cpTiles(TIFF* in, TIFF* out)
+        -:  338:{
+    #####:  339:    tsize_t bufsize = TIFFTileSize(in);
+    #####:  340:    unsigned char *buf = (unsigned char *)_TIFFmalloc(bufsize);
+        -:  341:
+    #####:  342:    if (buf) {
+    #####:  343:	ttile_t t, nt = TIFFNumberOfTiles(in);
+    #####:  344:	uint64 *bytecounts;
+        -:  345:
+    #####:  346:	TIFFGetField(in, TIFFTAG_TILEBYTECOUNTS, &bytecounts);
+    #####:  347:	for (t = 0; t < nt; t++) {
+    #####:  348:	    if (bytecounts[t] > (uint64) bufsize) {
+    #####:  349:		buf = (unsigned char *)_TIFFrealloc(buf, (tmsize_t)bytecounts[t]);
+    #####:  350:		if (!buf)
+    #####:  351:		    goto bad;
+    #####:  352:		bufsize = (tmsize_t)bytecounts[t];
+        -:  353:	    }
+    #####:  354:	    if (TIFFReadRawTile(in, t, buf, (tmsize_t)bytecounts[t]) < 0 ||
+    #####:  355:		TIFFWriteRawTile(out, t, buf, (tmsize_t)bytecounts[t]) < 0) {
+    #####:  356:		_TIFFfree(buf);
+    #####:  357:		return 0;
+        -:  358:	    }
+        -:  359:	}
+    #####:  360:	_TIFFfree(buf);
+    #####:  361:	return 1;
+        -:  362:    }
+        -:  363:
+    #####:  364:bad:
+    #####:  365:    TIFFError(TIFFFileName(in),
+        -:  366:		  "Can't allocate space for tile buffer.");
+    #####:  367:	return (0);
+        -:  368:}
+        -:  369:
+        -:  370:static int
+    #####:  371:cpIFD(TIFF* in, TIFF* out)
+        -:  372:{
+    #####:  373:    cpTags(in, out);
+    #####:  374:    if (TIFFIsTiled(in)) {
+    #####:  375:	if (!cpTiles(in, out))
+    #####:  376:	    return (0);
+        -:  377:    } else {
+    #####:  378:	if (!cpStrips(in, out))
+    #####:  379:	    return (0);
+        -:  380:    }
+    #####:  381:    return (1);
+        -:  382:}
+        -:  383:
+        -:  384:static	uint16	photometric;		/* current photometric of raster */
+        -:  385:static	uint16	filterWidth;		/* filter width in pixels */
+        -:  386:static	uint32	stepSrcWidth;		/* src image stepping width */
+        -:  387:static	uint32	stepDstWidth;		/* dest stepping width */
+        -:  388:static	uint8* src0;			/* horizontal bit stepping (start) */
+        -:  389:static	uint8* src1;			/* horizontal bit stepping (middle) */
+        -:  390:static	uint8* src2;			/* horizontal bit stepping (end) */
+        -:  391:static	uint32* rowoff;			/* row offset for stepping */
+        -:  392:static	uint8 cmap[256];		/* colormap indexes */
+        -:  393:static	uint8 bits[256];		/* count of bits set */
+        -:  394:
+        -:  395:static void
+    #####:  396:setupBitsTables()
+        -:  397:{
+        -:  398:    int i;
+    #####:  399:    for (i = 0; i < 256; i++) {
+    #####:  400:	int n = 0;
+    #####:  401:	if (i&0x01) n++;
+    #####:  402:	if (i&0x02) n++;
+    #####:  403:	if (i&0x04) n++;
+    #####:  404:	if (i&0x08) n++;
+    #####:  405:	if (i&0x10) n++;
+    #####:  406:	if (i&0x20) n++;
+    #####:  407:	if (i&0x40) n++;
+    #####:  408:	if (i&0x80) n++;
+    #####:  409:	bits[i] = n;
+        -:  410:    }
+    #####:  411:}
+        -:  412:
+    #####:  413:static int clamp(float v, int low, int high)
+    #####:  414:    { return (v < low ? low : v > high ? high : (int)v); }
+        -:  415:
+        -:  416:#ifndef M_E
+        -:  417:#define M_E		2.7182818284590452354
+        -:  418:#endif
+        -:  419:
+        -:  420:static void
+    #####:  421:expFill(float pct[], uint32 p, uint32 n)
+        -:  422:{
+        -:  423:    uint32 i;
+    #####:  424:    uint32 c = (p * n) / 100;
+    #####:  425:    for (i = 1; i < c; i++)
+    #####:  426:	pct[i] = (float) (1-exp(i/((double)(n-1)))/ M_E);
+    #####:  427:    for (; i < n; i++)
+    #####:  428:	pct[i] = 0.;
+    #####:  429:}
+        -:  430:
+        -:  431:static void
+    #####:  432:setupCmap()
+        -:  433:{
+    #####:  434:    float pct[256];			/* known to be large enough */
+        -:  435:    uint32 i;
+    #####:  436:    pct[0] = 1;				/* force white */
+    #####:  437:    switch (contrast) {
+    #####:  438:    case EXP50: expFill(pct, 50, 256); break;
+    #####:  439:    case EXP60:	expFill(pct, 60, 256); break;
+    #####:  440:    case EXP70:	expFill(pct, 70, 256); break;
+    #####:  441:    case EXP80:	expFill(pct, 80, 256); break;
+    #####:  442:    case EXP90:	expFill(pct, 90, 256); break;
+    #####:  443:    case EXP:	expFill(pct, 100, 256); break;
+    #####:  444:    case LINEAR:
+    #####:  445:	for (i = 1; i < 256; i++)
+    #####:  446:	    pct[i] = 1-((float)i)/(256-1);
+    #####:  447:	break;
+        -:  448:    }
+    #####:  449:    switch (photometric) {
+    #####:  450:    case PHOTOMETRIC_MINISWHITE:
+    #####:  451:	for (i = 0; i < 256; i++)
+    #####:  452:	    cmap[i] = clamp(255*pct[(256-1)-i], 0, 255);
+    #####:  453:	break;
+    #####:  454:    case PHOTOMETRIC_MINISBLACK:
+    #####:  455:	for (i = 0; i < 256; i++)
+    #####:  456:	    cmap[i] = clamp(255*pct[i], 0, 255);
+    #####:  457:	break;
+        -:  458:    }
+    #####:  459:}
+        -:  460:
+        -:  461:static void
+    #####:  462:initScale()
+        -:  463:{
+    #####:  464:    src0 = (uint8*) _TIFFmalloc(sizeof (uint8) * tnw);
+    #####:  465:    src1 = (uint8*) _TIFFmalloc(sizeof (uint8) * tnw);
+    #####:  466:    src2 = (uint8*) _TIFFmalloc(sizeof (uint8) * tnw);
+    #####:  467:    rowoff = (uint32*) _TIFFmalloc(sizeof (uint32) * tnw);
+    #####:  468:    filterWidth = 0;
+    #####:  469:    stepDstWidth = stepSrcWidth = 0;
+    #####:  470:    setupBitsTables();
+    #####:  471:}
+        -:  472:
+        -:  473:/*
+        -:  474: * Calculate the horizontal accumulation parameteres
+        -:  475: * according to the widths of the src and dst images.
+        -:  476: */
+        -:  477:static void
+    #####:  478:setupStepTables(uint32 sw)
+        -:  479:{
+    #####:  480:    if (stepSrcWidth != sw || stepDstWidth != tnw) {
+    #####:  481:	int step = sw;
+    #####:  482:	int limit = tnw;
+    #####:  483:	int err = 0;
+    #####:  484:	uint32 sx = 0;
+        -:  485:	uint32 x;
+        -:  486:	int fw;
+        -:  487:	uint8 b;
+    #####:  488:	for (x = 0; x < tnw; x++) {
+    #####:  489:	    uint32 sx0 = sx;
+    #####:  490:	    err += step;
+    #####:  491:	    while (err >= limit) {
+    #####:  492:		err -= limit;
+    #####:  493:		sx++;
+        -:  494:	    }
+    #####:  495:	    rowoff[x] = sx0 >> 3;
+    #####:  496:	    fw = sx - sx0;		/* width */
+    #####:  497:	    b = (fw < 8) ? 0xff<<(8-fw) : 0xff;
+    #####:  498:	    src0[x] = b >> (sx0&7);
+    #####:  499:	    fw -= 8 - (sx0&7);
+    #####:  500:	    if (fw < 0)
+    #####:  501:		fw = 0;
+    #####:  502:	    src1[x] = fw >> 3;
+    #####:  503:	    fw -= (fw>>3)<<3;
+    #####:  504:	    src2[x] = 0xff << (8-fw);
+        -:  505:	}
+    #####:  506:	stepSrcWidth = sw;
+    #####:  507:	stepDstWidth = tnw;
+        -:  508:    }
+    #####:  509:}
+        -:  510:
+        -:  511:static void
+    #####:  512:setrow(uint8* row, uint32 nrows, const uint8* rows[])
+        -:  513:{
+        -:  514:    uint32 x;
+    #####:  515:    uint32 area = nrows * filterWidth;
+    #####:  516:    for (x = 0; x < tnw; x++) {
+    #####:  517:	uint32 mask0 = src0[x];
+    #####:  518:	uint32 fw = src1[x];
+    #####:  519:	uint32 mask1 = src1[x];
+    #####:  520:	uint32 off = rowoff[x];
+    #####:  521:	uint32 acc = 0;
+        -:  522:	uint32 y, i;
+    #####:  523:	for (y = 0; y < nrows; y++) {
+    #####:  524:	    const uint8* src = rows[y] + off;
+    #####:  525:	    acc += bits[*src++ & mask0];
+    #####:  526:	    switch (fw) {
+    #####:  527:	    default:
+    #####:  528:		for (i = fw; i > 8; i--)
+    #####:  529:		    acc += bits[*src++];
+        -:  530:		/* fall thru... */
+    #####:  531:	    case 8: acc += bits[*src++];
+    #####:  532:	    case 7: acc += bits[*src++];
+    #####:  533:	    case 6: acc += bits[*src++];
+    #####:  534:	    case 5: acc += bits[*src++];
+    #####:  535:	    case 4: acc += bits[*src++];
+    #####:  536:	    case 3: acc += bits[*src++];
+    #####:  537:	    case 2: acc += bits[*src++];
+    #####:  538:	    case 1: acc += bits[*src++];
+    #####:  539:	    case 0: break;
+        -:  540:	    }
+    #####:  541:	    acc += bits[*src & mask1];
+        -:  542:	}
+    #####:  543:	*row++ = cmap[(255*acc)/area];
+        -:  544:    }
+    #####:  545:}
+        -:  546:
+        -:  547:/*
+        -:  548: * Install the specified image.  The
+        -:  549: * image is resized to fit the display page using
+        -:  550: * a box filter.  The resultant pixels are mapped
+        -:  551: * with a user-selectable contrast curve.
+        -:  552: */
+        -:  553:static void
+    #####:  554:setImage1(const uint8* br, uint32 rw, uint32 rh)
+        -:  555:{
+    #####:  556:    int step = rh;
+    #####:  557:    int limit = tnh;
+    #####:  558:    int err = 0;
+    #####:  559:    int bpr = TIFFhowmany8(rw);
+    #####:  560:    int sy = 0;
+    #####:  561:    uint8* row = thumbnail;
+        -:  562:    uint32 dy;
+    #####:  563:    for (dy = 0; dy < tnh; dy++) {
+    #####:  564:	const uint8* rows[256];
+    #####:  565:	uint32 nrows = 1;
+    #####:  566:	fprintf(stderr, "bpr=%d, sy=%d, bpr*sy=%d\n", bpr, sy, bpr*sy);
+    #####:  567:	rows[0] = br + bpr*sy;
+    #####:  568:	err += step;
+    #####:  569:	while (err >= limit) {
+    #####:  570:	    err -= limit;
+    #####:  571:	    sy++;
+    #####:  572:	    if (err >= limit)
+        -:  573:		{
+        -:  574:			/* We should perhaps error loudly, but I can't make sense of that */
+        -:  575:			/* code... */
+    #####:  576:			if( nrows == 256 )
+    #####:  577:				break;
+    #####:  578:			rows[nrows++] = br + bpr*sy;
+        -:  579:		}
+        -:  580:	}
+    #####:  581:	setrow(row, nrows, rows);
+    #####:  582:	row += tnw;
+        -:  583:    }
+    #####:  584:}
+        -:  585:
+        -:  586:static void
+    #####:  587:setImage(const uint8* br, uint32 rw, uint32 rh)
+        -:  588:{
+    #####:  589:    filterWidth = (uint16) ceil((double) rw / (double) tnw);
+    #####:  590:    setupStepTables(rw);
+    #####:  591:    setImage1(br, rw, rh);
+    #####:  592:}
+        -:  593:
+        -:  594:static int
+    #####:  595:generateThumbnail(TIFF* in, TIFF* out)
+        -:  596:{
+        -:  597:    unsigned char* raster;
+        -:  598:    unsigned char* rp;
+    #####:  599:    uint32 sw, sh, rps;
+    #####:  600:    uint16 bps, spp;
+        -:  601:    tsize_t rowsize, rastersize;
+    #####:  602:    tstrip_t s, ns = TIFFNumberOfStrips(in);
+    #####:  603:    toff_t diroff[1];
+        -:  604:
+    #####:  605:    TIFFGetField(in, TIFFTAG_IMAGEWIDTH, &sw);
+    #####:  606:    TIFFGetField(in, TIFFTAG_IMAGELENGTH, &sh);
+    #####:  607:    TIFFGetFieldDefaulted(in, TIFFTAG_BITSPERSAMPLE, &bps);
+    #####:  608:    TIFFGetFieldDefaulted(in, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    #####:  609:    TIFFGetFieldDefaulted(in, TIFFTAG_ROWSPERSTRIP, &rps);
+    #####:  610:    if (spp != 1 || bps != 1)
+    #####:  611:	return 0;
+    #####:  612:    rowsize = TIFFScanlineSize(in);
+    #####:  613:    rastersize = sh * rowsize;
+    #####:  614:    fprintf(stderr, "rastersize=%u\n", (unsigned int)rastersize);
+        -:  615:	/* +3 : add a few guard bytes since setrow() can read a bit */
+        -:  616:	/* outside buffer */
+    #####:  617:    raster = (unsigned char*)_TIFFmalloc(rastersize+3);
+    #####:  618:    if (!raster) {
+    #####:  619:	    TIFFError(TIFFFileName(in),
+        -:  620:		      "Can't allocate space for raster buffer.");
+    #####:  621:	    return 0;
+        -:  622:    }
+    #####:  623:    raster[rastersize] = 0;
+    #####:  624:    raster[rastersize+1] = 0;
+    #####:  625:    raster[rastersize+2] = 0;
+    #####:  626:    rp = raster;
+    #####:  627:    for (s = 0; s < ns; s++) {
+    #####:  628:	(void) TIFFReadEncodedStrip(in, s, rp, -1);
+    #####:  629:	rp += rps * rowsize;
+        -:  630:    }
+    #####:  631:    TIFFGetField(in, TIFFTAG_PHOTOMETRIC, &photometric);
+    #####:  632:    setupCmap();
+    #####:  633:    setImage(raster, sw, sh);
+    #####:  634:    _TIFFfree(raster);
+        -:  635:
+    #####:  636:    TIFFSetField(out, TIFFTAG_SUBFILETYPE, FILETYPE_REDUCEDIMAGE);
+    #####:  637:    TIFFSetField(out, TIFFTAG_IMAGEWIDTH, (uint32) tnw);
+    #####:  638:    TIFFSetField(out, TIFFTAG_IMAGELENGTH, (uint32) tnh);
+    #####:  639:    TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, (uint16) 8);
+    #####:  640:    TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, (uint16) 1);
+    #####:  641:    TIFFSetField(out, TIFFTAG_COMPRESSION, COMPRESSION_PACKBITS);
+    #####:  642:    TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISWHITE);
+    #####:  643:    TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    #####:  644:    TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    #####:  645:    cpTag(in, out, TIFFTAG_SOFTWARE,		(uint16) -1, TIFF_ASCII);
+    #####:  646:    cpTag(in, out, TIFFTAG_IMAGEDESCRIPTION,	(uint16) -1, TIFF_ASCII);
+    #####:  647:    cpTag(in, out, TIFFTAG_DATETIME,		(uint16) -1, TIFF_ASCII);
+    #####:  648:    cpTag(in, out, TIFFTAG_HOSTCOMPUTER,	(uint16) -1, TIFF_ASCII);
+    #####:  649:    diroff[0] = 0UL;
+    #####:  650:    TIFFSetField(out, TIFFTAG_SUBIFD, 1, diroff);
+    #####:  651:    return (TIFFWriteEncodedStrip(out, 0, thumbnail, tnw*tnh) != -1 &&
+    #####:  652:            TIFFWriteDirectory(out) != -1);
+        -:  653:}
+        -:  654:
+        -:  655:char* stuff[] = {
+        -:  656:"usage: thumbnail [options] input.tif output.tif",
+        -:  657:"where options are:",
+        -:  658:" -h #		specify thumbnail image height (default is 274)",
+        -:  659:" -w #		specify thumbnail image width (default is 216)",
+        -:  660:"",
+        -:  661:" -c linear	use linear contrast curve",
+        -:  662:" -c exp50	use 50% exponential contrast curve",
+        -:  663:" -c exp60	use 60% exponential contrast curve",
+        -:  664:" -c exp70	use 70% exponential contrast curve",
+        -:  665:" -c exp80	use 80% exponential contrast curve",
+        -:  666:" -c exp90	use 90% exponential contrast curve",
+        -:  667:" -c exp		use pure exponential contrast curve",
+        -:  668:NULL
+        -:  669:};
+        -:  670:
+        -:  671:static void
+    #####:  672:usage(void)
+        -:  673:{
+    #####:  674:	char buf[BUFSIZ];
+        -:  675:	int i;
+        -:  676:
+    #####:  677:	setbuf(stderr, buf);
+    #####:  678:        fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:  679:	for (i = 0; stuff[i] != NULL; i++)
+    #####:  680:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:  681:	exit(-1);
+        -:  682:}
+        -:  683:
+        -:  684:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  685:/*
+        -:  686: * Local Variables:
+        -:  687: * mode: c
+        -:  688: * c-basic-offset: 8
+        -:  689: * fill-column: 78
+        -:  690: * End:
+        -:  691: */

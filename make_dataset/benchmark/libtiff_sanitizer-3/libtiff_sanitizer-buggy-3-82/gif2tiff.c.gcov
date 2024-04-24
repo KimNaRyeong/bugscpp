@@ -1,0 +1,592 @@
+        -:    0:Source:gif2tiff.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1990-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:/*
+        -:   28: *	convert a GIF file into a TIFF file.
+        -:   29: *	based on Paul Haeberli's fromgif program which in turn is
+        -:   30: *	based on a GIF file reader by Marcel J.E. Mol March 23 1989 
+        -:   31: *
+        -:   32: *	if input is 320 by 200 pixel aspect is probably 1.2
+        -:   33: *	if input is 640 350 pixel aspect is probably 1.37
+        -:   34: *
+        -:   35: */
+        -:   36:#include "tif_config.h"
+        -:   37:
+        -:   38:#include <stdio.h>
+        -:   39:#include <stdlib.h>
+        -:   40:#include <string.h>
+        -:   41:#include <errno.h>
+        -:   42:#include <math.h>
+        -:   43:
+        -:   44:#ifdef HAVE_UNISTD_H
+        -:   45:# include <unistd.h>
+        -:   46:#endif
+        -:   47:
+        -:   48:#ifdef NEED_LIBPORT
+        -:   49:# include "libport.h"
+        -:   50:#endif
+        -:   51:
+        -:   52:#include "tiffio.h"
+        -:   53:
+        -:   54:#define	GIFGAMMA	(1.5)		/* smaller makes output img brighter */
+        -:   55:#define	IMAX		0xffff		/* max intensity value */
+        -:   56:#define EXTRAFUDGE	128		/* some people write BAD .gif files */
+        -:   57:
+        -:   58:#define	streq(a,b)	(strcmp(a,b) == 0)
+        -:   59:#define	strneq(a,b,n)	(strncmp(a,b,n) == 0)
+        -:   60:
+        -:   61:unsigned short gamtab[256];
+        -:   62:
+        -:   63:void
+    #####:   64:makegamtab(float gam)
+        -:   65:{
+        -:   66:    int i;
+        -:   67:
+    #####:   68:    for(i=0; i<256; i++) 
+    #####:   69:	gamtab[i] = (unsigned short) (IMAX*pow(i/255.0,gam)+0.5);
+    #####:   70:}
+        -:   71:
+        -:   72:char* stuff[] = {
+        -:   73:"usage: gif2tiff [options] input.gif output.tif",
+        -:   74:"where options are:",
+        -:   75:" -r #		make each strip have no more than # rows",
+        -:   76:"",
+        -:   77:" -c lzw[:opts]	compress output with Lempel-Ziv & Welch encoding",
+        -:   78:" -c zip[:opts]	compress output with deflate encoding",
+        -:   79:" -c packbits	compress output with packbits encoding",
+        -:   80:" -c none	use no compression algorithm on output",
+        -:   81:"",
+        -:   82:"LZW and deflate options:",
+        -:   83:" #		set predictor value",
+        -:   84:"For example, -c lzw:2 to get LZW-encoded data with horizontal differencing",
+        -:   85:NULL
+        -:   86:};
+        -:   87:
+        -:   88:static void
+    #####:   89:usage(void)
+        -:   90:{
+    #####:   91:	char buf[BUFSIZ];
+        -:   92:	int i;
+        -:   93:
+    #####:   94:	setbuf(stderr, buf);
+    #####:   95:        fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:   96:	for (i = 0; stuff[i] != NULL; i++)
+    #####:   97:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:   98:	exit(-1);
+        -:   99:}
+        -:  100:
+        -:  101:#define COLSIZE 256
+        -:  102:
+        -:  103:unsigned char *stackp;
+        -:  104:unsigned int prefix[4096];
+        -:  105:unsigned char suffix[4096];
+        -:  106:unsigned char stack[4096];
+        -:  107:int datasize,codesize,codemask;     /* Decoder working variables */
+        -:  108:int clear,eoi;                      /* Special code values */
+        -:  109:int avail, oldcode;
+        -:  110:
+        -:  111:FILE *infile;
+        -:  112:int global;                        /* Is there a global color map? */
+        -:  113:int globalbits;                     /* Number of bits of global colors */
+        -:  114:unsigned char globalmap[COLSIZE][3];/* RGB values for global color map */
+        -:  115:unsigned char *raster;              /* Decoded image data */
+        -:  116:unsigned long width, height;
+        -:  117:unsigned short red[COLSIZE];
+        -:  118:unsigned short green[COLSIZE];
+        -:  119:unsigned short blue[COLSIZE];
+        -:  120:char *filename, *imagename;
+        -:  121:
+        -:  122:static	uint16 compression = COMPRESSION_PACKBITS;
+        -:  123:static	uint16 predictor = 0;
+        -:  124:static	uint32 rowsperstrip = (uint32) -1;
+        -:  125:static	int processCompressOptions(char*);
+        -:  126:
+        -:  127:int	convert(void);
+        -:  128:int	checksignature(void);
+        -:  129:int	readscreen(void);
+        -:  130:int	readgifimage(char*);
+        -:  131:int	readextension(void);
+        -:  132:int	readraster(void);
+        -:  133:int	process(int, unsigned char**);
+        -:  134:void	initcolors(unsigned char [COLSIZE][3], int);
+        -:  135:void	rasterize(int, char*);
+        -:  136:
+        -:  137:int
+    #####:  138:main(int argc, char* argv[])
+        -:  139:{
+        -:  140:#if !HAVE_DECL_OPTARG
+        -:  141:    extern int optind;
+        -:  142:    extern char *optarg;
+        -:  143:#endif
+        -:  144:
+        -:  145:    int c, status;
+        -:  146:
+    #####:  147:    while ((c = getopt(argc, argv, "c:r:")) != -1)
+    #####:  148:	    switch (c) {
+    #####:  149:	    case 'c':		/* compression scheme */
+    #####:  150:		    if (!processCompressOptions(optarg))
+    #####:  151:			    usage();
+    #####:  152:		    break;
+    #####:  153:	    case 'r':		/* rows/strip */
+    #####:  154:		    rowsperstrip = atoi(optarg);
+    #####:  155:		    break;
+    #####:  156:	    case '?':
+    #####:  157:		    usage();
+        -:  158:		    /*NOTREACHED*/
+        -:  159:	    }
+    #####:  160:    if (argc - optind != 2)
+    #####:  161:	    usage();
+        -:  162:
+    #####:  163:    makegamtab(GIFGAMMA);
+    #####:  164:    filename = argv[optind];
+    #####:  165:    imagename = argv[optind+1];
+    #####:  166:    if ((infile = fopen(imagename, "rb")) != NULL) {
+        -:  167:	int c;
+    #####:  168:	fclose(infile);
+    #####:  169:	printf("overwrite %s? ", imagename); fflush(stdout);
+    #####:  170:	c = getc(stdin);
+    #####:  171:	if (c != 'y' && c != 'Y')
+    #####:  172:	    return (1);
+        -:  173:    }
+    #####:  174:    if ((infile = fopen(filename, "rb")) == NULL) {
+    #####:  175:	perror(filename);
+    #####:  176:	return (1);
+        -:  177:    }
+    #####:  178:    status = convert();
+    #####:  179:    fclose(infile);
+    #####:  180:    return (status);
+        -:  181:}
+        -:  182:
+        -:  183:static int
+    #####:  184:processCompressOptions(char* opt)
+        -:  185:{
+    #####:  186:	if (streq(opt, "none"))
+    #####:  187:		compression = COMPRESSION_NONE;
+    #####:  188:	else if (streq(opt, "packbits"))
+    #####:  189:		compression = COMPRESSION_PACKBITS;
+    #####:  190:	else if (strneq(opt, "lzw", 3)) {
+    #####:  191:		char* cp = strchr(opt, ':');
+    #####:  192:		if (cp)
+    #####:  193:			predictor = atoi(cp+1);
+    #####:  194:		compression = COMPRESSION_LZW;
+    #####:  195:	} else if (strneq(opt, "zip", 3)) {
+    #####:  196:		char* cp = strchr(opt, ':');
+    #####:  197:		if (cp)
+    #####:  198:			predictor = atoi(cp+1);
+    #####:  199:		compression = COMPRESSION_DEFLATE;
+        -:  200:	} else
+    #####:  201:		return (0);
+    #####:  202:	return (1);
+        -:  203:}
+        -:  204:
+        -:  205:int
+    #####:  206:convert(void)
+        -:  207:{
+        -:  208:    int ch;
+    #####:  209:    char* mode = "w";
+        -:  210:
+    #####:  211:    if (!checksignature())
+    #####:  212:        return (-1);
+    #####:  213:    if (!readscreen())
+    #####:  214:        return (-1);
+    #####:  215:    while ((ch = getc(infile)) != ';' && ch != EOF) {
+    #####:  216:        switch (ch) {
+    #####:  217:            case '\0':  break;  /* this kludge for non-standard files */
+    #####:  218:            case ',':   if (!readgifimage(mode))
+    #####:  219:                           return (-1);
+    #####:  220:			mode = "a";		/* subsequent images append */
+    #####:  221:                        break;
+    #####:  222:        case '!':   if (!readextension())
+    #####:  223:                            return (-1);
+    #####:  224:                        break;
+    #####:  225:            default:    fprintf(stderr, "illegal GIF block type\n");
+    #####:  226:                        return (-1);
+        -:  227:        }
+        -:  228:    }
+    #####:  229:    return (0);
+        -:  230:}
+        -:  231:
+        -:  232:int
+    #####:  233:checksignature(void)
+        -:  234:{
+    #####:  235:    char buf[6];
+        -:  236:
+    #####:  237:    if (fread(buf,1,6,infile) != 6) {
+    #####:  238:        fprintf(stderr, "short read from file %s (%s)\n",
+    #####:  239:                filename, strerror(errno));
+    #####:  240:        return 0;
+        -:  241:    }
+    #####:  242:    if (strncmp(buf,"GIF",3)) {
+    #####:  243:        fprintf(stderr, "file is not a GIF file\n");
+    #####:  244:        return 0;
+        -:  245:    }
+    #####:  246:    if (strncmp(&buf[3],"87a",3)) {
+    #####:  247:        fprintf(stderr, "unknown GIF version number\n");
+    #####:  248:        return 0;
+        -:  249:    }
+    #####:  250:    return 1;
+        -:  251:}
+        -:  252:
+        -:  253:/*
+        -:  254: * 	readscreen - 
+        -:  255: *		Get information which is global to all the images stored 
+        -:  256: *	in the file
+        -:  257: */
+        -:  258:int
+    #####:  259:readscreen(void)
+        -:  260:{
+    #####:  261:    unsigned char buf[7];
+        -:  262:
+    #####:  263:    if (fread(buf,1,7,infile) != 7) {
+    #####:  264:        fprintf(stderr, "short read from file %s (%s)\n",
+    #####:  265:                filename, strerror(errno));
+    #####:  266:        return 0;
+        -:  267:    }
+    #####:  268:    global = buf[4] & 0x80;
+    #####:  269:    if (global) {
+    #####:  270:        globalbits = (buf[4] & 0x07) + 1;
+    #####:  271:        if (fread(globalmap,3,((size_t)1)<<globalbits,infile) !=
+    #####:  272:            ((size_t)1)<<globalbits) {
+    #####:  273:            fprintf(stderr, "short read from file %s (%s)\n",
+    #####:  274:                    filename, strerror(errno));
+    #####:  275:            return 0;
+        -:  276:        }
+        -:  277:    }
+    #####:  278:    return 1;
+        -:  279:}
+        -:  280:
+        -:  281:int
+    #####:  282:readgifimage(char* mode)
+        -:  283:{
+    #####:  284:    unsigned char buf[9];
+        -:  285:    int local, interleaved;
+    #####:  286:    unsigned char localmap[256][3];
+        -:  287:    int localbits;
+        -:  288:    int status;
+        -:  289:    size_t raster_size;
+        -:  290:
+    #####:  291:    if (fread(buf, 1, 9, infile) != 9) {
+    #####:  292:        fprintf(stderr, "short read from file %s (%s)\n",
+    #####:  293:                filename, strerror(errno));
+    #####:  294:	return (0);
+        -:  295:    }
+    #####:  296:    width = (buf[4] + (buf[5] << 8)) & 0xffff; /* 16 bit */
+    #####:  297:    height = (buf[6] + (buf[7] << 8)) & 0xffff;  /* 16 bit */
+    #####:  298:    local = buf[8] & 0x80;
+    #####:  299:    interleaved = buf[8] & 0x40;
+    #####:  300:    if (width == 0UL || height == 0UL || (width > 2000000000UL / height)) {
+    #####:  301:        fprintf(stderr, "Invalid value of width or height\n");
+    #####:  302:        return(0);
+        -:  303:    }
+    #####:  304:    if (local == 0 && global == 0) {
+    #####:  305:        fprintf(stderr, "no colormap present for image\n");
+    #####:  306:        return (0);
+        -:  307:    }
+    #####:  308:    raster_size=width*height;
+    #####:  309:    if ((raster_size/width) == height) {
+    #####:  310:        raster_size += EXTRAFUDGE;  /* Add elbow room */
+        -:  311:    } else {
+    #####:  312:        raster_size=0;
+        -:  313:    }
+    #####:  314:    if ((raster = (unsigned char*) _TIFFmalloc(raster_size)) == NULL) {
+    #####:  315:        fprintf(stderr, "not enough memory for image\n");
+    #####:  316:        return (0);
+        -:  317:    }
+    #####:  318:    if (local) {
+    #####:  319:        localbits = (buf[8] & 0x7) + 1;
+        -:  320:
+    #####:  321:        fprintf(stderr, "   local colors: %d\n", 1<<localbits);
+        -:  322:
+    #####:  323:        if (fread(localmap, 3, ((size_t)1)<<localbits, infile) !=
+    #####:  324:            ((size_t)1)<<localbits) {
+    #####:  325:            fprintf(stderr, "short read from file %s (%s)\n",
+    #####:  326:                    filename, strerror(errno));
+    #####:  327:            return (0);
+        -:  328:        }
+    #####:  329:        initcolors(localmap, 1<<localbits);
+    #####:  330:    } else if (global) {
+    #####:  331:        initcolors(globalmap, 1<<globalbits);
+        -:  332:    }
+    #####:  333:    if ((status = readraster()))
+    #####:  334:	rasterize(interleaved, mode);
+    #####:  335:    _TIFFfree(raster);
+    #####:  336:    return status;
+        -:  337:}
+        -:  338:
+        -:  339:/*
+        -:  340: * 	readextension -
+        -:  341: *		Read a GIF extension block (and do nothing with it).
+        -:  342: *
+        -:  343: */
+        -:  344:int
+    #####:  345:readextension(void)
+        -:  346:{
+        -:  347:    int count;
+    #####:  348:    char buf[255];
+    #####:  349:    int status = 1;
+        -:  350:
+    #####:  351:    (void) getc(infile);
+    #####:  352:    while ((count = getc(infile)) && count <= 255)
+    #####:  353:        if (fread(buf, 1, count, infile) != (size_t) count) {
+    #####:  354:            fprintf(stderr, "short read from file %s (%s)\n",
+    #####:  355:                    filename, strerror(errno));
+    #####:  356:            status = 0;
+    #####:  357:            break;
+        -:  358:        }
+    #####:  359:    return status;
+        -:  360:}
+        -:  361:
+        -:  362:/*
+        -:  363: * 	readraster -
+        -:  364: *		Decode a raster image
+        -:  365: *
+        -:  366: */
+        -:  367:int
+    #####:  368:readraster(void)
+        -:  369:{
+    #####:  370:    unsigned char *fill = raster;
+    #####:  371:    unsigned char buf[255];
+    #####:  372:    register int bits=0;
+    #####:  373:    register unsigned long datum=0;
+        -:  374:    register unsigned char *ch;
+        -:  375:    register int count, code;
+    #####:  376:    int status = 1;
+        -:  377:
+    #####:  378:    datasize = getc(infile);
+    #####:  379:    if (datasize > 12)
+    #####:  380:	return 0;
+    #####:  381:    clear = 1 << datasize;
+    #####:  382:    eoi = clear + 1;
+    #####:  383:    avail = clear + 2;
+    #####:  384:    oldcode = -1;
+    #####:  385:    codesize = datasize + 1;
+    #####:  386:    codemask = (1 << codesize) - 1;
+    #####:  387:    for (code = 0; code < clear; code++) {
+    #####:  388:	prefix[code] = 0;
+    #####:  389:	suffix[code] = code;
+        -:  390:    }
+    #####:  391:    stackp = stack;
+    #####:  392:    for (count = getc(infile); count > 0 && count <= 255; count = getc(infile)) {
+    #####:  393:	if (fread(buf,1,count,infile) != (size_t)count) {
+    #####:  394:            fprintf(stderr, "short read from file %s (%s)\n",
+    #####:  395:                    filename, strerror(errno));
+    #####:  396:            return 0;
+        -:  397:        }
+    #####:  398:	for (ch=buf; count-- > 0; ch++) {
+    #####:  399:	    datum += (unsigned long) *ch << bits;
+    #####:  400:	    bits += 8;
+    #####:  401:	    while (bits >= codesize) {
+    #####:  402:		code = datum & codemask;
+    #####:  403:		datum >>= codesize;
+    #####:  404:		bits -= codesize;
+    #####:  405:		if (code == eoi) {               /* This kludge put in */
+    #####:  406:		    goto exitloop;               /* because some GIF files*/
+        -:  407:		}                                /* aren't standard */
+    #####:  408:		if (!process(code, &fill)) {
+    #####:  409:		    status = 0;
+    #####:  410:		    goto exitloop;
+        -:  411:		}
+        -:  412:	    }
+        -:  413:	}
+    #####:  414:	if (fill >= raster + width*height) {
+    #####:  415:	    fprintf(stderr, "raster full before eoi code\n");
+    #####:  416:	    break;
+        -:  417:	}
+        -:  418:    }
+    #####:  419:exitloop:
+    #####:  420:    if (fill != raster + width*height)  {
+    #####:  421:	fprintf(stderr, "warning: wrong rastersize: %ld bytes\n",
+        -:  422:						      (long) (fill-raster));
+    #####:  423:	fprintf(stderr, "         instead of %ld bytes\n",
+        -:  424:						      (long) width*height);
+        -:  425:    }
+    #####:  426:    return status;
+        -:  427:}
+        -:  428:
+        -:  429:/*
+        -:  430: * 	process - 
+        -:  431: *		Process a compression code.  "clear" resets the code table.  
+        -:  432: *	Otherwise make a new code table entry, and output the bytes 
+        -:  433: *	associated with the code.
+        -:  434: */
+        -:  435:int
+    #####:  436:process(register int code, unsigned char** fill)
+        -:  437:{
+        -:  438:    int incode;
+        -:  439:    static unsigned char firstchar;
+        -:  440:
+    #####:  441:    if (code == clear) {
+    #####:  442:	codesize = datasize + 1;
+    #####:  443:	codemask = (1 << codesize) - 1;
+    #####:  444:	avail = clear + 2;
+    #####:  445:	oldcode = -1;
+    #####:  446:	return 1;
+        -:  447:    }
+        -:  448:
+    #####:  449:    if (oldcode == -1) {
+    #####:  450:        if (code >= clear) {
+    #####:  451:            fprintf(stderr, "bad input: code=%d is larger than clear=%d\n",code, clear);
+    #####:  452:            return 0;
+        -:  453:        }
+    #####:  454:        if (*fill >= raster + width*height) {
+    #####:  455:            fprintf(stderr, "raster full before eoi code\n");
+    #####:  456:            return 0;
+        -:  457:        }
+    #####:  458:	*(*fill)++ = suffix[code];
+    #####:  459:	firstchar = oldcode = code;
+    #####:  460:	return 1;
+        -:  461:    }
+    #####:  462:    if (code > avail) {
+    #####:  463:	fprintf(stderr, "code %d too large for %d\n", code, avail);
+    #####:  464:	return 0; 
+        -:  465:    }
+        -:  466:
+    #####:  467:    incode = code;
+    #####:  468:    if (code == avail) {      /* the first code is always < avail */
+    #####:  469:	*stackp++ = firstchar;
+    #####:  470:	code = oldcode;
+        -:  471:    }
+    #####:  472:    while (code > clear) {
+    #####:  473:	*stackp++ = suffix[code];
+    #####:  474:	code = prefix[code];
+        -:  475:    }
+        -:  476:
+    #####:  477:    *stackp++ = firstchar = suffix[code];
+    #####:  478:    prefix[avail] = oldcode;
+    #####:  479:    suffix[avail] = firstchar;
+    #####:  480:    avail++;
+        -:  481:
+    #####:  482:    if (((avail & codemask) == 0) && (avail < 4096)) {
+    #####:  483:	codesize++;
+    #####:  484:	codemask += avail;
+        -:  485:    }
+    #####:  486:    oldcode = incode;
+        -:  487:    do {
+    #####:  488:        if (*fill >= raster + width*height) {
+    #####:  489:            fprintf(stderr, "raster full before eoi code\n");
+    #####:  490:            return 0;
+        -:  491:        }
+    #####:  492:	*(*fill)++ = *--stackp;
+    #####:  493:    } while (stackp > stack);
+    #####:  494:    return 1;
+        -:  495:}
+        -:  496:
+        -:  497:/*
+        -:  498: * 	initcolors -
+        -:  499: *		Convert a color map (local or global) to arrays with R, G and B
+        -:  500: * 	values. 
+        -:  501: *
+        -:  502: */
+        -:  503:void
+    #####:  504:initcolors(unsigned char colormap[COLSIZE][3], int ncolors)
+        -:  505:{
+        -:  506:    register int i;
+        -:  507:
+    #####:  508:    for (i = 0; i < ncolors; i++) {
+    #####:  509:        red[i]   = gamtab[colormap[i][0]];
+    #####:  510:        green[i] = gamtab[colormap[i][1]];
+    #####:  511:        blue[i]  = gamtab[colormap[i][2]];
+        -:  512:    }
+    #####:  513:}
+        -:  514:
+        -:  515:void
+    #####:  516:rasterize(int interleaved, char* mode)
+        -:  517:{
+        -:  518:    register unsigned long row;
+        -:  519:    unsigned char *newras;
+        -:  520:    unsigned char *ras;
+        -:  521:    TIFF *tif;
+        -:  522:    tstrip_t strip;
+        -:  523:    tsize_t stripsize;
+        -:  524:
+    #####:  525:    if ((newras = (unsigned char*) _TIFFmalloc(width*height+EXTRAFUDGE)) == NULL) {
+    #####:  526:        fprintf(stderr, "not enough memory for image\n");
+    #####:  527:        return;
+        -:  528:    }
+        -:  529:#define DRAWSEGMENT(offset, step) {			\
+        -:  530:        for (row = offset; row < height; row += step) {	\
+        -:  531:            _TIFFmemcpy(newras + row*width, ras, width);\
+        -:  532:            ras += width;                            	\
+        -:  533:        }						\
+        -:  534:    }
+    #####:  535:    ras = raster;
+    #####:  536:    if (interleaved) {
+    #####:  537:        DRAWSEGMENT(0, 8);
+    #####:  538:        DRAWSEGMENT(4, 8);
+    #####:  539:        DRAWSEGMENT(2, 4);
+    #####:  540:        DRAWSEGMENT(1, 2);
+        -:  541:    } else 
+    #####:  542:        DRAWSEGMENT(0, 1);
+        -:  543:#undef DRAWSEGMENT
+        -:  544:
+    #####:  545:    tif = TIFFOpen(imagename, mode);
+    #####:  546:    if (!tif) {
+    #####:  547:	TIFFError(imagename,"Can not open output image");
+    #####:  548:	exit(-1);
+        -:  549:    }
+    #####:  550:    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, (uint32) width);
+    #####:  551:    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, (uint32) height);
+    #####:  552:    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_PALETTE);
+    #####:  553:    TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    #####:  554:    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
+    #####:  555:    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 8);
+    #####:  556:    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 
+    #####:  557:	rowsperstrip = TIFFDefaultStripSize(tif, rowsperstrip));
+    #####:  558:    TIFFSetField(tif, TIFFTAG_COMPRESSION, compression);
+    #####:  559:    switch (compression) {
+    #####:  560:    case COMPRESSION_LZW:
+        -:  561:    case COMPRESSION_DEFLATE:
+    #####:  562:	    if (predictor != 0)
+    #####:  563:		    TIFFSetField(tif, TIFFTAG_PREDICTOR, predictor);
+    #####:  564:	    break;
+        -:  565:    }
+    #####:  566:    TIFFSetField(tif, TIFFTAG_COLORMAP, red, green, blue);
+    #####:  567:    TIFFSetField(tif, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    #####:  568:    strip = 0;
+    #####:  569:    stripsize = TIFFStripSize(tif);
+    #####:  570:    for (row=0; row<height; row += rowsperstrip) {
+    #####:  571:	if (rowsperstrip > height-row) {
+    #####:  572:	    rowsperstrip = height-row;
+    #####:  573:	    stripsize = TIFFVStripSize(tif, rowsperstrip);
+        -:  574:	}
+    #####:  575:	if (TIFFWriteEncodedStrip(tif, strip, newras+row*width, stripsize) < 0)
+    #####:  576:	    break;
+    #####:  577:	strip++;
+        -:  578:    }
+    #####:  579:    TIFFClose(tif);
+        -:  580:
+    #####:  581:    _TIFFfree(newras);
+        -:  582:}
+        -:  583:
+        -:  584:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  585:/*
+        -:  586: * Local Variables:
+        -:  587: * mode: c
+        -:  588: * c-basic-offset: 4
+        -:  589: * fill-column: 78
+        -:  590: * End:
+        -:  591: */

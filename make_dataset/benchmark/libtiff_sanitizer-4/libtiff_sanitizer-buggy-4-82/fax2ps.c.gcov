@@ -1,0 +1,464 @@
+        -:    0:Source:fax2ps.c
+        -:    1:/* $Id$" */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1991-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:#include "tif_config.h"
+        -:   27:
+        -:   28:#include <stdlib.h>
+        -:   29:#include <stdio.h>
+        -:   30:#include <string.h>
+        -:   31:#include <math.h>
+        -:   32:#include <time.h>
+        -:   33:
+        -:   34:#ifdef HAVE_UNISTD_H
+        -:   35:# include <unistd.h>
+        -:   36:#endif
+        -:   37:
+        -:   38:#ifdef HAVE_FCNTL_H
+        -:   39:# include <fcntl.h>
+        -:   40:#endif
+        -:   41:
+        -:   42:#ifdef HAVE_IO_H
+        -:   43:# include <io.h>
+        -:   44:#endif
+        -:   45:
+        -:   46:#ifdef NEED_LIBPORT
+        -:   47:# include "libport.h"
+        -:   48:#endif
+        -:   49:
+        -:   50:#include "tiffiop.h"
+        -:   51:#include "tiffio.h"
+        -:   52:
+        -:   53:float	defxres = 204.;		/* default x resolution (pixels/inch) */
+        -:   54:float	defyres = 98.;		/* default y resolution (lines/inch) */
+        -:   55:const float half = 0.5;
+        -:   56:const float points = 72.0;
+        -:   57:float	pageWidth = 0;		/* image page width (inches) */
+        -:   58:float	pageHeight = 0;		/* image page length (inches) */
+        -:   59:int	scaleToPage = 0;	/* if true, scale raster to page dimensions */
+        -:   60:int	totalPages = 0;		/* total # pages printed */
+        -:   61:int	row;			/* current output row */
+        -:   62:int	maxline = 512;		/* max output line of PostScript */
+        -:   63:
+        -:   64:/*
+        -:   65: * Turn a bit-mapped scanline into the appropriate sequence
+        -:   66: * of PostScript characters to be rendered.
+        -:   67: *  
+        -:   68: * Original version written by Bret D. Whissel,
+        -:   69: * Florida State University Meteorology Department
+        -:   70: * March 13-15, 1995.
+        -:   71: */
+        -:   72:static void
+    #####:   73:printruns(unsigned char* buf, uint32* runs, uint32* erun, uint32 lastx)
+        -:   74:{
+        -:   75:    static struct {
+        -:   76:	char white, black;
+        -:   77:	unsigned short width;
+        -:   78:    } WBarr[] = {
+        -:   79:	{ 'd', 'n', 512 }, { 'e', 'o', 256 }, { 'f', 'p', 128 },
+        -:   80:	{ 'g', 'q',  64 }, { 'h', 'r',  32 }, { 'i', 's',  16 },
+        -:   81:	{ 'j', 't',   8 }, { 'k', 'u',   4 }, { 'l', 'v',   2 },
+        -:   82:	{ 'm', 'w',   1 }
+        -:   83:    };
+        -:   84:    static char* svalue =
+        -:   85:	" !\"#$&'*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abc";
+    #####:   86:    int colormode = 1;		/* 0 for white, 1 for black */
+    #####:   87:    uint32 runlength = 0;
+    #####:   88:    int n = maxline;
+    #####:   89:    uint32 x = 0;
+        -:   90:    int l;
+        -:   91:
+        -:   92:    (void) buf;
+    #####:   93:    printf("%d m(", row++);
+    #####:   94:    while (runs < erun) {
+    #####:   95:	if (runlength <= 0) {
+    #####:   96:	    colormode ^= 1;
+    #####:   97:	    runlength = *runs++;
+    #####:   98:	    if (x+runlength > lastx)
+    #####:   99:		runlength = runs[-1] = lastx-x;
+    #####:  100:	    x += runlength;
+    #####:  101:	    if (!colormode && runs == erun)	
+    #####:  102:		break;		/* don't bother printing the final white run */
+        -:  103:	}
+        -:  104:	/*
+        -:  105:	 * If a runlength is greater than 6 pixels, then spit out
+        -:  106:	 * black or white characters until the runlength drops to
+        -:  107:	 * 6 or less.  Once a runlength is <= 6, then combine black
+        -:  108:	 * and white runlengths until a 6-pixel pattern is obtained.
+        -:  109:	 * Then write out the special character.  Six-pixel patterns
+        -:  110:	 * were selected since 64 patterns is the largest power of
+        -:  111:	 * two less than the 92 "easily printable" PostScript
+        -:  112:	 * characters (i.e., no escape codes or octal chars).
+        -:  113:	 */
+    #####:  114:	l = 0;
+    #####:  115:	while (runlength > 6) {	/* Run is greater than six... */
+    #####:  116:	    if (runlength >= WBarr[l].width) {
+    #####:  117:		if (n == 0) {
+    #####:  118:		    putchar('\n');
+    #####:  119:		    n = maxline;
+        -:  120:		}
+    #####:  121:		putchar(colormode ? WBarr[l].black : WBarr[l].white), n--;
+    #####:  122:		runlength -= WBarr[l].width;
+        -:  123:	    } else
+    #####:  124:		l++;
+        -:  125:	}
+    #####:  126:	while (runlength > 0 && runlength <= 6) {
+    #####:  127:	    uint32 bitsleft = 6;
+    #####:  128:	    int t = 0;
+    #####:  129:	    while (bitsleft) {
+    #####:  130:		if (runlength <= bitsleft) {
+    #####:  131:		    if (colormode)
+    #####:  132:			t |= ((1 << runlength)-1) << (bitsleft-runlength);
+    #####:  133:		    bitsleft -= runlength;
+    #####:  134:		    runlength = 0;
+    #####:  135:		    if (bitsleft) {
+    #####:  136:			if (runs >= erun)
+    #####:  137:			    break;
+    #####:  138:			colormode ^= 1;
+    #####:  139:			runlength = *runs++;
+    #####:  140:			if (x+runlength > lastx)
+    #####:  141:			    runlength = runs[-1] = lastx-x;
+    #####:  142:			x += runlength;
+        -:  143:		    }
+        -:  144:		} else {		/* runlength exceeds bits left */
+    #####:  145:		    if (colormode)
+    #####:  146:			t |= ((1 << bitsleft)-1);
+    #####:  147:		    runlength -= bitsleft;
+    #####:  148:		    bitsleft = 0;
+        -:  149:		}
+        -:  150:	    }
+    #####:  151:	    if (n == 0) {
+    #####:  152:		putchar('\n');
+    #####:  153:		n = maxline;
+        -:  154:	    }
+    #####:  155:	    putchar(svalue[t]), n--;
+        -:  156:	}
+        -:  157:    }
+    #####:  158:    printf(")s\n");
+    #####:  159:}
+        -:  160:
+        -:  161:/* 
+        -:  162: * Create a special PostScript font for printing FAX documents.  By taking
+        -:  163: * advantage of the font-cacheing mechanism, a substantial speed-up in 
+        -:  164: * rendering time is realized. 
+        -:  165: */
+        -:  166:static void
+    #####:  167:emitFont(FILE* fd)
+        -:  168:{
+        -:  169:    static const char* fontPrologue[] = {
+        -:  170:	"/newfont 10 dict def newfont begin /FontType 3 def /FontMatrix [1",
+        -:  171:	"0 0 1 0 0] def /FontBBox [0 0 512 1] def /Encoding 256 array def",
+        -:  172:	"0 1 31{Encoding exch /255 put}for 120 1 255{Encoding exch /255",
+        -:  173:	"put}for Encoding 37 /255 put Encoding 40 /255 put Encoding 41 /255",
+        -:  174:	"put Encoding 92 /255 put /count 0 def /ls{Encoding exch count 3",
+        -:  175:	"string cvs cvn put /count count 1 add def}def 32 1 36{ls}for",
+        -:  176:	"38 1 39{ls}for 42 1 91{ls}for 93 1 99{ls}for /count 100",
+        -:  177:	"def 100 1 119{ls}for /CharDict 5 dict def CharDict begin /white",
+        -:  178:	"{dup 255 eq{pop}{1 dict begin 100 sub neg 512 exch bitshift",
+        -:  179:	"/cw exch def cw 0 0 0 cw 1 setcachedevice end}ifelse}def /black",
+        -:  180:	"{dup 255 eq{pop}{1 dict begin 110 sub neg 512 exch bitshift",
+        -:  181:	"/cw exch def cw 0 0 0 cw 1 setcachedevice 0 0 moveto cw 0 rlineto",
+        -:  182:	"0 1 rlineto cw neg 0 rlineto closepath fill end}ifelse}def /numbuild",
+        -:  183:	"{dup 255 eq{pop}{6 0 0 0 6 1 setcachedevice 0 1 5{0 moveto",
+        -:  184:	"dup 32 and 32 eq{1 0 rlineto 0 1 rlineto -1 0 rlineto closepath",
+        -:  185:	"fill newpath}if 1 bitshift}for pop}ifelse}def /.notdef {}",
+        -:  186:	"def /255 {}def end /BuildChar{exch begin dup 110 ge{Encoding",
+        -:  187:	"exch get 3 string cvs cvi CharDict /black get}{dup 100 ge {Encoding",
+        -:  188:	"exch get 3 string cvs cvi CharDict /white get}{Encoding exch get",
+        -:  189:	"3 string cvs cvi CharDict /numbuild get}ifelse}ifelse exec end",
+        -:  190:	"}def end /Bitfont newfont definefont 1 scalefont setfont",
+        -:  191:	NULL
+        -:  192:    };
+        -:  193:    int i;
+    #####:  194:    for (i = 0; fontPrologue[i] != NULL; i++)
+    #####:  195:	fprintf(fd, "%s\n", fontPrologue[i]);
+    #####:  196:}
+        -:  197:
+        -:  198:void
+    #####:  199:printTIF(TIFF* tif, uint16 pageNumber)
+        -:  200:{
+    #####:  201:    uint32 w, h;
+    #####:  202:    uint16 unit, compression;
+    #####:  203:    float xres, yres, scale = 1.0;
+        -:  204:    tstrip_t s, ns;
+    #####:  205:    time_t creation_time;
+        -:  206:
+    #####:  207:    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h);
+    #####:  208:    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w);
+    #####:  209:    if (!TIFFGetField(tif, TIFFTAG_COMPRESSION, &compression)
+    #####:  210:	|| compression < COMPRESSION_CCITTRLE
+    #####:  211:	|| compression > COMPRESSION_CCITT_T6)
+    #####:  212:	return;
+    #####:  213:    if (!TIFFGetField(tif, TIFFTAG_XRESOLUTION, &xres) || !xres) {
+    #####:  214:	TIFFWarning(TIFFFileName(tif),
+        -:  215:	    "No x-resolution, assuming %g dpi", defxres);
+    #####:  216:	xres = defxres;
+        -:  217:    }
+    #####:  218:    if (!TIFFGetField(tif, TIFFTAG_YRESOLUTION, &yres) || !yres) {
+    #####:  219:	TIFFWarning(TIFFFileName(tif),
+        -:  220:	    "No y-resolution, assuming %g lpi", defyres);
+    #####:  221:	yres = defyres;					/* XXX */
+        -:  222:    }
+    #####:  223:    if (TIFFGetField(tif, TIFFTAG_RESOLUTIONUNIT, &unit) &&
+    #####:  224:      unit == RESUNIT_CENTIMETER) {
+    #####:  225:	xres *= 2.54F;
+    #####:  226:	yres *= 2.54F;
+        -:  227:    }
+    #####:  228:    if (pageWidth == 0)
+    #####:  229:	pageWidth = w / xres;
+    #####:  230:    if (pageHeight == 0)
+    #####:  231:	pageHeight = h / yres;
+        -:  232:
+    #####:  233:    printf("%%!PS-Adobe-3.0\n");
+    #####:  234:    printf("%%%%Creator: fax2ps\n");
+        -:  235:#ifdef notdef
+        -:  236:    printf("%%%%Title: %s\n", file);
+        -:  237:#endif
+    #####:  238:    creation_time = time(0);
+    #####:  239:    printf("%%%%CreationDate: %s", ctime(&creation_time));
+    #####:  240:    printf("%%%%Origin: 0 0\n");
+    #####:  241:    printf("%%%%BoundingBox: 0 0 %u %u\n",
+    #####:  242:	(int)(pageWidth * points), (int)(pageHeight * points));	/* XXX */
+    #####:  243:    printf("%%%%Pages: (atend)\n");
+    #####:  244:    printf("%%%%EndComments\n");
+    #####:  245:    printf("%%%%BeginProlog\n");
+    #####:  246:    emitFont(stdout);
+    #####:  247:    printf("/d{bind def}def\n"); /* bind and def proc */
+    #####:  248:    printf("/m{0 exch moveto}d\n");
+    #####:  249:    printf("/s{show}d\n");
+    #####:  250:    printf("/p{showpage}d \n");	/* end page */
+    #####:  251:    printf("%%%%EndProlog\n");
+    #####:  252:    printf("%%%%Page: \"%u\" %u\n", pageNumber, pageNumber);
+    #####:  253:    printf("/$pageTop save def gsave\n");
+    #####:  254:    if (scaleToPage)
+    #####:  255:        scale = pageHeight / (h/yres) < pageWidth / (w/xres) ?
+    #####:  256:            pageHeight / (h/yres) : pageWidth / (w/xres);
+    #####:  257:    printf("%g %g translate\n",
+    #####:  258:           points * (pageWidth - scale*w/xres) * half,
+    #####:  259:           points * (scale*h/yres + (pageHeight - scale*h/yres) * half));
+    #####:  260:    printf("%g %g scale\n", points/xres*scale, -points/yres*scale);
+    #####:  261:    printf("0 setgray\n");
+    #####:  262:    TIFFSetField(tif, TIFFTAG_FAXFILLFUNC, printruns);
+    #####:  263:    ns = TIFFNumberOfStrips(tif);
+    #####:  264:    row = 0;
+    #####:  265:    for (s = 0; s < ns; s++)
+    #####:  266:	(void) TIFFReadEncodedStrip(tif, s, (tdata_t) NULL, (tsize_t) -1);
+    #####:  267:    printf("p\n");
+    #####:  268:    printf("grestore $pageTop restore\n");
+    #####:  269:    totalPages++;
+        -:  270:}
+        -:  271:
+        -:  272:#define	GetPageNumber(tif) \
+        -:  273:TIFFGetField(tif, TIFFTAG_PAGENUMBER, &pn, &ptotal)
+        -:  274:
+        -:  275:int
+    #####:  276:findPage(TIFF* tif, uint16 pageNumber)
+        -:  277:{
+    #####:  278:    uint16 pn = (uint16) -1;
+    #####:  279:    uint16 ptotal = (uint16) -1;
+    #####:  280:    if (GetPageNumber(tif)) {
+    #####:  281:	while (pn != (pageNumber-1) && TIFFReadDirectory(tif) && GetPageNumber(tif))
+        -:  282:	    ;
+    #####:  283:	return (pn == (pageNumber-1));
+        -:  284:    } else
+    #####:  285:	return (TIFFSetDirectory(tif, (tdir_t)(pageNumber-1)));
+        -:  286:}
+        -:  287:
+        -:  288:void
+    #####:  289:fax2ps(TIFF* tif, uint16 npages, uint16* pages, char* filename)
+        -:  290:{
+    #####:  291:    if (npages > 0) {
+    #####:  292:	uint16 pn, ptotal;
+        -:  293:	int i;
+        -:  294:
+    #####:  295:	if (!GetPageNumber(tif))
+    #####:  296:	    fprintf(stderr, "%s: No page numbers, counting directories.\n",
+        -:  297:		filename);
+    #####:  298:	for (i = 0; i < npages; i++) {
+    #####:  299:	    if (findPage(tif, pages[i]))
+    #####:  300:		printTIF(tif, pages[i]);
+        -:  301:	    else
+    #####:  302:		fprintf(stderr, "%s: No page number %d\n", filename, pages[i]);
+        -:  303:	}
+        -:  304:    } else {
+    #####:  305:	uint16 pageNumber = 0;
+        -:  306:	do
+    #####:  307:	    printTIF(tif, pageNumber++);
+    #####:  308:	while (TIFFReadDirectory(tif));
+        -:  309:    }
+    #####:  310:}
+        -:  311:
+        -:  312:#undef GetPageNumber
+        -:  313:
+        -:  314:static int
+    #####:  315:pcompar(const void* va, const void* vb)
+        -:  316:{
+    #####:  317:    const int* pa = (const int*) va;
+    #####:  318:    const int* pb = (const int*) vb;
+    #####:  319:    return (*pa - *pb);
+        -:  320:}
+        -:  321:
+        -:  322:static	void usage(int code);
+        -:  323:
+        -:  324:int
+    #####:  325:main(int argc, char** argv)
+        -:  326:{
+        -:  327:#if !HAVE_DECL_OPTARG
+        -:  328:    extern int optind;
+        -:  329:    extern char* optarg;
+        -:  330:#endif
+    #####:  331:    uint16 *pages = NULL, npages = 0, pageNumber;
+    #####:  332:    int c, dowarnings = 0;		/* if 1, enable library warnings */
+        -:  333:    TIFF* tif;
+        -:  334:
+    #####:  335:    while ((c = getopt(argc, argv, "l:p:x:y:W:H:wS")) != -1)
+    #####:  336:	switch (c) {
+    #####:  337:	case 'H':		/* page height */
+    #####:  338:	    pageHeight = (float)atof(optarg);
+    #####:  339:	    break;
+    #####:  340:	case 'S':		/* scale to page */
+    #####:  341:	    scaleToPage = 1;
+    #####:  342:	    break;
+    #####:  343:	case 'W':		/* page width */
+    #####:  344:	    pageWidth = (float)atof(optarg);
+    #####:  345:	    break;
+    #####:  346:	case 'p':		/* print specific page */
+    #####:  347:	    pageNumber = (uint16)atoi(optarg);
+    #####:  348:	    if (pages)
+    #####:  349:		pages = (uint16*) realloc(pages, (npages+1)*sizeof(uint16));
+        -:  350:	    else
+    #####:  351:		pages = (uint16*) malloc(sizeof(uint16));
+    #####:  352:	    if( pages == NULL )
+        -:  353:	    {
+    #####:  354:		fprintf(stderr, "Out of memory\n");
+    #####:  355:		exit(-1);
+        -:  356:	    }
+    #####:  357:	    pages[npages++] = pageNumber;
+    #####:  358:	    break;
+    #####:  359:	case 'w':
+    #####:  360:	    dowarnings = 1;
+    #####:  361:	    break;
+    #####:  362:	case 'x':
+    #####:  363:	    defxres = (float)atof(optarg);
+    #####:  364:	    break;
+    #####:  365:	case 'y':
+    #####:  366:	    defyres = (float)atof(optarg);
+    #####:  367:	    break;
+    #####:  368:	case 'l':
+    #####:  369:	    maxline = atoi(optarg);
+    #####:  370:	    break;
+    #####:  371:	case '?':
+    #####:  372:	    usage(-1);
+        -:  373:	}
+    #####:  374:    if (npages > 0)
+    #####:  375:	qsort(pages, npages, sizeof(uint16), pcompar);
+    #####:  376:    if (!dowarnings)
+    #####:  377:	TIFFSetWarningHandler(0);
+    #####:  378:    if (optind < argc) {
+        -:  379:	do {
+    #####:  380:	    tif = TIFFOpen(argv[optind], "r");
+    #####:  381:	    if (tif) {
+    #####:  382:		fax2ps(tif, npages, pages, argv[optind]);
+    #####:  383:		TIFFClose(tif);
+        -:  384:	    } else
+    #####:  385:		fprintf(stderr, "%s: Can not open, or not a TIFF file.\n",
+    #####:  386:		    argv[optind]);
+    #####:  387:	} while (++optind < argc);
+        -:  388:    } else {
+        -:  389:	int n;
+        -:  390:	FILE* fd;
+    #####:  391:	char buf[16*1024];
+        -:  392:
+    #####:  393:	fd = tmpfile();
+    #####:  394:	if (fd == NULL) {
+    #####:  395:	    fprintf(stderr, "Could not obtain temporary file.\n");
+    #####:  396:	    exit(-2);
+        -:  397:	}
+        -:  398:#if defined(HAVE_SETMODE) && defined(O_BINARY)
+        -:  399:	setmode(fileno(stdin), O_BINARY);
+        -:  400:#endif
+    #####:  401:	while ((n = read(fileno(stdin), buf, sizeof (buf))) > 0) {
+    #####:  402:                if (write(fileno(fd), buf, n) != n) {
+    #####:  403:                        fclose(fd);
+    #####:  404:                        fprintf(stderr,
+        -:  405:                                "Could not copy stdin to temporary file.\n");
+    #####:  406:                        exit(-2);  
+        -:  407:                }
+        -:  408:        }
+    #####:  409:	_TIFF_lseek_f(fileno(fd), 0, SEEK_SET);
+        -:  410:#if defined(_WIN32) && defined(USE_WIN32_FILEIO)
+        -:  411:	tif = TIFFFdOpen(_get_osfhandle(fileno(fd)), "temp", "r");
+        -:  412:#else
+    #####:  413:	tif = TIFFFdOpen(fileno(fd), "temp", "r");
+        -:  414:#endif
+    #####:  415:	if (tif) {
+    #####:  416:	    fax2ps(tif, npages, pages, "<stdin>");
+    #####:  417:	    TIFFClose(tif);
+        -:  418:	} else
+    #####:  419:	    fprintf(stderr, "Can not open, or not a TIFF file.\n");
+    #####:  420:	fclose(fd);
+        -:  421:    }
+    #####:  422:    printf("%%%%Trailer\n");
+    #####:  423:    printf("%%%%Pages: %u\n", totalPages);
+    #####:  424:    printf("%%%%EOF\n");
+        -:  425:
+    #####:  426:    return (0);
+        -:  427:}
+        -:  428:
+        -:  429:char* stuff[] = {
+        -:  430:"usage: fax2ps [options] [input.tif ...]",
+        -:  431:"where options are:",
+        -:  432:" -w            suppress warning messages",
+        -:  433:" -l chars      set maximum output line length for generated PostScript",
+        -:  434:" -p page#      select page to print (can use multiple times)",
+        -:  435:" -x xres       set default horizontal resolution of input data (dpi)",
+        -:  436:" -y yres       set default vertical resolution of input data (lpi)",
+        -:  437:" -S            scale output to page size",
+        -:  438:" -W width      set output page width (inches), default is 8.5",
+        -:  439:" -H height     set output page height (inches), default is 11",
+        -:  440:NULL
+        -:  441:};
+        -:  442:
+        -:  443:static void
+    #####:  444:usage(int code)
+        -:  445:{
+    #####:  446:	char buf[BUFSIZ];
+        -:  447:	int i;
+        -:  448:
+    #####:  449:	setbuf(stderr, buf);
+    #####:  450:        fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:  451:	for (i = 0; stuff[i] != NULL; i++)
+    #####:  452:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:  453:	exit(code);
+        -:  454:}
+        -:  455:
+        -:  456:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  457:/*
+        -:  458: * Local Variables:
+        -:  459: * mode: c
+        -:  460: * c-basic-offset: 8
+        -:  461: * fill-column: 78
+        -:  462: * End:
+        -:  463: */
