@@ -1,0 +1,871 @@
+        -:    0:Source:tif_predict.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1988-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:/*
+        -:   28: * TIFF Library.
+        -:   29: *
+        -:   30: * Predictor Tag Support (used by multiple codecs).
+        -:   31: */
+        -:   32:#include "tiffiop.h"
+        -:   33:#include "tif_predict.h"
+        -:   34:
+        -:   35:#define	PredictorState(tif)	((TIFFPredictorState*) (tif)->tif_data)
+        -:   36:
+        -:   37:static int horAcc8(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   38:static int horAcc16(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   39:static int horAcc32(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   40:static int swabHorAcc16(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   41:static int swabHorAcc32(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   42:static int horDiff8(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   43:static int horDiff16(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   44:static int horDiff32(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   45:static int swabHorDiff16(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   46:static int swabHorDiff32(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   47:static int fpAcc(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   48:static int fpDiff(TIFF* tif, uint8* cp0, tmsize_t cc);
+        -:   49:static int PredictorDecodeRow(TIFF* tif, uint8* op0, tmsize_t occ0, uint16 s);
+        -:   50:static int PredictorDecodeTile(TIFF* tif, uint8* op0, tmsize_t occ0, uint16 s);
+        -:   51:static int PredictorEncodeRow(TIFF* tif, uint8* bp, tmsize_t cc, uint16 s);
+        -:   52:static int PredictorEncodeTile(TIFF* tif, uint8* bp0, tmsize_t cc0, uint16 s);
+        -:   53:
+        -:   54:static int
+    #####:   55:PredictorSetup(TIFF* tif)
+        -:   56:{
+        -:   57:	static const char module[] = "PredictorSetup";
+        -:   58:
+    #####:   59:	TIFFPredictorState* sp = PredictorState(tif);
+    #####:   60:	TIFFDirectory* td = &tif->tif_dir;
+        -:   61:
+    #####:   62:	switch (sp->predictor)		/* no differencing */
+        -:   63:	{
+    #####:   64:		case PREDICTOR_NONE:
+    #####:   65:			return 1;
+    #####:   66:		case PREDICTOR_HORIZONTAL:
+    #####:   67:			if (td->td_bitspersample != 8
+    #####:   68:			    && td->td_bitspersample != 16
+    #####:   69:			    && td->td_bitspersample != 32) {
+    #####:   70:				TIFFErrorExt(tif->tif_clientdata, module,
+        -:   71:				    "Horizontal differencing \"Predictor\" not supported with %d-bit samples",
+    #####:   72:				    td->td_bitspersample);
+    #####:   73:				return 0;
+        -:   74:			}
+    #####:   75:			break;
+    #####:   76:		case PREDICTOR_FLOATINGPOINT:
+    #####:   77:			if (td->td_sampleformat != SAMPLEFORMAT_IEEEFP) {
+    #####:   78:				TIFFErrorExt(tif->tif_clientdata, module,
+        -:   79:				    "Floating point \"Predictor\" not supported with %d data format",
+    #####:   80:				    td->td_sampleformat);
+    #####:   81:				return 0;
+        -:   82:			}
+    #####:   83:                        if (td->td_bitspersample != 16
+    #####:   84:                            && td->td_bitspersample != 24
+    #####:   85:                            && td->td_bitspersample != 32
+    #####:   86:                            && td->td_bitspersample != 64) { /* Should 64 be allowed? */
+    #####:   87:                                TIFFErrorExt(tif->tif_clientdata, module,
+        -:   88:                                             "Floating point \"Predictor\" not supported with %d-bit samples",
+    #####:   89:                                             td->td_bitspersample);
+    #####:   90:				return 0;
+        -:   91:                            }
+    #####:   92:			break;
+    #####:   93:		default:
+    #####:   94:			TIFFErrorExt(tif->tif_clientdata, module,
+        -:   95:			    "\"Predictor\" value %d not supported",
+        -:   96:			    sp->predictor);
+    #####:   97:			return 0;
+        -:   98:	}
+    #####:   99:	sp->stride = (td->td_planarconfig == PLANARCONFIG_CONTIG ?
+    #####:  100:	    td->td_samplesperpixel : 1);
+        -:  101:	/*
+        -:  102:	 * Calculate the scanline/tile-width size in bytes.
+        -:  103:	 */
+    #####:  104:	if (isTiled(tif))
+    #####:  105:		sp->rowsize = TIFFTileRowSize(tif);
+        -:  106:	else
+    #####:  107:		sp->rowsize = TIFFScanlineSize(tif);
+    #####:  108:	if (sp->rowsize == 0)
+    #####:  109:		return 0;
+        -:  110:
+    #####:  111:	return 1;
+        -:  112:}
+        -:  113:
+        -:  114:static int
+    #####:  115:PredictorSetupDecode(TIFF* tif)
+        -:  116:{
+    #####:  117:	TIFFPredictorState* sp = PredictorState(tif);
+    #####:  118:	TIFFDirectory* td = &tif->tif_dir;
+        -:  119:
+    #####:  120:	if (!(*sp->setupdecode)(tif) || !PredictorSetup(tif))
+    #####:  121:		return 0;
+        -:  122:
+    #####:  123:	if (sp->predictor == 2) {
+    #####:  124:		switch (td->td_bitspersample) {
+    #####:  125:			case 8:  sp->decodepfunc = horAcc8; break;
+    #####:  126:			case 16: sp->decodepfunc = horAcc16; break;
+    #####:  127:			case 32: sp->decodepfunc = horAcc32; break;
+        -:  128:		}
+        -:  129:		/*
+        -:  130:		 * Override default decoding method with one that does the
+        -:  131:		 * predictor stuff.
+        -:  132:		 */
+    #####:  133:                if( tif->tif_decoderow != PredictorDecodeRow )
+        -:  134:                {
+    #####:  135:                    sp->decoderow = tif->tif_decoderow;
+    #####:  136:                    tif->tif_decoderow = PredictorDecodeRow;
+    #####:  137:                    sp->decodestrip = tif->tif_decodestrip;
+    #####:  138:                    tif->tif_decodestrip = PredictorDecodeTile;
+    #####:  139:                    sp->decodetile = tif->tif_decodetile;
+    #####:  140:                    tif->tif_decodetile = PredictorDecodeTile;
+        -:  141:                }
+        -:  142:
+        -:  143:		/*
+        -:  144:		 * If the data is horizontally differenced 16-bit data that
+        -:  145:		 * requires byte-swapping, then it must be byte swapped before
+        -:  146:		 * the accumulation step.  We do this with a special-purpose
+        -:  147:		 * routine and override the normal post decoding logic that
+        -:  148:		 * the library setup when the directory was read.
+        -:  149:		 */
+    #####:  150:		if (tif->tif_flags & TIFF_SWAB) {
+    #####:  151:			if (sp->decodepfunc == horAcc16) {
+    #####:  152:				sp->decodepfunc = swabHorAcc16;
+    #####:  153:				tif->tif_postdecode = _TIFFNoPostDecode;
+    #####:  154:            } else if (sp->decodepfunc == horAcc32) {
+    #####:  155:				sp->decodepfunc = swabHorAcc32;
+    #####:  156:				tif->tif_postdecode = _TIFFNoPostDecode;
+        -:  157:            }
+        -:  158:		}
+        -:  159:	}
+        -:  160:
+    #####:  161:	else if (sp->predictor == 3) {
+    #####:  162:		sp->decodepfunc = fpAcc;
+        -:  163:		/*
+        -:  164:		 * Override default decoding method with one that does the
+        -:  165:		 * predictor stuff.
+        -:  166:		 */
+    #####:  167:                if( tif->tif_decoderow != PredictorDecodeRow )
+        -:  168:                {
+    #####:  169:                    sp->decoderow = tif->tif_decoderow;
+    #####:  170:                    tif->tif_decoderow = PredictorDecodeRow;
+    #####:  171:                    sp->decodestrip = tif->tif_decodestrip;
+    #####:  172:                    tif->tif_decodestrip = PredictorDecodeTile;
+    #####:  173:                    sp->decodetile = tif->tif_decodetile;
+    #####:  174:                    tif->tif_decodetile = PredictorDecodeTile;
+        -:  175:                }
+        -:  176:		/*
+        -:  177:		 * The data should not be swapped outside of the floating
+        -:  178:		 * point predictor, the accumulation routine should return
+        -:  179:		 * byres in the native order.
+        -:  180:		 */
+    #####:  181:		if (tif->tif_flags & TIFF_SWAB) {
+    #####:  182:			tif->tif_postdecode = _TIFFNoPostDecode;
+        -:  183:		}
+        -:  184:		/*
+        -:  185:		 * Allocate buffer to keep the decoded bytes before
+        -:  186:		 * rearranging in the right order
+        -:  187:		 */
+        -:  188:	}
+        -:  189:
+    #####:  190:	return 1;
+        -:  191:}
+        -:  192:
+        -:  193:static int
+    #####:  194:PredictorSetupEncode(TIFF* tif)
+        -:  195:{
+    #####:  196:	TIFFPredictorState* sp = PredictorState(tif);
+    #####:  197:	TIFFDirectory* td = &tif->tif_dir;
+        -:  198:
+    #####:  199:	if (!(*sp->setupencode)(tif) || !PredictorSetup(tif))
+    #####:  200:		return 0;
+        -:  201:
+    #####:  202:	if (sp->predictor == 2) {
+    #####:  203:		switch (td->td_bitspersample) {
+    #####:  204:			case 8:  sp->encodepfunc = horDiff8; break;
+    #####:  205:			case 16: sp->encodepfunc = horDiff16; break;
+    #####:  206:			case 32: sp->encodepfunc = horDiff32; break;
+        -:  207:		}
+        -:  208:		/*
+        -:  209:		 * Override default encoding method with one that does the
+        -:  210:		 * predictor stuff.
+        -:  211:		 */
+    #####:  212:                if( tif->tif_encoderow != PredictorEncodeRow )
+        -:  213:                {
+    #####:  214:                    sp->encoderow = tif->tif_encoderow;
+    #####:  215:                    tif->tif_encoderow = PredictorEncodeRow;
+    #####:  216:                    sp->encodestrip = tif->tif_encodestrip;
+    #####:  217:                    tif->tif_encodestrip = PredictorEncodeTile;
+    #####:  218:                    sp->encodetile = tif->tif_encodetile;
+    #####:  219:                    tif->tif_encodetile = PredictorEncodeTile;
+        -:  220:                }
+        -:  221:
+        -:  222:                /*
+        -:  223:                 * If the data is horizontally differenced 16-bit data that
+        -:  224:                 * requires byte-swapping, then it must be byte swapped after
+        -:  225:                 * the differentiation step.  We do this with a special-purpose
+        -:  226:                 * routine and override the normal post decoding logic that
+        -:  227:                 * the library setup when the directory was read.
+        -:  228:                 */
+    #####:  229:                if (tif->tif_flags & TIFF_SWAB) {
+    #####:  230:                    if (sp->encodepfunc == horDiff16) {
+    #####:  231:                            sp->encodepfunc = swabHorDiff16;
+    #####:  232:                            tif->tif_postdecode = _TIFFNoPostDecode;
+    #####:  233:                    } else if (sp->encodepfunc == horDiff32) {
+    #####:  234:                            sp->encodepfunc = swabHorDiff32;
+    #####:  235:                            tif->tif_postdecode = _TIFFNoPostDecode;
+        -:  236:                    }
+        -:  237:                }
+        -:  238:        }
+        -:  239:
+    #####:  240:	else if (sp->predictor == 3) {
+    #####:  241:		sp->encodepfunc = fpDiff;
+        -:  242:		/*
+        -:  243:		 * Override default encoding method with one that does the
+        -:  244:		 * predictor stuff.
+        -:  245:		 */
+    #####:  246:                if( tif->tif_encoderow != PredictorEncodeRow )
+        -:  247:                {
+    #####:  248:                    sp->encoderow = tif->tif_encoderow;
+    #####:  249:                    tif->tif_encoderow = PredictorEncodeRow;
+    #####:  250:                    sp->encodestrip = tif->tif_encodestrip;
+    #####:  251:                    tif->tif_encodestrip = PredictorEncodeTile;
+    #####:  252:                    sp->encodetile = tif->tif_encodetile;
+    #####:  253:                    tif->tif_encodetile = PredictorEncodeTile;
+        -:  254:                }
+        -:  255:	}
+        -:  256:
+    #####:  257:	return 1;
+        -:  258:}
+        -:  259:
+        -:  260:#define REPEAT4(n, op)		\
+        -:  261:    switch (n) {		\
+        -:  262:    default: { tmsize_t i; for (i = n-4; i > 0; i--) { op; } } \
+        -:  263:    case 4:  op;		\
+        -:  264:    case 3:  op;		\
+        -:  265:    case 2:  op;		\
+        -:  266:    case 1:  op;		\
+        -:  267:    case 0:  ;			\
+        -:  268:    }
+        -:  269:
+        -:  270:/* Remarks related to C standard compliance in all below functions : */
+        -:  271:/* - to avoid any undefined behaviour, we only operate on unsigned types */
+        -:  272:/*   since the behaviour of "overflows" is defined (wrap over) */
+        -:  273:/* - when storing into the byte stream, we explicitly mask with 0xff so */
+        -:  274:/*   as to make icc -check=conversions happy (not necessary by the standard) */
+        -:  275:
+        -:  276:static int
+    #####:  277:horAcc8(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  278:{
+    #####:  279:	tmsize_t stride = PredictorState(tif)->stride;
+        -:  280:
+    #####:  281:	unsigned char* cp = (unsigned char*) cp0;
+    #####:  282:    if((cc%stride)!=0)
+        -:  283:    {
+    #####:  284:        TIFFErrorExt(tif->tif_clientdata, "horAcc8",
+        -:  285:                     "%s", "(cc%stride)!=0");
+    #####:  286:        return 0;
+        -:  287:    }
+        -:  288:
+    #####:  289:	if (cc > stride) {
+        -:  290:		/*
+        -:  291:		 * Pipeline the most common cases.
+        -:  292:		 */
+    #####:  293:		if (stride == 3)  {
+    #####:  294:			unsigned int cr = cp[0];
+    #####:  295:			unsigned int cg = cp[1];
+    #####:  296:			unsigned int cb = cp[2];
+    #####:  297:			cc -= 3;
+    #####:  298:			cp += 3;
+    #####:  299:			while (cc>0) {
+    #####:  300:				cp[0] = (unsigned char) ((cr += cp[0]) & 0xff);
+    #####:  301:				cp[1] = (unsigned char) ((cg += cp[1]) & 0xff);
+    #####:  302:				cp[2] = (unsigned char) ((cb += cp[2]) & 0xff);
+    #####:  303:				cc -= 3;
+    #####:  304:				cp += 3;
+        -:  305:			}
+    #####:  306:		} else if (stride == 4)  {
+    #####:  307:			unsigned int cr = cp[0];
+    #####:  308:			unsigned int cg = cp[1];
+    #####:  309:			unsigned int cb = cp[2];
+    #####:  310:			unsigned int ca = cp[3];
+    #####:  311:			cc -= 4;
+    #####:  312:			cp += 4;
+    #####:  313:			while (cc>0) {
+    #####:  314:				cp[0] = (unsigned char) ((cr += cp[0]) & 0xff);
+    #####:  315:				cp[1] = (unsigned char) ((cg += cp[1]) & 0xff);
+    #####:  316:				cp[2] = (unsigned char) ((cb += cp[2]) & 0xff);
+    #####:  317:				cp[3] = (unsigned char) ((ca += cp[3]) & 0xff);
+    #####:  318:				cc -= 4;
+    #####:  319:				cp += 4;
+        -:  320:			}
+        -:  321:		} else  {
+    #####:  322:			cc -= stride;
+        -:  323:			do {
+    #####:  324:				REPEAT4(stride, cp[stride] =
+        -:  325:					(unsigned char) ((cp[stride] + *cp) & 0xff); cp++)
+    #####:  326:				cc -= stride;
+    #####:  327:			} while (cc>0);
+        -:  328:		}
+        -:  329:	}
+    #####:  330:	return 1;
+        -:  331:}
+        -:  332:
+        -:  333:static int
+    #####:  334:swabHorAcc16(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  335:{
+    #####:  336:	uint16* wp = (uint16*) cp0;
+    #####:  337:	tmsize_t wc = cc / 2;
+        -:  338:
+    #####:  339:        TIFFSwabArrayOfShort(wp, wc);
+    #####:  340:        return horAcc16(tif, cp0, cc);
+        -:  341:}
+        -:  342:
+        -:  343:static int
+    #####:  344:horAcc16(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  345:{
+    #####:  346:	tmsize_t stride = PredictorState(tif)->stride;
+    #####:  347:	uint16* wp = (uint16*) cp0;
+    #####:  348:	tmsize_t wc = cc / 2;
+        -:  349:
+    #####:  350:    if((cc%(2*stride))!=0)
+        -:  351:    {
+    #####:  352:        TIFFErrorExt(tif->tif_clientdata, "horAcc16",
+        -:  353:                     "%s", "cc%(2*stride))!=0");
+    #####:  354:        return 0;
+        -:  355:    }
+        -:  356:
+    #####:  357:	if (wc > stride) {
+    #####:  358:		wc -= stride;
+        -:  359:		do {
+    #####:  360:			REPEAT4(stride, wp[stride] = (uint16)(((unsigned int)wp[stride] + (unsigned int)wp[0]) & 0xffff); wp++)
+    #####:  361:			wc -= stride;
+    #####:  362:		} while (wc > 0);
+        -:  363:	}
+    #####:  364:	return 1;
+        -:  365:}
+        -:  366:
+        -:  367:static int
+    #####:  368:swabHorAcc32(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  369:{
+    #####:  370:	uint32* wp = (uint32*) cp0;
+    #####:  371:	tmsize_t wc = cc / 4;
+        -:  372:
+    #####:  373:        TIFFSwabArrayOfLong(wp, wc);
+    #####:  374:	return horAcc32(tif, cp0, cc);
+        -:  375:}
+        -:  376:
+        -:  377:static int
+    #####:  378:horAcc32(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  379:{
+    #####:  380:	tmsize_t stride = PredictorState(tif)->stride;
+    #####:  381:	uint32* wp = (uint32*) cp0;
+    #####:  382:	tmsize_t wc = cc / 4;
+        -:  383:
+    #####:  384:    if((cc%(4*stride))!=0)
+        -:  385:    {
+    #####:  386:        TIFFErrorExt(tif->tif_clientdata, "horAcc32",
+        -:  387:                     "%s", "cc%(4*stride))!=0");
+    #####:  388:        return 0;
+        -:  389:    }
+        -:  390:
+    #####:  391:	if (wc > stride) {
+    #####:  392:		wc -= stride;
+        -:  393:		do {
+    #####:  394:			REPEAT4(stride, wp[stride] += wp[0]; wp++)
+    #####:  395:			wc -= stride;
+    #####:  396:		} while (wc > 0);
+        -:  397:	}
+    #####:  398:	return 1;
+        -:  399:}
+        -:  400:
+        -:  401:/*
+        -:  402: * Floating point predictor accumulation routine.
+        -:  403: */
+        -:  404:static int
+    #####:  405:fpAcc(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  406:{
+    #####:  407:	tmsize_t stride = PredictorState(tif)->stride;
+    #####:  408:	uint32 bps = tif->tif_dir.td_bitspersample / 8;
+    #####:  409:	tmsize_t wc = cc / bps;
+    #####:  410:	tmsize_t count = cc;
+    #####:  411:	uint8 *cp = (uint8 *) cp0;
+        -:  412:	uint8 *tmp;
+        -:  413:
+    #####:  414:    if(cc%(bps*stride)!=0)
+        -:  415:    {
+    #####:  416:        TIFFErrorExt(tif->tif_clientdata, "fpAcc",
+        -:  417:                     "%s", "cc%(bps*stride))!=0");
+    #####:  418:        return 0;
+        -:  419:    }
+        -:  420:
+    #####:  421:    tmp = (uint8 *)_TIFFmalloc(cc);
+    #####:  422:	if (!tmp)
+    #####:  423:		return 0;
+        -:  424:
+    #####:  425:	while (count > stride) {
+    #####:  426:		REPEAT4(stride, cp[stride] =
+        -:  427:                        (unsigned char) ((cp[stride] + cp[0]) & 0xff); cp++)
+    #####:  428:		count -= stride;
+        -:  429:	}
+        -:  430:
+    #####:  431:	_TIFFmemcpy(tmp, cp0, cc);
+    #####:  432:	cp = (uint8 *) cp0;
+    #####:  433:	for (count = 0; count < wc; count++) {
+        -:  434:		uint32 byte;
+    #####:  435:		for (byte = 0; byte < bps; byte++) {
+        -:  436:			#if WORDS_BIGENDIAN
+        -:  437:			cp[bps * count + byte] = tmp[byte * wc + count];
+        -:  438:			#else
+    #####:  439:			cp[bps * count + byte] =
+    #####:  440:				tmp[(bps - byte - 1) * wc + count];
+        -:  441:			#endif
+        -:  442:		}
+        -:  443:	}
+    #####:  444:	_TIFFfree(tmp);
+    #####:  445:    return 1;
+        -:  446:}
+        -:  447:
+        -:  448:/*
+        -:  449: * Decode a scanline and apply the predictor routine.
+        -:  450: */
+        -:  451:static int
+    #####:  452:PredictorDecodeRow(TIFF* tif, uint8* op0, tmsize_t occ0, uint16 s)
+        -:  453:{
+    #####:  454:	TIFFPredictorState *sp = PredictorState(tif);
+        -:  455:
+    #####:  456:	assert(sp != NULL);
+    #####:  457:	assert(sp->decoderow != NULL);
+    #####:  458:	assert(sp->decodepfunc != NULL);  
+        -:  459:
+    #####:  460:	if ((*sp->decoderow)(tif, op0, occ0, s)) {
+    #####:  461:		return (*sp->decodepfunc)(tif, op0, occ0);
+        -:  462:	} else
+    #####:  463:		return 0;
+        -:  464:}
+        -:  465:
+        -:  466:/*
+        -:  467: * Decode a tile/strip and apply the predictor routine.
+        -:  468: * Note that horizontal differencing must be done on a
+        -:  469: * row-by-row basis.  The width of a "row" has already
+        -:  470: * been calculated at pre-decode time according to the
+        -:  471: * strip/tile dimensions.
+        -:  472: */
+        -:  473:static int
+    #####:  474:PredictorDecodeTile(TIFF* tif, uint8* op0, tmsize_t occ0, uint16 s)
+        -:  475:{
+    #####:  476:	TIFFPredictorState *sp = PredictorState(tif);
+        -:  477:
+    #####:  478:	assert(sp != NULL);
+    #####:  479:	assert(sp->decodetile != NULL);
+        -:  480:
+    #####:  481:	if ((*sp->decodetile)(tif, op0, occ0, s)) {
+    #####:  482:		tmsize_t rowsize = sp->rowsize;
+    #####:  483:		assert(rowsize > 0);
+    #####:  484:		if((occ0%rowsize) !=0)
+        -:  485:        {
+    #####:  486:            TIFFErrorExt(tif->tif_clientdata, "PredictorDecodeTile",
+        -:  487:                         "%s", "occ0%rowsize != 0");
+    #####:  488:            return 0;
+        -:  489:        }
+    #####:  490:		assert(sp->decodepfunc != NULL);
+    #####:  491:		while (occ0 > 0) {
+    #####:  492:			if( !(*sp->decodepfunc)(tif, op0, rowsize) )
+    #####:  493:                return 0;
+    #####:  494:			occ0 -= rowsize;
+    #####:  495:			op0 += rowsize;
+        -:  496:		}
+    #####:  497:		return 1;
+        -:  498:	} else
+    #####:  499:		return 0;
+        -:  500:}
+        -:  501:
+        -:  502:static int
+    #####:  503:horDiff8(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  504:{
+    #####:  505:	TIFFPredictorState* sp = PredictorState(tif);
+    #####:  506:	tmsize_t stride = sp->stride;
+    #####:  507:	unsigned char* cp = (unsigned char*) cp0;
+        -:  508:
+    #####:  509:    if((cc%stride)!=0)
+        -:  510:    {
+    #####:  511:        TIFFErrorExt(tif->tif_clientdata, "horDiff8",
+        -:  512:                     "%s", "(cc%stride)!=0");
+    #####:  513:        return 0;
+        -:  514:    }
+        -:  515:
+    #####:  516:	if (cc > stride) {
+    #####:  517:		cc -= stride;
+        -:  518:		/*
+        -:  519:		 * Pipeline the most common cases.
+        -:  520:		 */
+    #####:  521:		if (stride == 3) {
+        -:  522:			unsigned int r1, g1, b1;
+    #####:  523:			unsigned int r2 = cp[0];
+    #####:  524:			unsigned int g2 = cp[1];
+    #####:  525:			unsigned  int b2 = cp[2];
+        -:  526:			do {
+    #####:  527:				r1 = cp[3]; cp[3] = (unsigned char)((r1-r2)&0xff); r2 = r1;
+    #####:  528:				g1 = cp[4]; cp[4] = (unsigned char)((g1-g2)&0xff); g2 = g1;
+    #####:  529:				b1 = cp[5]; cp[5] = (unsigned char)((b1-b2)&0xff); b2 = b1;
+    #####:  530:				cp += 3;
+    #####:  531:			} while ((cc -= 3) > 0);
+    #####:  532:		} else if (stride == 4) {
+        -:  533:			unsigned int r1, g1, b1, a1;
+    #####:  534:			unsigned int r2 = cp[0];
+    #####:  535:			unsigned int g2 = cp[1];
+    #####:  536:			unsigned int b2 = cp[2];
+    #####:  537:			unsigned int a2 = cp[3];
+        -:  538:			do {
+    #####:  539:				r1 = cp[4]; cp[4] = (unsigned char)((r1-r2)&0xff); r2 = r1;
+    #####:  540:				g1 = cp[5]; cp[5] = (unsigned char)((g1-g2)&0xff); g2 = g1;
+    #####:  541:				b1 = cp[6]; cp[6] = (unsigned char)((b1-b2)&0xff); b2 = b1;
+    #####:  542:				a1 = cp[7]; cp[7] = (unsigned char)((a1-a2)&0xff); a2 = a1;
+    #####:  543:				cp += 4;
+    #####:  544:			} while ((cc -= 4) > 0);
+        -:  545:		} else {
+    #####:  546:			cp += cc - 1;
+        -:  547:			do {
+    #####:  548:				REPEAT4(stride, cp[stride] = (unsigned char)((cp[stride] - cp[0])&0xff); cp--)
+    #####:  549:			} while ((cc -= stride) > 0);
+        -:  550:		}
+        -:  551:	}
+    #####:  552:	return 1;
+        -:  553:}
+        -:  554:
+        -:  555:static int
+    #####:  556:horDiff16(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  557:{
+    #####:  558:	TIFFPredictorState* sp = PredictorState(tif);
+    #####:  559:	tmsize_t stride = sp->stride;
+    #####:  560:	uint16 *wp = (uint16*) cp0;
+    #####:  561:	tmsize_t wc = cc/2;
+        -:  562:
+    #####:  563:    if((cc%(2*stride))!=0)
+        -:  564:    {
+    #####:  565:        TIFFErrorExt(tif->tif_clientdata, "horDiff8",
+        -:  566:                     "%s", "(cc%(2*stride))!=0");
+    #####:  567:        return 0;
+        -:  568:    }
+        -:  569:
+    #####:  570:	if (wc > stride) {
+    #####:  571:		wc -= stride;
+    #####:  572:		wp += wc - 1;
+        -:  573:		do {
+    #####:  574:			REPEAT4(stride, wp[stride] = (uint16)(((unsigned int)wp[stride] - (unsigned int)wp[0]) & 0xffff); wp--)
+    #####:  575:			wc -= stride;
+    #####:  576:		} while (wc > 0);
+        -:  577:	}
+    #####:  578:	return 1;
+        -:  579:}
+        -:  580:
+        -:  581:static int
+    #####:  582:swabHorDiff16(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  583:{
+    #####:  584:    uint16* wp = (uint16*) cp0;
+    #####:  585:    tmsize_t wc = cc / 2;
+        -:  586:
+    #####:  587:    if( !horDiff16(tif, cp0, cc) )
+    #####:  588:        return 0;
+        -:  589:
+    #####:  590:    TIFFSwabArrayOfShort(wp, wc);
+    #####:  591:    return 1;
+        -:  592:}
+        -:  593:
+        -:  594:static int
+    #####:  595:horDiff32(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  596:{
+    #####:  597:	TIFFPredictorState* sp = PredictorState(tif);
+    #####:  598:	tmsize_t stride = sp->stride;
+    #####:  599:	uint32 *wp = (uint32*) cp0;
+    #####:  600:	tmsize_t wc = cc/4;
+        -:  601:
+    #####:  602:    if((cc%(4*stride))!=0)
+        -:  603:    {
+    #####:  604:        TIFFErrorExt(tif->tif_clientdata, "horDiff32",
+        -:  605:                     "%s", "(cc%(4*stride))!=0");
+    #####:  606:        return 0;
+        -:  607:    }
+        -:  608:
+    #####:  609:	if (wc > stride) {
+    #####:  610:		wc -= stride;
+    #####:  611:		wp += wc - 1;
+        -:  612:		do {
+    #####:  613:			REPEAT4(stride, wp[stride] -= wp[0]; wp--)
+    #####:  614:			wc -= stride;
+    #####:  615:		} while (wc > 0);
+        -:  616:	}
+    #####:  617:	return 1;
+        -:  618:}
+        -:  619:
+        -:  620:static int
+    #####:  621:swabHorDiff32(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  622:{
+    #####:  623:    uint32* wp = (uint32*) cp0;
+    #####:  624:    tmsize_t wc = cc / 4;
+        -:  625:
+    #####:  626:    if( !horDiff32(tif, cp0, cc) )
+    #####:  627:        return 0;
+        -:  628:
+    #####:  629:    TIFFSwabArrayOfLong(wp, wc);
+    #####:  630:    return 1;
+        -:  631:}
+        -:  632:
+        -:  633:/*
+        -:  634: * Floating point predictor differencing routine.
+        -:  635: */
+        -:  636:static int
+    #####:  637:fpDiff(TIFF* tif, uint8* cp0, tmsize_t cc)
+        -:  638:{
+    #####:  639:	tmsize_t stride = PredictorState(tif)->stride;
+    #####:  640:	uint32 bps = tif->tif_dir.td_bitspersample / 8;
+    #####:  641:	tmsize_t wc = cc / bps;
+        -:  642:	tmsize_t count;
+    #####:  643:	uint8 *cp = (uint8 *) cp0;
+        -:  644:	uint8 *tmp;
+        -:  645:
+    #####:  646:    if((cc%(bps*stride))!=0)
+        -:  647:    {
+    #####:  648:        TIFFErrorExt(tif->tif_clientdata, "fpDiff",
+        -:  649:                     "%s", "(cc%(bps*stride))!=0");
+    #####:  650:        return 0;
+        -:  651:    }
+        -:  652:
+    #####:  653:    tmp = (uint8 *)_TIFFmalloc(cc);
+    #####:  654:	if (!tmp)
+    #####:  655:		return 0;
+        -:  656:
+    #####:  657:	_TIFFmemcpy(tmp, cp0, cc);
+    #####:  658:	for (count = 0; count < wc; count++) {
+        -:  659:		uint32 byte;
+    #####:  660:		for (byte = 0; byte < bps; byte++) {
+        -:  661:			#if WORDS_BIGENDIAN
+        -:  662:			cp[byte * wc + count] = tmp[bps * count + byte];
+        -:  663:			#else
+    #####:  664:			cp[(bps - byte - 1) * wc + count] =
+    #####:  665:				tmp[bps * count + byte];
+        -:  666:			#endif
+        -:  667:		}
+        -:  668:	}
+    #####:  669:	_TIFFfree(tmp);
+        -:  670:
+    #####:  671:	cp = (uint8 *) cp0;
+    #####:  672:	cp += cc - stride - 1;
+    #####:  673:	for (count = cc; count > stride; count -= stride)
+    #####:  674:		REPEAT4(stride, cp[stride] = (unsigned char)((cp[stride] - cp[0])&0xff); cp--)
+    #####:  675:    return 1;
+        -:  676:}
+        -:  677:
+        -:  678:static int
+    #####:  679:PredictorEncodeRow(TIFF* tif, uint8* bp, tmsize_t cc, uint16 s)
+        -:  680:{
+    #####:  681:	TIFFPredictorState *sp = PredictorState(tif);
+        -:  682:
+    #####:  683:	assert(sp != NULL);
+    #####:  684:	assert(sp->encodepfunc != NULL);
+    #####:  685:	assert(sp->encoderow != NULL);
+        -:  686:
+        -:  687:	/* XXX horizontal differencing alters user's data XXX */
+    #####:  688:	if( !(*sp->encodepfunc)(tif, bp, cc) )
+    #####:  689:        return 0;
+    #####:  690:	return (*sp->encoderow)(tif, bp, cc, s);
+        -:  691:}
+        -:  692:
+        -:  693:static int
+    #####:  694:PredictorEncodeTile(TIFF* tif, uint8* bp0, tmsize_t cc0, uint16 s)
+        -:  695:{
+        -:  696:	static const char module[] = "PredictorEncodeTile";
+    #####:  697:	TIFFPredictorState *sp = PredictorState(tif);
+        -:  698:        uint8 *working_copy;
+    #####:  699:	tmsize_t cc = cc0, rowsize;
+        -:  700:	unsigned char* bp;
+        -:  701:        int result_code;
+        -:  702:
+    #####:  703:	assert(sp != NULL);
+    #####:  704:	assert(sp->encodepfunc != NULL);
+    #####:  705:	assert(sp->encodetile != NULL);
+        -:  706:
+        -:  707:        /* 
+        -:  708:         * Do predictor manipulation in a working buffer to avoid altering
+        -:  709:         * the callers buffer. http://trac.osgeo.org/gdal/ticket/1965
+        -:  710:         */
+    #####:  711:        working_copy = (uint8*) _TIFFmalloc(cc0);
+    #####:  712:        if( working_copy == NULL )
+        -:  713:        {
+    #####:  714:            TIFFErrorExt(tif->tif_clientdata, module, 
+        -:  715:                         "Out of memory allocating " TIFF_SSIZE_FORMAT " byte temp buffer.",
+        -:  716:                         cc0 );
+    #####:  717:            return 0;
+        -:  718:        }
+    #####:  719:        memcpy( working_copy, bp0, cc0 );
+    #####:  720:        bp = working_copy;
+        -:  721:
+    #####:  722:	rowsize = sp->rowsize;
+    #####:  723:	assert(rowsize > 0);
+    #####:  724:	if((cc0%rowsize)!=0)
+        -:  725:    {
+    #####:  726:        TIFFErrorExt(tif->tif_clientdata, "PredictorEncodeTile",
+        -:  727:                     "%s", "(cc0%rowsize)!=0");
+    #####:  728:        _TIFFfree( working_copy );
+    #####:  729:        return 0;
+        -:  730:    }
+    #####:  731:	while (cc > 0) {
+    #####:  732:		(*sp->encodepfunc)(tif, bp, rowsize);
+    #####:  733:		cc -= rowsize;
+    #####:  734:		bp += rowsize;
+        -:  735:	}
+    #####:  736:	result_code = (*sp->encodetile)(tif, working_copy, cc0, s);
+        -:  737:
+    #####:  738:        _TIFFfree( working_copy );
+        -:  739:
+    #####:  740:        return result_code;
+        -:  741:}
+        -:  742:
+        -:  743:#define	FIELD_PREDICTOR	(FIELD_CODEC+0)		/* XXX */
+        -:  744:
+        -:  745:static const TIFFField predictFields[] = {
+        -:  746:    { TIFFTAG_PREDICTOR, 1, 1, TIFF_SHORT, 0, TIFF_SETGET_UINT16, TIFF_SETGET_UINT16, FIELD_PREDICTOR, FALSE, FALSE, "Predictor", NULL },
+        -:  747:};
+        -:  748:
+        -:  749:static int
+    #####:  750:PredictorVSetField(TIFF* tif, uint32 tag, va_list ap)
+        -:  751:{
+    #####:  752:	TIFFPredictorState *sp = PredictorState(tif);
+        -:  753:
+    #####:  754:	assert(sp != NULL);
+    #####:  755:	assert(sp->vsetparent != NULL);
+        -:  756:
+    #####:  757:	switch (tag) {
+    #####:  758:	case TIFFTAG_PREDICTOR:
+    #####:  759:		sp->predictor = (uint16) va_arg(ap, uint16_vap);
+    #####:  760:		TIFFSetFieldBit(tif, FIELD_PREDICTOR);
+    #####:  761:		break;
+    #####:  762:	default:
+    #####:  763:		return (*sp->vsetparent)(tif, tag, ap);
+        -:  764:	}
+    #####:  765:	tif->tif_flags |= TIFF_DIRTYDIRECT;
+    #####:  766:	return 1;
+        -:  767:}
+        -:  768:
+        -:  769:static int
+    #####:  770:PredictorVGetField(TIFF* tif, uint32 tag, va_list ap)
+        -:  771:{
+    #####:  772:	TIFFPredictorState *sp = PredictorState(tif);
+        -:  773:
+    #####:  774:	assert(sp != NULL);
+    #####:  775:	assert(sp->vgetparent != NULL);
+        -:  776:
+    #####:  777:	switch (tag) {
+    #####:  778:	case TIFFTAG_PREDICTOR:
+    #####:  779:		*va_arg(ap, uint16*) = (uint16)sp->predictor;
+    #####:  780:		break;
+    #####:  781:	default:
+    #####:  782:		return (*sp->vgetparent)(tif, tag, ap);
+        -:  783:	}
+    #####:  784:	return 1;
+        -:  785:}
+        -:  786:
+        -:  787:static void
+    #####:  788:PredictorPrintDir(TIFF* tif, FILE* fd, long flags)
+        -:  789:{
+    #####:  790:	TIFFPredictorState* sp = PredictorState(tif);
+        -:  791:
+        -:  792:	(void) flags;
+    #####:  793:	if (TIFFFieldSet(tif,FIELD_PREDICTOR)) {
+    #####:  794:		fprintf(fd, "  Predictor: ");
+    #####:  795:		switch (sp->predictor) {
+    #####:  796:			case 1: fprintf(fd, "none "); break;
+    #####:  797:			case 2: fprintf(fd, "horizontal differencing "); break;
+    #####:  798:			case 3: fprintf(fd, "floating point predictor "); break;
+        -:  799:		}
+    #####:  800:		fprintf(fd, "%d (0x%x)\n", sp->predictor, sp->predictor);
+        -:  801:	}
+    #####:  802:	if (sp->printdir)
+    #####:  803:		(*sp->printdir)(tif, fd, flags);
+    #####:  804:}
+        -:  805:
+        -:  806:int
+    #####:  807:TIFFPredictorInit(TIFF* tif)
+        -:  808:{
+    #####:  809:	TIFFPredictorState* sp = PredictorState(tif);
+        -:  810:
+    #####:  811:	assert(sp != 0);
+        -:  812:
+        -:  813:	/*
+        -:  814:	 * Merge codec-specific tag information.
+        -:  815:	 */
+    #####:  816:	if (!_TIFFMergeFields(tif, predictFields,
+        -:  817:			      TIFFArrayCount(predictFields))) {
+    #####:  818:		TIFFErrorExt(tif->tif_clientdata, "TIFFPredictorInit",
+        -:  819:		    "Merging Predictor codec-specific tags failed");
+    #####:  820:		return 0;
+        -:  821:	}
+        -:  822:
+        -:  823:	/*
+        -:  824:	 * Override parent get/set field methods.
+        -:  825:	 */
+    #####:  826:	sp->vgetparent = tif->tif_tagmethods.vgetfield;
+    #####:  827:	tif->tif_tagmethods.vgetfield =
+        -:  828:            PredictorVGetField;/* hook for predictor tag */
+    #####:  829:	sp->vsetparent = tif->tif_tagmethods.vsetfield;
+    #####:  830:	tif->tif_tagmethods.vsetfield =
+        -:  831:	    PredictorVSetField;/* hook for predictor tag */
+    #####:  832:	sp->printdir = tif->tif_tagmethods.printdir;
+    #####:  833:	tif->tif_tagmethods.printdir =
+        -:  834:            PredictorPrintDir;	/* hook for predictor tag */
+        -:  835:
+    #####:  836:	sp->setupdecode = tif->tif_setupdecode;
+    #####:  837:	tif->tif_setupdecode = PredictorSetupDecode;
+    #####:  838:	sp->setupencode = tif->tif_setupencode;
+    #####:  839:	tif->tif_setupencode = PredictorSetupEncode;
+        -:  840:
+    #####:  841:	sp->predictor = 1;			/* default value */
+    #####:  842:	sp->encodepfunc = NULL;			/* no predictor routine */
+    #####:  843:	sp->decodepfunc = NULL;			/* no predictor routine */
+    #####:  844:	return 1;
+        -:  845:}
+        -:  846:
+        -:  847:int
+    #####:  848:TIFFPredictorCleanup(TIFF* tif)
+        -:  849:{
+    #####:  850:	TIFFPredictorState* sp = PredictorState(tif);
+        -:  851:
+    #####:  852:	assert(sp != 0);
+        -:  853:
+    #####:  854:	tif->tif_tagmethods.vgetfield = sp->vgetparent;
+    #####:  855:	tif->tif_tagmethods.vsetfield = sp->vsetparent;
+    #####:  856:	tif->tif_tagmethods.printdir = sp->printdir;
+    #####:  857:	tif->tif_setupdecode = sp->setupdecode;
+    #####:  858:	tif->tif_setupencode = sp->setupencode;
+        -:  859:
+    #####:  860:	return 1;
+        -:  861:}
+        -:  862:
+        -:  863:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  864:/*
+        -:  865: * Local Variables:
+        -:  866: * mode: c
+        -:  867: * c-basic-offset: 8
+        -:  868: * fill-column: 78
+        -:  869: * End:
+        -:  870: */

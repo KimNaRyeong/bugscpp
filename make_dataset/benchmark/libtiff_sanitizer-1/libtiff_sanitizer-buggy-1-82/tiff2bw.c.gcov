@@ -1,0 +1,479 @@
+        -:    0:Source:tiff2bw.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1988-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:#include "tif_config.h"
+        -:   28:
+        -:   29:#include <stdio.h>
+        -:   30:#include <stdlib.h>
+        -:   31:#include <string.h>
+        -:   32:#include <ctype.h>
+        -:   33:
+        -:   34:#ifdef HAVE_UNISTD_H
+        -:   35:# include <unistd.h>
+        -:   36:#endif
+        -:   37:
+        -:   38:#ifdef NEED_LIBPORT
+        -:   39:# include "libport.h"
+        -:   40:#endif
+        -:   41:
+        -:   42:#include "tiffio.h"
+        -:   43:
+        -:   44:#define	streq(a,b)	(strcmp((a),(b)) == 0)
+        -:   45:#define	strneq(a,b,n)	(strncmp(a,b,n) == 0)
+        -:   46:
+        -:   47:/* x% weighting -> fraction of full color */
+        -:   48:#define	PCT(x)	(((x)*256+50)/100)
+        -:   49:int	RED = PCT(30);		/* 30% */
+        -:   50:int	GREEN = PCT(59);	/* 59% */
+        -:   51:int	BLUE = PCT(11);		/* 11% */
+        -:   52:
+        -:   53:static	void usage(void);
+        -:   54:static	int processCompressOptions(char*);
+        -:   55:
+        -:   56:static void
+    #####:   57:compresscontig(unsigned char* out, unsigned char* rgb, uint32 n)
+        -:   58:{
+    #####:   59:	register int v, red = RED, green = GREEN, blue = BLUE;
+        -:   60:
+    #####:   61:	while (n-- > 0) {
+    #####:   62:		v = red*(*rgb++);
+    #####:   63:		v += green*(*rgb++);
+    #####:   64:		v += blue*(*rgb++);
+    #####:   65:		*out++ = v>>8;
+        -:   66:	}
+    #####:   67:}
+        -:   68:
+        -:   69:static void
+    #####:   70:compresssep(unsigned char* out,
+        -:   71:	    unsigned char* r, unsigned char* g, unsigned char* b, uint32 n)
+        -:   72:{
+    #####:   73:	register uint32 red = RED, green = GREEN, blue = BLUE;
+        -:   74:
+    #####:   75:	while (n-- > 0)
+    #####:   76:		*out++ = (unsigned char)
+    #####:   77:			((red*(*r++) + green*(*g++) + blue*(*b++)) >> 8);
+    #####:   78:}
+        -:   79:
+        -:   80:static int
+    #####:   81:checkcmap(TIFF* tif, int n, uint16* r, uint16* g, uint16* b)
+        -:   82:{
+    #####:   83:	while (n-- > 0)
+    #####:   84:		if (*r++ >= 256 || *g++ >= 256 || *b++ >= 256)
+    #####:   85:			return (16);
+    #####:   86:	TIFFWarning(TIFFFileName(tif), "Assuming 8-bit colormap");
+    #####:   87:	return (8);
+        -:   88:}
+        -:   89:
+        -:   90:static void
+    #####:   91:compresspalette(unsigned char* out, unsigned char* data, uint32 n, uint16* rmap, uint16* gmap, uint16* bmap)
+        -:   92:{
+    #####:   93:	register int v, red = RED, green = GREEN, blue = BLUE;
+        -:   94:
+    #####:   95:	while (n-- > 0) {
+    #####:   96:		unsigned int ix = *data++;
+    #####:   97:		v = red*rmap[ix];
+    #####:   98:		v += green*gmap[ix];
+    #####:   99:		v += blue*bmap[ix];
+    #####:  100:		*out++ = v>>8;
+        -:  101:	}
+    #####:  102:}
+        -:  103:
+        -:  104:static	uint16 compression = (uint16) -1;
+        -:  105:static	uint16 predictor = 0;
+        -:  106:static	int jpegcolormode = JPEGCOLORMODE_RGB;
+        -:  107:static	int quality = 75;		/* JPEG quality */
+        -:  108:
+        -:  109:static	void cpTags(TIFF* in, TIFF* out);
+        -:  110:
+        -:  111:int
+    #####:  112:main(int argc, char* argv[])
+        -:  113:{
+    #####:  114:	uint32 rowsperstrip = (uint32) -1;
+        -:  115:	TIFF *in, *out;
+    #####:  116:	uint32 w, h;
+    #####:  117:	uint16 samplesperpixel;
+    #####:  118:	uint16 bitspersample;
+    #####:  119:	uint16 config;
+    #####:  120:	uint16 photometric;
+    #####:  121:	uint16* red;
+    #####:  122:	uint16* green;
+    #####:  123:	uint16* blue;
+        -:  124:	tsize_t rowsize;
+        -:  125:	register uint32 row;
+        -:  126:	register tsample_t s;
+        -:  127:	unsigned char *inbuf, *outbuf;
+    #####:  128:	char thing[1024];
+        -:  129:	int c;
+        -:  130:#if !HAVE_DECL_OPTARG
+        -:  131:	extern int optind;
+        -:  132:	extern char *optarg;
+        -:  133:#endif
+        -:  134:
+    #####:  135:	while ((c = getopt(argc, argv, "c:r:R:G:B:")) != -1)
+    #####:  136:		switch (c) {
+    #####:  137:		case 'c':		/* compression scheme */
+    #####:  138:			if (!processCompressOptions(optarg))
+    #####:  139:				usage();
+    #####:  140:			break;
+    #####:  141:		case 'r':		/* rows/strip */
+    #####:  142:			rowsperstrip = atoi(optarg);
+    #####:  143:			break;
+    #####:  144:		case 'R':
+    #####:  145:			RED = PCT(atoi(optarg));
+    #####:  146:			break;
+    #####:  147:		case 'G':
+    #####:  148:			GREEN = PCT(atoi(optarg));
+    #####:  149:			break;
+    #####:  150:		case 'B':
+    #####:  151:			BLUE = PCT(atoi(optarg));
+    #####:  152:			break;
+    #####:  153:		case '?':
+    #####:  154:			usage();
+        -:  155:			/*NOTREACHED*/
+        -:  156:		}
+    #####:  157:	if (argc - optind < 2)
+    #####:  158:		usage();
+    #####:  159:	in = TIFFOpen(argv[optind], "r");
+    #####:  160:	if (in == NULL)
+    #####:  161:		return (-1);
+    #####:  162:	photometric = 0;
+    #####:  163:	TIFFGetField(in, TIFFTAG_PHOTOMETRIC, &photometric);
+    #####:  164:	if (photometric != PHOTOMETRIC_RGB && photometric != PHOTOMETRIC_PALETTE ) {
+    #####:  165:		fprintf(stderr,
+        -:  166:	    "%s: Bad photometric; can only handle RGB and Palette images.\n",
+    #####:  167:		    argv[optind]);
+    #####:  168:		return (-1);
+        -:  169:	}
+    #####:  170:	TIFFGetField(in, TIFFTAG_SAMPLESPERPIXEL, &samplesperpixel);
+    #####:  171:	if (samplesperpixel != 1 && samplesperpixel != 3) {
+    #####:  172:		fprintf(stderr, "%s: Bad samples/pixel %u.\n",
+    #####:  173:		    argv[optind], samplesperpixel);
+    #####:  174:		return (-1);
+        -:  175:	}
+    #####:  176:	if( photometric == PHOTOMETRIC_RGB && samplesperpixel != 3) {
+    #####:  177:		fprintf(stderr, "%s: Bad samples/pixel %u for PHOTOMETRIC_RGB.\n",
+    #####:  178:		    argv[optind], samplesperpixel);
+    #####:  179:		return (-1);
+        -:  180:	}
+    #####:  181:	TIFFGetField(in, TIFFTAG_BITSPERSAMPLE, &bitspersample);
+    #####:  182:	if (bitspersample != 8) {
+    #####:  183:		fprintf(stderr,
+    #####:  184:		    " %s: Sorry, only handle 8-bit samples.\n", argv[optind]);
+    #####:  185:		return (-1);
+        -:  186:	}
+    #####:  187:	TIFFGetField(in, TIFFTAG_IMAGEWIDTH, &w);
+    #####:  188:	TIFFGetField(in, TIFFTAG_IMAGELENGTH, &h);
+    #####:  189:	TIFFGetField(in, TIFFTAG_PLANARCONFIG, &config);
+        -:  190:
+    #####:  191:	out = TIFFOpen(argv[optind+1], "w");
+    #####:  192:	if (out == NULL)
+    #####:  193:		return (-1);
+    #####:  194:	TIFFSetField(out, TIFFTAG_IMAGEWIDTH, w);
+    #####:  195:	TIFFSetField(out, TIFFTAG_IMAGELENGTH, h);
+    #####:  196:	TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 8);
+    #####:  197:	TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 1);
+    #####:  198:	TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    #####:  199:	cpTags(in, out);
+    #####:  200:	if (compression != (uint16) -1) {
+    #####:  201:		TIFFSetField(out, TIFFTAG_COMPRESSION, compression);
+    #####:  202:		switch (compression) {
+    #####:  203:		case COMPRESSION_JPEG:
+    #####:  204:			TIFFSetField(out, TIFFTAG_JPEGQUALITY, quality);
+    #####:  205:			TIFFSetField(out, TIFFTAG_JPEGCOLORMODE, jpegcolormode);
+    #####:  206:			break;
+    #####:  207:		case COMPRESSION_LZW:
+        -:  208:		case COMPRESSION_DEFLATE:
+    #####:  209:			if (predictor != 0)
+    #####:  210:				TIFFSetField(out, TIFFTAG_PREDICTOR, predictor);
+    #####:  211:			break;
+        -:  212:		}
+    #####:  213:	}
+    #####:  214:	TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+    #####:  215:	snprintf(thing, sizeof(thing), "B&W version of %s", argv[optind]);
+    #####:  216:	TIFFSetField(out, TIFFTAG_IMAGEDESCRIPTION, thing);
+    #####:  217:	TIFFSetField(out, TIFFTAG_SOFTWARE, "tiff2bw");
+    #####:  218:	outbuf = (unsigned char *)_TIFFmalloc(TIFFScanlineSize(out));
+    #####:  219:	TIFFSetField(out, TIFFTAG_ROWSPERSTRIP,
+        -:  220:	    TIFFDefaultStripSize(out, rowsperstrip));
+        -:  221:
+        -:  222:#define	pack(a,b)	((a)<<8 | (b))
+    #####:  223:	switch (pack(photometric, config)) {
+    #####:  224:	case pack(PHOTOMETRIC_PALETTE, PLANARCONFIG_CONTIG):
+        -:  225:	case pack(PHOTOMETRIC_PALETTE, PLANARCONFIG_SEPARATE):
+    #####:  226:		TIFFGetField(in, TIFFTAG_COLORMAP, &red, &green, &blue);
+        -:  227:		/*
+        -:  228:		 * Convert 16-bit colormap to 8-bit (unless it looks
+        -:  229:		 * like an old-style 8-bit colormap).
+        -:  230:		 */
+    #####:  231:		if (checkcmap(in, 1<<bitspersample, red, green, blue) == 16) {
+        -:  232:			int i;
+        -:  233:#define	CVT(x)		(((x) * 255L) / ((1L<<16)-1))
+    #####:  234:			for (i = (1<<bitspersample)-1; i >= 0; i--) {
+    #####:  235:				red[i] = CVT(red[i]);
+    #####:  236:				green[i] = CVT(green[i]);
+    #####:  237:				blue[i] = CVT(blue[i]);
+        -:  238:			}
+        -:  239:#undef CVT
+        -:  240:		}
+    #####:  241:		inbuf = (unsigned char *)_TIFFmalloc(TIFFScanlineSize(in));
+    #####:  242:		for (row = 0; row < h; row++) {
+    #####:  243:			if (TIFFReadScanline(in, inbuf, row, 0) < 0)
+    #####:  244:				break;
+    #####:  245:			compresspalette(outbuf, inbuf, w, red, green, blue);
+    #####:  246:			if (TIFFWriteScanline(out, outbuf, row, 0) < 0)
+    #####:  247:				break;
+        -:  248:		}
+    #####:  249:		break;
+    #####:  250:	case pack(PHOTOMETRIC_RGB, PLANARCONFIG_CONTIG):
+    #####:  251:		inbuf = (unsigned char *)_TIFFmalloc(TIFFScanlineSize(in));
+    #####:  252:		for (row = 0; row < h; row++) {
+    #####:  253:			if (TIFFReadScanline(in, inbuf, row, 0) < 0)
+    #####:  254:				break;
+    #####:  255:			compresscontig(outbuf, inbuf, w);
+    #####:  256:			if (TIFFWriteScanline(out, outbuf, row, 0) < 0)
+    #####:  257:				break;
+        -:  258:		}
+    #####:  259:		break;
+    #####:  260:	case pack(PHOTOMETRIC_RGB, PLANARCONFIG_SEPARATE):
+    #####:  261:		rowsize = TIFFScanlineSize(in);
+    #####:  262:		inbuf = (unsigned char *)_TIFFmalloc(3*rowsize);
+    #####:  263:		for (row = 0; row < h; row++) {
+    #####:  264:			for (s = 0; s < 3; s++)
+    #####:  265:				if (TIFFReadScanline(in,
+    #####:  266:				    inbuf+s*rowsize, row, s) < 0)
+    #####:  267:					 return (-1);
+    #####:  268:			compresssep(outbuf,
+    #####:  269:			    inbuf, inbuf+rowsize, inbuf+2*rowsize, w);
+    #####:  270:			if (TIFFWriteScanline(out, outbuf, row, 0) < 0)
+    #####:  271:				break;
+        -:  272:		}
+    #####:  273:		break;
+        -:  274:	}
+        -:  275:#undef pack
+    #####:  276:	TIFFClose(out);
+    #####:  277:	return (0);
+        -:  278:}
+        -:  279:
+        -:  280:static int
+    #####:  281:processCompressOptions(char* opt)
+        -:  282:{
+    #####:  283:	if (streq(opt, "none"))
+    #####:  284:		compression = COMPRESSION_NONE;
+    #####:  285:	else if (streq(opt, "packbits"))
+    #####:  286:		compression = COMPRESSION_PACKBITS;
+    #####:  287:	else if (strneq(opt, "jpeg", 4)) {
+    #####:  288:		char* cp = strchr(opt, ':');
+        -:  289:
+    #####:  290:                compression = COMPRESSION_JPEG;
+    #####:  291:                while( cp )
+        -:  292:                {
+    #####:  293:                    if (isdigit((int)cp[1]))
+    #####:  294:			quality = atoi(cp+1);
+    #####:  295:                    else if (cp[1] == 'r' )
+    #####:  296:			jpegcolormode = JPEGCOLORMODE_RAW;
+        -:  297:                    else
+    #####:  298:                        usage();
+        -:  299:
+    #####:  300:                    cp = strchr(cp+1,':');
+        -:  301:                }
+    #####:  302:	} else if (strneq(opt, "lzw", 3)) {
+    #####:  303:		char* cp = strchr(opt, ':');
+    #####:  304:		if (cp)
+    #####:  305:			predictor = atoi(cp+1);
+    #####:  306:		compression = COMPRESSION_LZW;
+    #####:  307:	} else if (strneq(opt, "zip", 3)) {
+    #####:  308:		char* cp = strchr(opt, ':');
+    #####:  309:		if (cp)
+    #####:  310:			predictor = atoi(cp+1);
+    #####:  311:		compression = COMPRESSION_DEFLATE;
+        -:  312:	} else
+    #####:  313:		return (0);
+    #####:  314:	return (1);
+        -:  315:}
+        -:  316:
+        -:  317:#define	CopyField(tag, v) \
+        -:  318:    if (TIFFGetField(in, tag, &v)) TIFFSetField(out, tag, v)
+        -:  319:#define	CopyField2(tag, v1, v2) \
+        -:  320:    if (TIFFGetField(in, tag, &v1, &v2)) TIFFSetField(out, tag, v1, v2)
+        -:  321:#define	CopyField3(tag, v1, v2, v3) \
+        -:  322:    if (TIFFGetField(in, tag, &v1, &v2, &v3)) TIFFSetField(out, tag, v1, v2, v3)
+        -:  323:#define	CopyField4(tag, v1, v2, v3, v4) \
+        -:  324:    if (TIFFGetField(in, tag, &v1, &v2, &v3, &v4)) TIFFSetField(out, tag, v1, v2, v3, v4)
+        -:  325:
+        -:  326:static void
+    #####:  327:cpTag(TIFF* in, TIFF* out, uint16 tag, uint16 count, TIFFDataType type)
+        -:  328:{
+    #####:  329:	switch (type) {
+    #####:  330:	case TIFF_SHORT:
+    #####:  331:		if (count == 1) {
+    #####:  332:			uint16 shortv;
+    #####:  333:			CopyField(tag, shortv);
+    #####:  334:		} else if (count == 2) {
+    #####:  335:			uint16 shortv1, shortv2;
+    #####:  336:			CopyField2(tag, shortv1, shortv2);
+    #####:  337:		} else if (count == 4) {
+    #####:  338:			uint16 *tr, *tg, *tb, *ta;
+    #####:  339:			CopyField4(tag, tr, tg, tb, ta);
+    #####:  340:		} else if (count == (uint16) -1) {
+    #####:  341:			uint16 shortv1;
+    #####:  342:			uint16* shortav;
+    #####:  343:			CopyField2(tag, shortv1, shortav);
+        -:  344:		}
+    #####:  345:		break;
+    #####:  346:	case TIFF_LONG:
+    #####:  347:		{ uint32 longv;
+    #####:  348:		  CopyField(tag, longv);
+        -:  349:		}
+        -:  350:		break;
+    #####:  351:	case TIFF_RATIONAL:
+    #####:  352:		if (count == 1) {
+    #####:  353:			float floatv;
+    #####:  354:			CopyField(tag, floatv);
+    #####:  355:		} else if (count == (uint16) -1) {
+    #####:  356:			float* floatav;
+    #####:  357:			CopyField(tag, floatav);
+        -:  358:		}
+    #####:  359:		break;
+    #####:  360:	case TIFF_ASCII:
+    #####:  361:		{ char* stringv;
+    #####:  362:		  CopyField(tag, stringv);
+        -:  363:		}
+        -:  364:		break;
+    #####:  365:	case TIFF_DOUBLE:
+    #####:  366:		if (count == 1) {
+    #####:  367:			double doublev;
+    #####:  368:			CopyField(tag, doublev);
+    #####:  369:		} else if (count == (uint16) -1) {
+    #####:  370:			double* doubleav;
+    #####:  371:			CopyField(tag, doubleav);
+        -:  372:		}
+    #####:  373:		break;
+    #####:  374:          default:
+    #####:  375:                TIFFError(TIFFFileName(in),
+        -:  376:                          "Data type %d is not supported, tag %d skipped.",
+        -:  377:                          tag, type);
+        -:  378:	}
+    #####:  379:}
+        -:  380:
+        -:  381:#undef CopyField4
+        -:  382:#undef CopyField3
+        -:  383:#undef CopyField2
+        -:  384:#undef CopyField
+        -:  385:
+        -:  386:static struct cpTag {
+        -:  387:	uint16	tag;
+        -:  388:	uint16	count;
+        -:  389:	TIFFDataType type;
+        -:  390:} tags[] = {
+        -:  391:	{ TIFFTAG_SUBFILETYPE,		1, TIFF_LONG },
+        -:  392:	{ TIFFTAG_THRESHHOLDING,	1, TIFF_SHORT },
+        -:  393:	{ TIFFTAG_DOCUMENTNAME,		1, TIFF_ASCII },
+        -:  394:	{ TIFFTAG_IMAGEDESCRIPTION,	1, TIFF_ASCII },
+        -:  395:	{ TIFFTAG_MAKE,			1, TIFF_ASCII },
+        -:  396:	{ TIFFTAG_MODEL,		1, TIFF_ASCII },
+        -:  397:	{ TIFFTAG_MINSAMPLEVALUE,	1, TIFF_SHORT },
+        -:  398:	{ TIFFTAG_MAXSAMPLEVALUE,	1, TIFF_SHORT },
+        -:  399:	{ TIFFTAG_XRESOLUTION,		1, TIFF_RATIONAL },
+        -:  400:	{ TIFFTAG_YRESOLUTION,		1, TIFF_RATIONAL },
+        -:  401:	{ TIFFTAG_PAGENAME,		1, TIFF_ASCII },
+        -:  402:	{ TIFFTAG_XPOSITION,		1, TIFF_RATIONAL },
+        -:  403:	{ TIFFTAG_YPOSITION,		1, TIFF_RATIONAL },
+        -:  404:	{ TIFFTAG_RESOLUTIONUNIT,	1, TIFF_SHORT },
+        -:  405:	{ TIFFTAG_SOFTWARE,		1, TIFF_ASCII },
+        -:  406:	{ TIFFTAG_DATETIME,		1, TIFF_ASCII },
+        -:  407:	{ TIFFTAG_ARTIST,		1, TIFF_ASCII },
+        -:  408:	{ TIFFTAG_HOSTCOMPUTER,		1, TIFF_ASCII },
+        -:  409:	{ TIFFTAG_WHITEPOINT,		2, TIFF_RATIONAL },
+        -:  410:	{ TIFFTAG_PRIMARYCHROMATICITIES,(uint16) -1,TIFF_RATIONAL },
+        -:  411:	{ TIFFTAG_HALFTONEHINTS,	2, TIFF_SHORT },
+        -:  412:	{ TIFFTAG_INKSET,		1, TIFF_SHORT },
+        -:  413:	{ TIFFTAG_DOTRANGE,		2, TIFF_SHORT },
+        -:  414:	{ TIFFTAG_TARGETPRINTER,	1, TIFF_ASCII },
+        -:  415:	{ TIFFTAG_SAMPLEFORMAT,		1, TIFF_SHORT },
+        -:  416:	{ TIFFTAG_YCBCRCOEFFICIENTS,	(uint16) -1,TIFF_RATIONAL },
+        -:  417:	{ TIFFTAG_YCBCRSUBSAMPLING,	2, TIFF_SHORT },
+        -:  418:	{ TIFFTAG_YCBCRPOSITIONING,	1, TIFF_SHORT },
+        -:  419:	{ TIFFTAG_REFERENCEBLACKWHITE,	(uint16) -1,TIFF_RATIONAL },
+        -:  420:	{ TIFFTAG_EXTRASAMPLES,		(uint16) -1, TIFF_SHORT },
+        -:  421:	{ TIFFTAG_SMINSAMPLEVALUE,	1, TIFF_DOUBLE },
+        -:  422:	{ TIFFTAG_SMAXSAMPLEVALUE,	1, TIFF_DOUBLE },
+        -:  423:	{ TIFFTAG_STONITS,		1, TIFF_DOUBLE },
+        -:  424:};
+        -:  425:#define	NTAGS	(sizeof (tags) / sizeof (tags[0]))
+        -:  426:
+        -:  427:static void
+    #####:  428:cpTags(TIFF* in, TIFF* out)
+        -:  429:{
+        -:  430:    struct cpTag *p;
+    #####:  431:    for (p = tags; p < &tags[NTAGS]; p++)
+    #####:  432:	cpTag(in, out, p->tag, p->count, p->type);
+    #####:  433:}
+        -:  434:#undef NTAGS
+        -:  435:
+        -:  436:char* stuff[] = {
+        -:  437:"usage: tiff2bw [options] input.tif output.tif",
+        -:  438:"where options are:",
+        -:  439:" -R %		use #% from red channel",
+        -:  440:" -G %		use #% from green channel",
+        -:  441:" -B %		use #% from blue channel",
+        -:  442:"",
+        -:  443:" -r #		make each strip have no more than # rows",
+        -:  444:"",
+        -:  445:" -c lzw[:opts]	compress output with Lempel-Ziv & Welch encoding",
+        -:  446:" -c zip[:opts]	compress output with deflate encoding",
+        -:  447:" -c packbits	compress output with packbits encoding",
+        -:  448:" -c g3[:opts]	compress output with CCITT Group 3 encoding",
+        -:  449:" -c g4		compress output with CCITT Group 4 encoding",
+        -:  450:" -c none	use no compression algorithm on output",
+        -:  451:"",
+        -:  452:"LZW and deflate options:",
+        -:  453:" #		set predictor value",
+        -:  454:"For example, -c lzw:2 to get LZW-encoded data with horizontal differencing",
+        -:  455:NULL
+        -:  456:};
+        -:  457:
+        -:  458:static void
+    #####:  459:usage(void)
+        -:  460:{
+    #####:  461:	char buf[BUFSIZ];
+        -:  462:	int i;
+        -:  463:
+    #####:  464:	setbuf(stderr, buf);
+    #####:  465:        fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:  466:	for (i = 0; stuff[i] != NULL; i++)
+    #####:  467:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:  468:	exit(-1);
+        -:  469:}
+        -:  470:
+        -:  471:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  472:/*
+        -:  473: * Local Variables:
+        -:  474: * mode: c
+        -:  475: * c-basic-offset: 8
+        -:  476: * fill-column: 78
+        -:  477: * End:
+        -:  478: */

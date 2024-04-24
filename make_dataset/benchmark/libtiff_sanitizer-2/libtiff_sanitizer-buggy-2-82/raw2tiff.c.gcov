@@ -1,0 +1,685 @@
+        -:    0:Source:raw2tiff.c
+        -:    1:/* $Id$
+        -:    2: *
+        -:    3: * Project:  libtiff tools
+        -:    4: * Purpose:  Convert raw byte sequences in TIFF images
+        -:    5: * Author:   Andrey Kiselev, dron@ak4719.spb.edu
+        -:    6: *
+        -:    7: ******************************************************************************
+        -:    8: * Copyright (c) 2002, Andrey Kiselev <dron@ak4719.spb.edu>
+        -:    9: *
+        -:   10: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:   11: * its documentation for any purpose is hereby granted without fee, provided
+        -:   12: * that (i) the above copyright notices and this permission notice appear in
+        -:   13: * all copies of the software and related documentation, and (ii) the names of
+        -:   14: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   15: * publicity relating to the software without the specific, prior written
+        -:   16: * permission of Sam Leffler and Silicon Graphics.
+        -:   17: * 
+        -:   18: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   19: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   20: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   21: * 
+        -:   22: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   23: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   24: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   25: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   26: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   27: * OF THIS SOFTWARE.
+        -:   28: */
+        -:   29:
+        -:   30:#include "tif_config.h"
+        -:   31:
+        -:   32:#include <stdio.h>
+        -:   33:#include <stdlib.h>
+        -:   34:#include <string.h>
+        -:   35:#include <sys/stat.h>
+        -:   36:#include <sys/types.h>
+        -:   37:#include <math.h>
+        -:   38:#include <ctype.h>
+        -:   39:
+        -:   40:#ifdef HAVE_UNISTD_H
+        -:   41:# include <unistd.h>
+        -:   42:#endif
+        -:   43:
+        -:   44:#if HAVE_FCNTL_H
+        -:   45:# include <fcntl.h>
+        -:   46:#endif
+        -:   47:
+        -:   48:#if HAVE_SYS_TYPES_H
+        -:   49:# include <sys/types.h>
+        -:   50:#endif
+        -:   51:
+        -:   52:#if HAVE_IO_H
+        -:   53:# include <io.h>
+        -:   54:#endif
+        -:   55:
+        -:   56:#ifdef NEED_LIBPORT
+        -:   57:# include "libport.h"
+        -:   58:#endif
+        -:   59:
+        -:   60:#include "tiffiop.h"
+        -:   61:#include "tiffio.h"
+        -:   62:
+        -:   63:#ifndef HAVE_GETOPT
+        -:   64:extern int getopt(int, char**, char*);
+        -:   65:#endif
+        -:   66:
+        -:   67:#ifndef O_BINARY
+        -:   68:# define O_BINARY 0
+        -:   69:#endif
+        -:   70:
+        -:   71:typedef enum {
+        -:   72:	PIXEL,
+        -:   73:	BAND
+        -:   74:} InterleavingType;
+        -:   75:
+        -:   76:static	uint16 compression = (uint16) -1;
+        -:   77:static	int jpegcolormode = JPEGCOLORMODE_RGB;
+        -:   78:static	int quality = 75;		/* JPEG quality */
+        -:   79:static	uint16 predictor = 0;
+        -:   80:
+        -:   81:static void swapBytesInScanline(void *, uint32, TIFFDataType);
+        -:   82:static int guessSize(int, TIFFDataType, _TIFF_off_t, uint32, int,
+        -:   83:		     uint32 *, uint32 *);
+        -:   84:static double correlation(void *, void *, uint32, TIFFDataType);
+        -:   85:static void usage(void);
+        -:   86:static	int processCompressOptions(char*);
+        -:   87:
+        -:   88:int
+    #####:   89:main(int argc, char* argv[])
+        -:   90:{
+    #####:   91:	uint32	width = 0, length = 0, linebytes, bufsize;
+    #####:   92:	uint32	nbands = 1;		    /* number of bands in input image*/
+    #####:   93:	_TIFF_off_t hdr_size = 0;	    /* size of the header to skip */
+    #####:   94:	TIFFDataType dtype = TIFF_BYTE;
+    #####:   95:	int16	depth = 1;		    /* bytes per pixel in input image */
+    #####:   96:	int	swab = 0;		    /* byte swapping flag */
+    #####:   97:	InterleavingType interleaving = 0;  /* interleaving type flag */
+    #####:   98:	uint32  rowsperstrip = (uint32) -1;
+    #####:   99:	uint16	photometric = PHOTOMETRIC_MINISBLACK;
+    #####:  100:	uint16	config = PLANARCONFIG_CONTIG;
+    #####:  101:	uint16	fillorder = FILLORDER_LSB2MSB;
+        -:  102:	int	fd;
+    #####:  103:	char	*outfilename = NULL;
+        -:  104:	TIFF	*out;
+        -:  105:
+        -:  106:	uint32 row, col, band;
+        -:  107:	int	c;
+    #####:  108:	unsigned char *buf = NULL, *buf1 = NULL;
+        -:  109:#if !HAVE_DECL_OPTARG
+        -:  110:	extern int optind;
+        -:  111:	extern char* optarg;
+        -:  112:#endif
+        -:  113:
+    #####:  114:	while ((c = getopt(argc, argv, "c:r:H:w:l:b:d:LMp:si:o:h")) != -1) {
+    #####:  115:		switch (c) {
+    #####:  116:		case 'c':		/* compression scheme */
+    #####:  117:			if (!processCompressOptions(optarg))
+    #####:  118:				usage();
+    #####:  119:			break;
+    #####:  120:		case 'r':		/* rows/strip */
+    #####:  121:			rowsperstrip = atoi(optarg);
+    #####:  122:			break;
+    #####:  123:		case 'H':		/* size of input image file header */
+    #####:  124:			hdr_size = atoi(optarg);
+    #####:  125:			break;
+    #####:  126:		case 'w':		/* input image width */
+    #####:  127:			width = atoi(optarg);
+    #####:  128:			break;
+    #####:  129:		case 'l':		/* input image length */
+    #####:  130:			length = atoi(optarg);
+    #####:  131:			break;
+    #####:  132:		case 'b':		/* number of bands in input image */
+    #####:  133:			nbands = atoi(optarg);
+    #####:  134:			break;
+    #####:  135:		case 'd':		/* type of samples in input image */
+    #####:  136:			if (strncmp(optarg, "byte", 4) == 0)
+    #####:  137:				dtype = TIFF_BYTE;
+    #####:  138:			else if (strncmp(optarg, "short", 5) == 0)
+    #####:  139:				dtype = TIFF_SHORT;
+    #####:  140:			else if  (strncmp(optarg, "long", 4) == 0)
+    #####:  141:				dtype = TIFF_LONG;
+    #####:  142:			else if  (strncmp(optarg, "sbyte", 5) == 0)
+    #####:  143:				dtype = TIFF_SBYTE;
+    #####:  144:			else if  (strncmp(optarg, "sshort", 6) == 0)
+    #####:  145:				dtype = TIFF_SSHORT;
+    #####:  146:			else if  (strncmp(optarg, "slong", 5) == 0)
+    #####:  147:				dtype = TIFF_SLONG;
+    #####:  148:			else if  (strncmp(optarg, "float", 5) == 0)
+    #####:  149:				dtype = TIFF_FLOAT;
+    #####:  150:			else if  (strncmp(optarg, "double", 6) == 0)
+    #####:  151:				dtype = TIFF_DOUBLE;
+        -:  152:			else
+    #####:  153:				dtype = TIFF_BYTE;
+    #####:  154:			depth = TIFFDataWidth(dtype);
+    #####:  155:			break;
+    #####:  156:		case 'L':		/* input has lsb-to-msb fillorder */
+    #####:  157:			fillorder = FILLORDER_LSB2MSB;
+    #####:  158:			break;
+    #####:  159:		case 'M':		/* input has msb-to-lsb fillorder */
+    #####:  160:			fillorder = FILLORDER_MSB2LSB;
+    #####:  161:			break;
+    #####:  162:		case 'p':		/* photometric interpretation */
+    #####:  163:			if (strncmp(optarg, "miniswhite", 10) == 0)
+    #####:  164:				photometric = PHOTOMETRIC_MINISWHITE;
+    #####:  165:			else if (strncmp(optarg, "minisblack", 10) == 0)
+    #####:  166:				photometric = PHOTOMETRIC_MINISBLACK;
+    #####:  167:			else if (strncmp(optarg, "rgb", 3) == 0)
+    #####:  168:				photometric = PHOTOMETRIC_RGB;
+    #####:  169:			else if (strncmp(optarg, "cmyk", 4) == 0)
+    #####:  170:				photometric = PHOTOMETRIC_SEPARATED;
+    #####:  171:			else if (strncmp(optarg, "ycbcr", 5) == 0)
+    #####:  172:				photometric = PHOTOMETRIC_YCBCR;
+    #####:  173:			else if (strncmp(optarg, "cielab", 6) == 0)
+    #####:  174:				photometric = PHOTOMETRIC_CIELAB;
+    #####:  175:			else if (strncmp(optarg, "icclab", 6) == 0)
+    #####:  176:				photometric = PHOTOMETRIC_ICCLAB;
+    #####:  177:			else if (strncmp(optarg, "itulab", 6) == 0)
+    #####:  178:				photometric = PHOTOMETRIC_ITULAB;
+        -:  179:			else
+    #####:  180:				photometric = PHOTOMETRIC_MINISBLACK;
+    #####:  181:			break;
+    #####:  182:		case 's':		/* do we need to swap bytes? */
+    #####:  183:			swab = 1;
+    #####:  184:			break;
+    #####:  185:		case 'i':		/* type of interleaving */
+    #####:  186:			if (strncmp(optarg, "pixel", 4) == 0)
+    #####:  187:				interleaving = PIXEL;
+    #####:  188:			else if  (strncmp(optarg, "band", 6) == 0)
+    #####:  189:				interleaving = BAND;
+        -:  190:			else
+    #####:  191:				interleaving = 0;
+    #####:  192:			break;
+    #####:  193:		case 'o':
+    #####:  194:			outfilename = optarg;
+    #####:  195:			break;
+    #####:  196:		case 'h':
+    #####:  197:			usage();
+    #####:  198:		default:
+    #####:  199:			break;
+        -:  200:		}
+        -:  201:        }
+        -:  202:
+    #####:  203:        if (argc - optind < 2)
+    #####:  204:		usage();
+        -:  205:
+    #####:  206:        fd = open(argv[optind], O_RDONLY|O_BINARY, 0);
+    #####:  207:	if (fd < 0) {
+    #####:  208:		fprintf(stderr, "%s: %s: Cannot open input file.\n",
+    #####:  209:			argv[0], argv[optind]);
+    #####:  210:		return (-1);
+        -:  211:	}
+        -:  212:
+    #####:  213:	if (guessSize(fd, dtype, hdr_size, nbands, swab, &width, &length) < 0)
+    #####:  214:		return 1;
+        -:  215:
+    #####:  216:	if (outfilename == NULL)
+    #####:  217:		outfilename = argv[optind+1];
+    #####:  218:	out = TIFFOpen(outfilename, "w");
+    #####:  219:	if (out == NULL) {
+    #####:  220:		fprintf(stderr, "%s: %s: Cannot open file for output.\n",
+        -:  221:			argv[0], outfilename);
+    #####:  222:		return (-1);
+        -:  223:	}
+    #####:  224:	TIFFSetField(out, TIFFTAG_IMAGEWIDTH, width);
+    #####:  225:	TIFFSetField(out, TIFFTAG_IMAGELENGTH, length);
+    #####:  226:	TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    #####:  227:	TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, nbands);
+    #####:  228:	TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, depth * 8);
+    #####:  229:	TIFFSetField(out, TIFFTAG_FILLORDER, fillorder);
+    #####:  230:	TIFFSetField(out, TIFFTAG_PLANARCONFIG, config);
+    #####:  231:	TIFFSetField(out, TIFFTAG_PHOTOMETRIC, photometric);
+    #####:  232:	switch (dtype) {
+    #####:  233:	case TIFF_BYTE:
+        -:  234:	case TIFF_SHORT:
+        -:  235:	case TIFF_LONG:
+    #####:  236:		TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_UINT);
+    #####:  237:		break;
+    #####:  238:	case TIFF_SBYTE:
+        -:  239:	case TIFF_SSHORT:
+        -:  240:	case TIFF_SLONG:
+    #####:  241:		TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_INT);
+    #####:  242:		break;
+    #####:  243:	case TIFF_FLOAT:
+        -:  244:	case TIFF_DOUBLE:
+    #####:  245:		TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+    #####:  246:		break;
+    #####:  247:	default:
+    #####:  248:		TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_VOID);
+    #####:  249:		break;
+        -:  250:	}
+    #####:  251:	if (compression == (uint16) -1)
+    #####:  252:		compression = COMPRESSION_PACKBITS;
+    #####:  253:	TIFFSetField(out, TIFFTAG_COMPRESSION, compression);
+    #####:  254:	switch (compression) {
+    #####:  255:	case COMPRESSION_JPEG:
+    #####:  256:		if (photometric == PHOTOMETRIC_RGB
+    #####:  257:		    && jpegcolormode == JPEGCOLORMODE_RGB)
+    #####:  258:			photometric = PHOTOMETRIC_YCBCR;
+    #####:  259:		TIFFSetField(out, TIFFTAG_JPEGQUALITY, quality);
+    #####:  260:		TIFFSetField(out, TIFFTAG_JPEGCOLORMODE, jpegcolormode);
+    #####:  261:		break;
+    #####:  262:	case COMPRESSION_LZW:
+        -:  263:	case COMPRESSION_DEFLATE:
+    #####:  264:		if (predictor != 0)
+    #####:  265:			TIFFSetField(out, TIFFTAG_PREDICTOR, predictor);
+    #####:  266:		break;
+        -:  267:	}
+    #####:  268:	switch(interleaving) {
+    #####:  269:	case BAND:				/* band interleaved data */
+    #####:  270:		linebytes = width * depth;
+    #####:  271:		buf = (unsigned char *)_TIFFmalloc(linebytes);
+    #####:  272:		break;
+    #####:  273:	case PIXEL:				/* pixel interleaved data */
+        -:  274:	default:
+    #####:  275:		linebytes = width * nbands * depth;
+    #####:  276:		break;
+        -:  277:	}
+    #####:  278:	bufsize = width * nbands * depth;
+    #####:  279:	buf1 = (unsigned char *)_TIFFmalloc(bufsize);
+        -:  280:
+    #####:  281:	rowsperstrip = TIFFDefaultStripSize(out, rowsperstrip);
+    #####:  282:	if (rowsperstrip > length) {
+    #####:  283:		rowsperstrip = length;
+        -:  284:	}
+    #####:  285:	TIFFSetField(out, TIFFTAG_ROWSPERSTRIP, rowsperstrip );
+        -:  286:
+    #####:  287:	_TIFF_lseek_f(fd, hdr_size, SEEK_SET);		/* Skip the file header */
+    #####:  288:	for (row = 0; row < length; row++) {
+    #####:  289:		switch(interleaving) {
+    #####:  290:		case BAND:			/* band interleaved data */
+    #####:  291:			for (band = 0; band < nbands; band++) {
+    #####:  292:				if (_TIFF_lseek_f(fd,
+        -:  293:                                          hdr_size + (length*band+row)*linebytes,
+        -:  294:                                          SEEK_SET) == (_TIFF_off_t)-1) {
+    #####:  295:                                        fprintf(stderr,
+        -:  296:                                                "%s: %s: scanline %lu: seek error.\n",
+    #####:  297:                                                argv[0], argv[optind],
+        -:  298:                                                (unsigned long) row);
+    #####:  299:                                        break;
+        -:  300:                                }
+    #####:  301:				if (read(fd, buf, linebytes) < 0) {
+    #####:  302:					fprintf(stderr,
+        -:  303:                                                "%s: %s: scanline %lu: Read error.\n",
+    #####:  304:                                                argv[0], argv[optind],
+        -:  305:                                                (unsigned long) row);
+    #####:  306:                                        break;
+        -:  307:				}
+    #####:  308:				if (swab)	/* Swap bytes if needed */
+    #####:  309:					swapBytesInScanline(buf, width, dtype);
+    #####:  310:				for (col = 0; col < width; col++)
+    #####:  311:					memcpy(buf1 + (col*nbands+band)*depth,
+    #####:  312:					       buf + col * depth, depth);
+        -:  313:			}
+    #####:  314:			break;
+    #####:  315:		case PIXEL:			/* pixel interleaved data */
+        -:  316:		default:
+    #####:  317:			if (read(fd, buf1, bufsize) < 0) {
+    #####:  318:				fprintf(stderr,
+        -:  319:					"%s: %s: scanline %lu: Read error.\n",
+    #####:  320:					argv[0], argv[optind],
+        -:  321:					(unsigned long) row);
+    #####:  322:				break;
+        -:  323:			}
+    #####:  324:			if (swab)		/* Swap bytes if needed */
+    #####:  325:				swapBytesInScanline(buf1, width, dtype);
+    #####:  326:			break;
+        -:  327:		}
+        -:  328:				
+    #####:  329:		if (TIFFWriteScanline(out, buf1, row, 0) < 0) {
+    #####:  330:			fprintf(stderr,	"%s: %s: scanline %lu: Write error.\n",
+        -:  331:				argv[0], outfilename, (unsigned long) row);
+    #####:  332:			break;
+        -:  333:		}
+        -:  334:	}
+    #####:  335:	if (buf)
+    #####:  336:		_TIFFfree(buf);
+    #####:  337:	if (buf1)
+    #####:  338:		_TIFFfree(buf1);
+    #####:  339:	TIFFClose(out);
+    #####:  340:	return (0);
+        -:  341:}
+        -:  342:
+        -:  343:static void
+    #####:  344:swapBytesInScanline(void *buf, uint32 width, TIFFDataType dtype)
+        -:  345:{
+    #####:  346:	switch (dtype) {
+    #####:  347:		case TIFF_SHORT:
+        -:  348:		case TIFF_SSHORT:
+    #####:  349:			TIFFSwabArrayOfShort((uint16*)buf,
+        -:  350:                                             (unsigned long)width);
+    #####:  351:			break;
+    #####:  352:		case TIFF_LONG:
+        -:  353:		case TIFF_SLONG:
+    #####:  354:			TIFFSwabArrayOfLong((uint32*)buf,
+        -:  355:                                            (unsigned long)width);
+    #####:  356:			break;
+        -:  357:		/* case TIFF_FLOAT: */	/* FIXME */
+    #####:  358:		case TIFF_DOUBLE:
+    #####:  359:			TIFFSwabArrayOfDouble((double*)buf,
+        -:  360:                                              (unsigned long)width);
+    #####:  361:			break;
+    #####:  362:		default:
+    #####:  363:			break;
+        -:  364:	}
+    #####:  365:}
+        -:  366:
+        -:  367:static int
+    #####:  368:guessSize(int fd, TIFFDataType dtype, _TIFF_off_t hdr_size, uint32 nbands,
+        -:  369:	  int swab, uint32 *width, uint32 *length)
+        -:  370:{
+    #####:  371:	const float longt = 40.0;    /* maximum possible height/width ratio */
+        -:  372:	char	    *buf1, *buf2;
+    #####:  373:	_TIFF_stat_s filestat;
+        -:  374:	uint32	    w, h, scanlinesize, imagesize;
+    #####:  375:	uint32	    depth = TIFFDataWidth(dtype);
+    #####:  376:	float	    cor_coef = 0, tmp;
+        -:  377:
+    #####:  378:	if (_TIFF_fstat_f(fd, &filestat) == -1) {
+    #####:  379:                fprintf(stderr, "Failed to obtain file size.\n");
+    #####:  380:		return -1;
+        -:  381:        }
+        -:  382:
+    #####:  383:	if (filestat.st_size < hdr_size) {
+    #####:  384:		fprintf(stderr, "Too large header size specified.\n");
+    #####:  385:		return -1;
+        -:  386:	}
+        -:  387:
+    #####:  388:	imagesize = (filestat.st_size - hdr_size) / nbands / depth;
+        -:  389:
+    #####:  390:	if (*width != 0 && *length == 0) {
+    #####:  391:		fprintf(stderr,	"Image height is not specified.\n");
+        -:  392:
+    #####:  393:		*length = imagesize / *width;
+        -:  394:		
+    #####:  395:		fprintf(stderr, "Height is guessed as %lu.\n",
+    #####:  396:			(unsigned long)*length);
+        -:  397:
+    #####:  398:		return 1;
+    #####:  399:	} else if (*width == 0 && *length != 0) {
+    #####:  400:		fprintf(stderr, "Image width is not specified.\n");
+        -:  401:
+    #####:  402:		*width = imagesize / *length;
+        -:  403:		
+    #####:  404:		fprintf(stderr,	"Width is guessed as %lu.\n",
+    #####:  405:			(unsigned long)*width);
+        -:  406:
+    #####:  407:		return 1;
+    #####:  408:	} else if (*width == 0 && *length == 0) {
+    #####:  409:                unsigned int fail = 0;
+    #####:  410:		fprintf(stderr,	"Image width and height are not specified.\n");
+        -:  411:
+    #####:  412:		for (w = (uint32) sqrt(imagesize / longt);
+    #####:  413:		     w < sqrt(imagesize * longt);
+    #####:  414:		     w++) {
+    #####:  415:			if (imagesize % w == 0) {
+    #####:  416:				scanlinesize = w * depth;
+    #####:  417:				buf1 = _TIFFmalloc(scanlinesize);
+    #####:  418:				buf2 = _TIFFmalloc(scanlinesize);
+    #####:  419:				h = imagesize / w;
+        -:  420:                                do {
+    #####:  421:                                        if (_TIFF_lseek_f(fd, hdr_size + (int)(h/2)*scanlinesize,
+        -:  422:                                                  SEEK_SET) == (_TIFF_off_t)-1) {
+    #####:  423:                                                fprintf(stderr, "seek error.\n");
+    #####:  424:                                                fail=1;
+    #####:  425:                                                break;
+        -:  426:                                        }
+    #####:  427:                                        if (read(fd, buf1, scanlinesize) !=
+        -:  428:                                            (long) scanlinesize) {
+    #####:  429:                                                fprintf(stderr, "read error.\n");
+    #####:  430:                                                fail=1;
+    #####:  431:                                                break;
+        -:  432:                                        }
+    #####:  433:                                        if (read(fd, buf2, scanlinesize) !=
+        -:  434:                                            (long) scanlinesize) {
+    #####:  435:                                                fprintf(stderr, "read error.\n");
+    #####:  436:                                                fail=1;
+    #####:  437:                                                break;
+        -:  438:                                        }
+    #####:  439:                                        if (swab) {
+    #####:  440:                                                swapBytesInScanline(buf1, w, dtype);
+    #####:  441:                                                swapBytesInScanline(buf2, w, dtype);
+        -:  442:                                        }
+    #####:  443:                                        tmp = (float) fabs(correlation(buf1, buf2,
+        -:  444:                                                                       w, dtype));
+    #####:  445:                                        if (tmp > cor_coef) {
+    #####:  446:                                                cor_coef = tmp;
+    #####:  447:                                                *width = w, *length = h;
+        -:  448:                                        }
+        -:  449:                                } while (0);
+        -:  450:
+    #####:  451:                                _TIFFfree(buf1);
+    #####:  452:				_TIFFfree(buf2);
+        -:  453:			}
+        -:  454:		}
+        -:  455:
+    #####:  456:                if (fail) {
+    #####:  457:                        return -1;
+        -:  458:                }
+        -:  459:
+    #####:  460:		fprintf(stderr,
+        -:  461:			"Width is guessed as %lu, height is guessed as %lu.\n",
+    #####:  462:			(unsigned long)*width, (unsigned long)*length);
+        -:  463:
+    #####:  464:		return 1;
+        -:  465:	} else {
+    #####:  466:		if (filestat.st_size<(_TIFF_off_t)(hdr_size+(*width)*(*length)*nbands*depth)) {
+    #####:  467:			fprintf(stderr, "Input file too small.\n");
+    #####:  468:		return -1;
+        -:  469:		}
+        -:  470:	}
+        -:  471:
+    #####:  472:	return 1;
+        -:  473:}
+        -:  474:
+        -:  475:/* Calculate correlation coefficient between two numeric vectors */
+        -:  476:static double
+    #####:  477:correlation(void *buf1, void *buf2, uint32 n_elem, TIFFDataType dtype)
+        -:  478:{
+    #####:  479:	double	X, Y, M1 = 0.0, M2 = 0.0, D1 = 0.0, D2 = 0.0, K = 0.0;
+        -:  480:	uint32	i;
+        -:  481:
+    #####:  482:	switch (dtype) {
+    #####:  483:		case TIFF_BYTE:
+        -:  484:		default:
+    #####:  485:                        for (i = 0; i < n_elem; i++) {
+    #####:  486:				X = ((unsigned char *)buf1)[i];
+    #####:  487:				Y = ((unsigned char *)buf2)[i];
+    #####:  488:				M1 += X, M2 += Y;
+    #####:  489:				D1 += X * X, D2 += Y * Y;
+    #####:  490:				K += X * Y;
+        -:  491:                        }
+    #####:  492:			break;
+    #####:  493:		case TIFF_SBYTE:
+    #####:  494:                        for (i = 0; i < n_elem; i++) {
+    #####:  495:				X = ((signed char *)buf1)[i];
+    #####:  496:				Y = ((signed char *)buf2)[i];
+    #####:  497:				M1 += X, M2 += Y;
+    #####:  498:				D1 += X * X, D2 += Y * Y;
+    #####:  499:				K += X * Y;
+        -:  500:                        }
+    #####:  501:			break;
+    #####:  502:		case TIFF_SHORT:
+    #####:  503:                        for (i = 0; i < n_elem; i++) {
+    #####:  504:				X = ((uint16 *)buf1)[i];
+    #####:  505:				Y = ((uint16 *)buf2)[i];
+    #####:  506:				M1 += X, M2 += Y;
+    #####:  507:				D1 += X * X, D2 += Y * Y;
+    #####:  508:				K += X * Y;
+        -:  509:                        }
+    #####:  510:			break;
+    #####:  511:		case TIFF_SSHORT:
+    #####:  512:                        for (i = 0; i < n_elem; i++) {
+    #####:  513:				X = ((int16 *)buf1)[i];
+    #####:  514:				Y = ((int16 *)buf2)[i];
+    #####:  515:				M1 += X, M2 += Y;
+    #####:  516:				D1 += X * X, D2 += Y * Y;
+    #####:  517:				K += X * Y;
+        -:  518:                        }
+    #####:  519:			break;
+    #####:  520:		case TIFF_LONG:
+    #####:  521:                        for (i = 0; i < n_elem; i++) {
+    #####:  522:				X = ((uint32 *)buf1)[i];
+    #####:  523:				Y = ((uint32 *)buf2)[i];
+    #####:  524:				M1 += X, M2 += Y;
+    #####:  525:				D1 += X * X, D2 += Y * Y;
+    #####:  526:				K += X * Y;
+        -:  527:                        }
+    #####:  528:			break;
+    #####:  529:		case TIFF_SLONG:
+    #####:  530:                        for (i = 0; i < n_elem; i++) {
+    #####:  531:				X = ((int32 *)buf1)[i];
+    #####:  532:				Y = ((int32 *)buf2)[i];
+    #####:  533:				M1 += X, M2 += Y;
+    #####:  534:				D1 += X * X, D2 += Y * Y;
+    #####:  535:				K += X * Y;
+        -:  536:                        }
+    #####:  537:			break;
+    #####:  538:		case TIFF_FLOAT:
+    #####:  539:                        for (i = 0; i < n_elem; i++) {
+    #####:  540:				X = ((float *)buf1)[i];
+    #####:  541:				Y = ((float *)buf2)[i];
+    #####:  542:				M1 += X, M2 += Y;
+    #####:  543:				D1 += X * X, D2 += Y * Y;
+    #####:  544:				K += X * Y;
+        -:  545:                        }
+    #####:  546:			break;
+    #####:  547:		case TIFF_DOUBLE:
+    #####:  548:                        for (i = 0; i < n_elem; i++) {
+    #####:  549:				X = ((double *)buf1)[i];
+    #####:  550:				Y = ((double *)buf2)[i];
+    #####:  551:				M1 += X, M2 += Y;
+    #####:  552:				D1 += X * X, D2 += Y * Y;
+    #####:  553:				K += X * Y;
+        -:  554:                        }
+    #####:  555:			break;
+        -:  556:	}
+        -:  557:
+    #####:  558:	M1 /= n_elem;
+    #####:  559:	M2 /= n_elem;
+    #####:  560:	D1 -= M1 * M1 * n_elem;
+    #####:  561:	D2 -= M2 * M2 * n_elem;
+    #####:  562:	K = (K - M1 * M2 * n_elem) / sqrt(D1 * D2);
+        -:  563:
+    #####:  564:	return K;
+        -:  565:}
+        -:  566:
+        -:  567:static int
+    #####:  568:processCompressOptions(char* opt)
+        -:  569:{
+    #####:  570:	if (strcmp(opt, "none") == 0)
+    #####:  571:		compression = COMPRESSION_NONE;
+    #####:  572:	else if (strcmp(opt, "packbits") == 0)
+    #####:  573:		compression = COMPRESSION_PACKBITS;
+    #####:  574:	else if (strncmp(opt, "jpeg", 4) == 0) {
+    #####:  575:		char* cp = strchr(opt, ':');
+        -:  576:
+    #####:  577:                compression = COMPRESSION_JPEG;
+    #####:  578:                while( cp )
+        -:  579:                {
+    #####:  580:                    if (isdigit((int)cp[1]))
+    #####:  581:			quality = atoi(cp+1);
+    #####:  582:                    else if (cp[1] == 'r' )
+    #####:  583:			jpegcolormode = JPEGCOLORMODE_RAW;
+        -:  584:                    else
+    #####:  585:                        usage();
+        -:  586:
+    #####:  587:                    cp = strchr(cp+1,':');
+        -:  588:                }
+    #####:  589:	} else if (strncmp(opt, "lzw", 3) == 0) {
+    #####:  590:		char* cp = strchr(opt, ':');
+    #####:  591:		if (cp)
+    #####:  592:			predictor = atoi(cp+1);
+    #####:  593:		compression = COMPRESSION_LZW;
+    #####:  594:	} else if (strncmp(opt, "zip", 3) == 0) {
+    #####:  595:		char* cp = strchr(opt, ':');
+    #####:  596:		if (cp)
+    #####:  597:			predictor = atoi(cp+1);
+    #####:  598:		compression = COMPRESSION_DEFLATE;
+        -:  599:	} else
+    #####:  600:		return (0);
+    #####:  601:	return (1);
+        -:  602:}
+        -:  603:
+        -:  604:static char* stuff[] = {
+        -:  605:"raw2tiff --- tool for converting raw byte sequences in TIFF images",
+        -:  606:"usage: raw2tiff [options] input.raw output.tif",
+        -:  607:"where options are:",
+        -:  608:" -L		input data has LSB2MSB bit order (default)",
+        -:  609:" -M		input data has MSB2LSB bit order",
+        -:  610:" -r #		make each strip have no more than # rows",
+        -:  611:" -H #		size of input image file header in bytes (0 by default)",
+        -:  612:" -w #		width of input image in pixels",
+        -:  613:" -l #		length of input image in lines",
+        -:  614:" -b #		number of bands in input image (1 by default)",
+        -:  615:"",
+        -:  616:" -d data_type	type of samples in input image",
+        -:  617:"where data_type may be:",
+        -:  618:" byte		8-bit unsigned integer (default)",
+        -:  619:" short		16-bit unsigned integer",
+        -:  620:" long		32-bit unsigned integer",
+        -:  621:" sbyte		8-bit signed integer",
+        -:  622:" sshort		16-bit signed integer",
+        -:  623:" slong		32-bit signed integer",
+        -:  624:" float		32-bit IEEE floating point",
+        -:  625:" double		64-bit IEEE floating point",
+        -:  626:"",
+        -:  627:" -p photo	photometric interpretation (color space) of the input image",
+        -:  628:"where photo may be:",
+        -:  629:" miniswhite	white color represented with 0 value",
+        -:  630:" minisblack	black color represented with 0 value (default)",
+        -:  631:" rgb		image has RGB color model",
+        -:  632:" cmyk		image has CMYK (separated) color model",
+        -:  633:" ycbcr		image has YCbCr color model",
+        -:  634:" cielab		image has CIE L*a*b color model",
+        -:  635:" icclab		image has ICC L*a*b color model",
+        -:  636:" itulab		image has ITU L*a*b color model",
+        -:  637:"",
+        -:  638:" -s		swap bytes fetched from input file",
+        -:  639:"",
+        -:  640:" -i config	type of samples interleaving in input image",
+        -:  641:"where config may be:",
+        -:  642:" pixel		pixel interleaved data (default)",
+        -:  643:" band		band interleaved data",
+        -:  644:"",
+        -:  645:" -c lzw[:opts]	compress output with Lempel-Ziv & Welch encoding",
+        -:  646:" -c zip[:opts]	compress output with deflate encoding",
+        -:  647:" -c jpeg[:opts]	compress output with JPEG encoding",
+        -:  648:" -c packbits	compress output with packbits encoding",
+        -:  649:" -c none	use no compression algorithm on output",
+        -:  650:"",
+        -:  651:"JPEG options:",
+        -:  652:" #		set compression quality level (0-100, default 75)",
+        -:  653:" r		output color image as RGB rather than YCbCr",
+        -:  654:"For example, -c jpeg:r:50 to get JPEG-encoded RGB data with 50% comp. quality",
+        -:  655:"",
+        -:  656:"LZW and deflate options:",
+        -:  657:" #		set predictor value",
+        -:  658:"For example, -c lzw:2 to get LZW-encoded data with horizontal differencing",
+        -:  659:" -o out.tif	write output to out.tif",
+        -:  660:" -h		this help message",
+        -:  661:NULL
+        -:  662:};
+        -:  663:
+        -:  664:static void
+    #####:  665:usage(void)
+        -:  666:{
+    #####:  667:	char buf[BUFSIZ];
+        -:  668:	int i;
+        -:  669:
+    #####:  670:	setbuf(stderr, buf);
+    #####:  671:        fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:  672:	for (i = 0; stuff[i] != NULL; i++)
+    #####:  673:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:  674:	exit(-1);
+        -:  675:}
+        -:  676:
+        -:  677:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  678:/*
+        -:  679: * Local Variables:
+        -:  680: * mode: c
+        -:  681: * c-basic-offset: 8
+        -:  682: * fill-column: 78
+        -:  683: * End:
+        -:  684: */

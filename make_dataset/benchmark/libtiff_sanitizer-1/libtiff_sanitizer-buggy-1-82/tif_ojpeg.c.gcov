@@ -1,0 +1,2549 @@
+        -:    0:Source:tif_ojpeg.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/* WARNING: The type of JPEG encapsulation defined by the TIFF Version 6.0
+        -:    4:   specification is now totally obsolete and deprecated for new applications and
+        -:    5:   images. This file was was created solely in order to read unconverted images
+        -:    6:   still present on some users' computer systems. It will never be extended
+        -:    7:   to write such files. Writing new-style JPEG compressed TIFFs is implemented
+        -:    8:   in tif_jpeg.c.
+        -:    9:
+        -:   10:   The code is carefully crafted to robustly read all gathered JPEG-in-TIFF
+        -:   11:   testfiles, and anticipate as much as possible all other... But still, it may
+        -:   12:   fail on some. If you encounter problems, please report them on the TIFF
+        -:   13:   mailing list and/or to Joris Van Damme <info@awaresystems.be>.
+        -:   14:
+        -:   15:   Please read the file called "TIFF Technical Note #2" if you need to be
+        -:   16:   convinced this compression scheme is bad and breaks TIFF. That document
+        -:   17:   is linked to from the LibTiff site <http://www.remotesensing.org/libtiff/>
+        -:   18:   and from AWare Systems' TIFF section
+        -:   19:   <http://www.awaresystems.be/imaging/tiff.html>. It is also absorbed
+        -:   20:   in Adobe's specification supplements, marked "draft" up to this day, but
+        -:   21:   supported by the TIFF community.
+        -:   22:
+        -:   23:   This file interfaces with Release 6B of the JPEG Library written by the
+        -:   24:   Independent JPEG Group. Previous versions of this file required a hack inside
+        -:   25:   the LibJpeg library. This version no longer requires that. Remember to
+        -:   26:   remove the hack if you update from the old version.
+        -:   27:
+        -:   28:   Copyright (c) Joris Van Damme <info@awaresystems.be>
+        -:   29:   Copyright (c) AWare Systems <http://www.awaresystems.be/>
+        -:   30:
+        -:   31:   The licence agreement for this file is the same as the rest of the LibTiff
+        -:   32:   library.
+        -:   33:
+        -:   34:   IN NO EVENT SHALL JORIS VAN DAMME OR AWARE SYSTEMS BE LIABLE FOR
+        -:   35:   ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   36:   OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   37:   WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF
+        -:   38:   LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+        -:   39:   OF THIS SOFTWARE.
+        -:   40:
+        -:   41:   Joris Van Damme and/or AWare Systems may be available for custom
+        -:   42:   development. If you like what you see, and need anything similar or related,
+        -:   43:   contact <info@awaresystems.be>.
+        -:   44:*/
+        -:   45:
+        -:   46:/* What is what, and what is not?
+        -:   47:
+        -:   48:   This decoder starts with an input stream, that is essentially the JpegInterchangeFormat
+        -:   49:   stream, if any, followed by the strile data, if any. This stream is read in
+        -:   50:   OJPEGReadByte and related functions.
+        -:   51:
+        -:   52:   It analyzes the start of this stream, until it encounters non-marker data, i.e.
+        -:   53:   compressed image data. Some of the header markers it sees have no actual content,
+        -:   54:   like the SOI marker, and APP/COM markers that really shouldn't even be there. Some
+        -:   55:   other markers do have content, and the valuable bits and pieces of information
+        -:   56:   in these markers are saved, checking all to verify that the stream is more or
+        -:   57:   less within expected bounds. This happens inside the OJPEGReadHeaderInfoSecStreamXxx
+        -:   58:   functions.
+        -:   59:
+        -:   60:   Some OJPEG imagery contains no valid JPEG header markers. This situation is picked
+        -:   61:   up on if we've seen no SOF marker when we're at the start of the compressed image
+        -:   62:   data. In this case, the tables are read from JpegXxxTables tags, and the other
+        -:   63:   bits and pieces of information is initialized to its most basic value. This is
+        -:   64:   implemented in the OJPEGReadHeaderInfoSecTablesXxx functions.
+        -:   65:
+        -:   66:   When this is complete, a good and valid JPEG header can be assembled, and this is
+        -:   67:   passed through to LibJpeg. When that's done, the remainder of the input stream, i.e.
+        -:   68:   the compressed image data, can be passed through unchanged. This is done in
+        -:   69:   OJPEGWriteStream functions.
+        -:   70:
+        -:   71:   LibTiff rightly expects to know the subsampling values before decompression. Just like
+        -:   72:   in new-style JPEG-in-TIFF, though, or even more so, actually, the YCbCrsubsampling
+        -:   73:   tag is notoriously unreliable. To correct these tag values with the ones inside
+        -:   74:   the JPEG stream, the first part of the input stream is pre-scanned in
+        -:   75:   OJPEGSubsamplingCorrect, making no note of any other data, reporting no warnings
+        -:   76:   or errors, up to the point where either these values are read, or it's clear they
+        -:   77:   aren't there. This means that some of the data is read twice, but we feel speed
+        -:   78:   in correcting these values is important enough to warrant this sacrifice. Although
+        -:   79:   there is currently no define or other configuration mechanism to disable this behaviour,
+        -:   80:   the actual header scanning is build to robustly respond with error report if it
+        -:   81:   should encounter an uncorrected mismatch of subsampling values. See
+        -:   82:   OJPEGReadHeaderInfoSecStreamSof.
+        -:   83:
+        -:   84:   The restart interval and restart markers are the most tricky part... The restart
+        -:   85:   interval can be specified in a tag. It can also be set inside the input JPEG stream.
+        -:   86:   It can be used inside the input JPEG stream. If reading from strile data, we've
+        -:   87:   consistently discovered the need to insert restart markers in between the different
+        -:   88:   striles, as is also probably the most likely interpretation of the original TIFF 6.0
+        -:   89:   specification. With all this setting of interval, and actual use of markers that is not
+        -:   90:   predictable at the time of valid JPEG header assembly, the restart thing may turn
+        -:   91:   out the Achilles heel of this implementation. Fortunately, most OJPEG writer vendors
+        -:   92:   succeed in reading back what they write, which may be the reason why we've been able
+        -:   93:   to discover ways that seem to work.
+        -:   94:
+        -:   95:   Some special provision is made for planarconfig separate OJPEG files. These seem
+        -:   96:   to consistently contain header info, a SOS marker, a plane, SOS marker, plane, SOS,
+        -:   97:   and plane. This may or may not be a valid JPEG configuration, we don't know and don't
+        -:   98:   care. We want LibTiff to be able to access the planes individually, without huge
+        -:   99:   buffering inside LibJpeg, anyway. So we compose headers to feed to LibJpeg, in this
+        -:  100:   case, that allow us to pass a single plane such that LibJpeg sees a valid
+        -:  101:   single-channel JPEG stream. Locating subsequent SOS markers, and thus subsequent
+        -:  102:   planes, is done inside OJPEGReadSecondarySos.
+        -:  103:
+        -:  104:   The benefit of the scheme is... that it works, basically. We know of no other that
+        -:  105:   does. It works without checking software tag, or otherwise going about things in an
+        -:  106:   OJPEG flavor specific manner. Instead, it is a single scheme, that covers the cases
+        -:  107:   with and without JpegInterchangeFormat, with and without striles, with part of
+        -:  108:   the header in JpegInterchangeFormat and remainder in first strile, etc. It is forgiving
+        -:  109:   and robust, may likely work with OJPEG flavors we've not seen yet, and makes most out
+        -:  110:   of the data.
+        -:  111:
+        -:  112:   Another nice side-effect is that a complete JPEG single valid stream is build if
+        -:  113:   planarconfig is not separate (vast majority). We may one day use that to build
+        -:  114:   converters to JPEG, and/or to new-style JPEG compression inside TIFF.
+        -:  115:
+        -:  116:   A disadvantage is the lack of random access to the individual striles. This is the
+        -:  117:   reason for much of the complicated restart-and-position stuff inside OJPEGPreDecode.
+        -:  118:   Applications would do well accessing all striles in order, as this will result in
+        -:  119:   a single sequential scan of the input stream, and no restarting of LibJpeg decoding
+        -:  120:   session.
+        -:  121:*/
+        -:  122:
+        -:  123:#define WIN32_LEAN_AND_MEAN
+        -:  124:#define VC_EXTRALEAN
+        -:  125:
+        -:  126:#include "tiffiop.h"
+        -:  127:#ifdef OJPEG_SUPPORT
+        -:  128:
+        -:  129:/* Configuration defines here are:
+        -:  130: * JPEG_ENCAP_EXTERNAL: The normal way to call libjpeg, uses longjump. In some environments,
+        -:  131: * 	like eg LibTiffDelphi, this is not possible. For this reason, the actual calls to
+        -:  132: * 	libjpeg, with longjump stuff, are encapsulated in dedicated functions. When
+        -:  133: * 	JPEG_ENCAP_EXTERNAL is defined, these encapsulating functions are declared external
+        -:  134: * 	to this unit, and can be defined elsewhere to use stuff other then longjump.
+        -:  135: * 	The default mode, without JPEG_ENCAP_EXTERNAL, implements the call encapsulators
+        -:  136: * 	here, internally, with normal longjump.
+        -:  137: * SETJMP, LONGJMP, JMP_BUF: On some machines/environments a longjump equivalent is
+        -:  138: * 	conveniently available, but still it may be worthwhile to use _setjmp or sigsetjmp
+        -:  139: * 	in place of plain setjmp. These macros will make it easier. It is useless
+        -:  140: * 	to fiddle with these if you define JPEG_ENCAP_EXTERNAL.
+        -:  141: * OJPEG_BUFFER: Define the size of the desired buffer here. Should be small enough so as to guarantee
+        -:  142: * 	instant processing, optimal streaming and optimal use of processor cache, but also big
+        -:  143: * 	enough so as to not result in significant call overhead. It should be at least a few
+        -:  144: * 	bytes to accommodate some structures (this is verified in asserts), but it would not be
+        -:  145: * 	sensible to make it this small anyway, and it should be at most 64K since it is indexed
+        -:  146: * 	with uint16. We recommend 2K.
+        -:  147: * EGYPTIANWALK: You could also define EGYPTIANWALK here, but it is not used anywhere and has
+        -:  148: * 	absolutely no effect. That is why most people insist the EGYPTIANWALK is a bit silly.
+        -:  149: */
+        -:  150:
+        -:  151:/* define LIBJPEG_ENCAP_EXTERNAL */
+        -:  152:#define SETJMP(jbuf) setjmp(jbuf)
+        -:  153:#define LONGJMP(jbuf,code) longjmp(jbuf,code)
+        -:  154:#define JMP_BUF jmp_buf
+        -:  155:#define OJPEG_BUFFER 2048
+        -:  156:/* define EGYPTIANWALK */
+        -:  157:
+        -:  158:#define JPEG_MARKER_SOF0 0xC0
+        -:  159:#define JPEG_MARKER_SOF1 0xC1
+        -:  160:#define JPEG_MARKER_SOF3 0xC3
+        -:  161:#define JPEG_MARKER_DHT 0xC4
+        -:  162:#define JPEG_MARKER_RST0 0XD0
+        -:  163:#define JPEG_MARKER_SOI 0xD8
+        -:  164:#define JPEG_MARKER_EOI 0xD9
+        -:  165:#define JPEG_MARKER_SOS 0xDA
+        -:  166:#define JPEG_MARKER_DQT 0xDB
+        -:  167:#define JPEG_MARKER_DRI 0xDD
+        -:  168:#define JPEG_MARKER_APP0 0xE0
+        -:  169:#define JPEG_MARKER_COM 0xFE
+        -:  170:
+        -:  171:#define FIELD_OJPEG_JPEGINTERCHANGEFORMAT (FIELD_CODEC+0)
+        -:  172:#define FIELD_OJPEG_JPEGINTERCHANGEFORMATLENGTH (FIELD_CODEC+1)
+        -:  173:#define FIELD_OJPEG_JPEGQTABLES (FIELD_CODEC+2)
+        -:  174:#define FIELD_OJPEG_JPEGDCTABLES (FIELD_CODEC+3)
+        -:  175:#define FIELD_OJPEG_JPEGACTABLES (FIELD_CODEC+4)
+        -:  176:#define FIELD_OJPEG_JPEGPROC (FIELD_CODEC+5)
+        -:  177:#define FIELD_OJPEG_JPEGRESTARTINTERVAL (FIELD_CODEC+6)
+        -:  178:
+        -:  179:static const TIFFField ojpegFields[] = {
+        -:  180:	{TIFFTAG_JPEGIFOFFSET,1,1,TIFF_LONG8,0,TIFF_SETGET_UINT64,TIFF_SETGET_UNDEFINED,FIELD_OJPEG_JPEGINTERCHANGEFORMAT,TRUE,FALSE,"JpegInterchangeFormat",NULL},
+        -:  181:	{TIFFTAG_JPEGIFBYTECOUNT,1,1,TIFF_LONG8,0,TIFF_SETGET_UINT64,TIFF_SETGET_UNDEFINED,FIELD_OJPEG_JPEGINTERCHANGEFORMATLENGTH,TRUE,FALSE,"JpegInterchangeFormatLength",NULL},
+        -:  182:	{TIFFTAG_JPEGQTABLES,TIFF_VARIABLE2,TIFF_VARIABLE2,TIFF_LONG8,0,TIFF_SETGET_C32_UINT64,TIFF_SETGET_UNDEFINED,FIELD_OJPEG_JPEGQTABLES,FALSE,TRUE,"JpegQTables",NULL},
+        -:  183:	{TIFFTAG_JPEGDCTABLES,TIFF_VARIABLE2,TIFF_VARIABLE2,TIFF_LONG8,0,TIFF_SETGET_C32_UINT64,TIFF_SETGET_UNDEFINED,FIELD_OJPEG_JPEGDCTABLES,FALSE,TRUE,"JpegDcTables",NULL},
+        -:  184:	{TIFFTAG_JPEGACTABLES,TIFF_VARIABLE2,TIFF_VARIABLE2,TIFF_LONG8,0,TIFF_SETGET_C32_UINT64,TIFF_SETGET_UNDEFINED,FIELD_OJPEG_JPEGACTABLES,FALSE,TRUE,"JpegAcTables",NULL},
+        -:  185:	{TIFFTAG_JPEGPROC,1,1,TIFF_SHORT,0,TIFF_SETGET_UINT16,TIFF_SETGET_UNDEFINED,FIELD_OJPEG_JPEGPROC,FALSE,FALSE,"JpegProc",NULL},
+        -:  186:	{TIFFTAG_JPEGRESTARTINTERVAL,1,1,TIFF_SHORT,0,TIFF_SETGET_UINT16,TIFF_SETGET_UNDEFINED,FIELD_OJPEG_JPEGRESTARTINTERVAL,FALSE,FALSE,"JpegRestartInterval",NULL},
+        -:  187:};
+        -:  188:
+        -:  189:#ifndef LIBJPEG_ENCAP_EXTERNAL
+        -:  190:#include <setjmp.h>
+        -:  191:#endif
+        -:  192:
+        -:  193:/* We undefine FAR to avoid conflict with JPEG definition */
+        -:  194:
+        -:  195:#ifdef FAR
+        -:  196:#undef FAR
+        -:  197:#endif
+        -:  198:
+        -:  199:/*
+        -:  200:  Libjpeg's jmorecfg.h defines INT16 and INT32, but only if XMD_H is
+        -:  201:  not defined.  Unfortunately, the MinGW and Borland compilers include
+        -:  202:  a typedef for INT32, which causes a conflict.  MSVC does not include
+        -:  203:  a conflicting typedef given the headers which are included.
+        -:  204:*/
+        -:  205:#if defined(__BORLANDC__) || defined(__MINGW32__)
+        -:  206:# define XMD_H 1
+        -:  207:#endif
+        -:  208:
+        -:  209:/* Define "boolean" as unsigned char, not int, per Windows custom. */
+        -:  210:#if defined(__WIN32__) && !defined(__MINGW32__)
+        -:  211:# ifndef __RPCNDR_H__            /* don't conflict if rpcndr.h already read */
+        -:  212:   typedef unsigned char boolean;
+        -:  213:# endif
+        -:  214:# define HAVE_BOOLEAN            /* prevent jmorecfg.h from redefining it */
+        -:  215:#endif
+        -:  216:
+        -:  217:#include "jpeglib.h"
+        -:  218:#include "jerror.h"
+        -:  219:
+        -:  220:typedef struct jpeg_error_mgr jpeg_error_mgr;
+        -:  221:typedef struct jpeg_common_struct jpeg_common_struct;
+        -:  222:typedef struct jpeg_decompress_struct jpeg_decompress_struct;
+        -:  223:typedef struct jpeg_source_mgr jpeg_source_mgr;
+        -:  224:
+        -:  225:typedef enum {
+        -:  226:	osibsNotSetYet,
+        -:  227:	osibsJpegInterchangeFormat,
+        -:  228:	osibsStrile,
+        -:  229:	osibsEof
+        -:  230:} OJPEGStateInBufferSource;
+        -:  231:
+        -:  232:typedef enum {
+        -:  233:	ososSoi,
+        -:  234:	ososQTable0,ososQTable1,ososQTable2,ososQTable3,
+        -:  235:	ososDcTable0,ososDcTable1,ososDcTable2,ososDcTable3,
+        -:  236:	ososAcTable0,ososAcTable1,ososAcTable2,ososAcTable3,
+        -:  237:	ososDri,
+        -:  238:	ososSof,
+        -:  239:	ososSos,
+        -:  240:	ososCompressed,
+        -:  241:	ososRst,
+        -:  242:	ososEoi
+        -:  243:} OJPEGStateOutState;
+        -:  244:
+        -:  245:typedef struct {
+        -:  246:	TIFF* tif;
+        -:  247:        int decoder_ok;
+        -:  248:	#ifndef LIBJPEG_ENCAP_EXTERNAL
+        -:  249:	JMP_BUF exit_jmpbuf;
+        -:  250:	#endif
+        -:  251:	TIFFVGetMethod vgetparent;
+        -:  252:	TIFFVSetMethod vsetparent;
+        -:  253:	TIFFPrintMethod printdir;
+        -:  254:	uint64 file_size;
+        -:  255:	uint32 image_width;
+        -:  256:	uint32 image_length;
+        -:  257:	uint32 strile_width;
+        -:  258:	uint32 strile_length;
+        -:  259:	uint32 strile_length_total;
+        -:  260:	uint8 samples_per_pixel;
+        -:  261:	uint8 plane_sample_offset;
+        -:  262:	uint8 samples_per_pixel_per_plane;
+        -:  263:	uint64 jpeg_interchange_format;
+        -:  264:	uint64 jpeg_interchange_format_length;
+        -:  265:	uint8 jpeg_proc;
+        -:  266:	uint8 subsamplingcorrect;
+        -:  267:	uint8 subsamplingcorrect_done;
+        -:  268:	uint8 subsampling_tag;
+        -:  269:	uint8 subsampling_hor;
+        -:  270:	uint8 subsampling_ver;
+        -:  271:	uint8 subsampling_force_desubsampling_inside_decompression;
+        -:  272:	uint8 qtable_offset_count;
+        -:  273:	uint8 dctable_offset_count;
+        -:  274:	uint8 actable_offset_count;
+        -:  275:	uint64 qtable_offset[3];
+        -:  276:	uint64 dctable_offset[3];
+        -:  277:	uint64 actable_offset[3];
+        -:  278:	uint8* qtable[4];
+        -:  279:	uint8* dctable[4];
+        -:  280:	uint8* actable[4];
+        -:  281:	uint16 restart_interval;
+        -:  282:	uint8 restart_index;
+        -:  283:	uint8 sof_log;
+        -:  284:	uint8 sof_marker_id;
+        -:  285:	uint32 sof_x;
+        -:  286:	uint32 sof_y;
+        -:  287:	uint8 sof_c[3];
+        -:  288:	uint8 sof_hv[3];
+        -:  289:	uint8 sof_tq[3];
+        -:  290:	uint8 sos_cs[3];
+        -:  291:	uint8 sos_tda[3];
+        -:  292:	struct {
+        -:  293:		uint8 log;
+        -:  294:		OJPEGStateInBufferSource in_buffer_source;
+        -:  295:		uint32 in_buffer_next_strile;
+        -:  296:		uint64 in_buffer_file_pos;
+        -:  297:		uint64 in_buffer_file_togo;
+        -:  298:	} sos_end[3];
+        -:  299:	uint8 readheader_done;
+        -:  300:	uint8 writeheader_done;
+        -:  301:	uint16 write_cursample;
+        -:  302:	uint32 write_curstrile;
+        -:  303:	uint8 libjpeg_session_active;
+        -:  304:	uint8 libjpeg_jpeg_query_style;
+        -:  305:	jpeg_error_mgr libjpeg_jpeg_error_mgr;
+        -:  306:	jpeg_decompress_struct libjpeg_jpeg_decompress_struct;
+        -:  307:	jpeg_source_mgr libjpeg_jpeg_source_mgr;
+        -:  308:	uint8 subsampling_convert_log;
+        -:  309:	uint32 subsampling_convert_ylinelen;
+        -:  310:	uint32 subsampling_convert_ylines;
+        -:  311:	uint32 subsampling_convert_clinelen;
+        -:  312:	uint32 subsampling_convert_clines;
+        -:  313:	uint32 subsampling_convert_ybuflen;
+        -:  314:	uint32 subsampling_convert_cbuflen;
+        -:  315:	uint32 subsampling_convert_ycbcrbuflen;
+        -:  316:	uint8* subsampling_convert_ycbcrbuf;
+        -:  317:	uint8* subsampling_convert_ybuf;
+        -:  318:	uint8* subsampling_convert_cbbuf;
+        -:  319:	uint8* subsampling_convert_crbuf;
+        -:  320:	uint32 subsampling_convert_ycbcrimagelen;
+        -:  321:	uint8** subsampling_convert_ycbcrimage;
+        -:  322:	uint32 subsampling_convert_clinelenout;
+        -:  323:	uint32 subsampling_convert_state;
+        -:  324:	uint32 bytes_per_line;   /* if the codec outputs subsampled data, a 'line' in bytes_per_line */
+        -:  325:	uint32 lines_per_strile; /* and lines_per_strile means subsampling_ver desubsampled rows     */
+        -:  326:	OJPEGStateInBufferSource in_buffer_source;
+        -:  327:	uint32 in_buffer_next_strile;
+        -:  328:	uint32 in_buffer_strile_count;
+        -:  329:	uint64 in_buffer_file_pos;
+        -:  330:	uint8 in_buffer_file_pos_log;
+        -:  331:	uint64 in_buffer_file_togo;
+        -:  332:	uint16 in_buffer_togo;
+        -:  333:	uint8* in_buffer_cur;
+        -:  334:	uint8 in_buffer[OJPEG_BUFFER];
+        -:  335:	OJPEGStateOutState out_state;
+        -:  336:	uint8 out_buffer[OJPEG_BUFFER];
+        -:  337:	uint8* skip_buffer;
+        -:  338:} OJPEGState;
+        -:  339:
+        -:  340:static int OJPEGVGetField(TIFF* tif, uint32 tag, va_list ap);
+        -:  341:static int OJPEGVSetField(TIFF* tif, uint32 tag, va_list ap);
+        -:  342:static void OJPEGPrintDir(TIFF* tif, FILE* fd, long flags);
+        -:  343:
+        -:  344:static int OJPEGFixupTags(TIFF* tif);
+        -:  345:static int OJPEGSetupDecode(TIFF* tif);
+        -:  346:static int OJPEGPreDecode(TIFF* tif, uint16 s);
+        -:  347:static int OJPEGPreDecodeSkipRaw(TIFF* tif);
+        -:  348:static int OJPEGPreDecodeSkipScanlines(TIFF* tif);
+        -:  349:static int OJPEGDecode(TIFF* tif, uint8* buf, tmsize_t cc, uint16 s);
+        -:  350:static int OJPEGDecodeRaw(TIFF* tif, uint8* buf, tmsize_t cc);
+        -:  351:static int OJPEGDecodeScanlines(TIFF* tif, uint8* buf, tmsize_t cc);
+        -:  352:static void OJPEGPostDecode(TIFF* tif, uint8* buf, tmsize_t cc);
+        -:  353:static int OJPEGSetupEncode(TIFF* tif);
+        -:  354:static int OJPEGPreEncode(TIFF* tif, uint16 s);
+        -:  355:static int OJPEGEncode(TIFF* tif, uint8* buf, tmsize_t cc, uint16 s);
+        -:  356:static int OJPEGPostEncode(TIFF* tif);
+        -:  357:static void OJPEGCleanup(TIFF* tif);
+        -:  358:
+        -:  359:static void OJPEGSubsamplingCorrect(TIFF* tif);
+        -:  360:static int OJPEGReadHeaderInfo(TIFF* tif);
+        -:  361:static int OJPEGReadSecondarySos(TIFF* tif, uint16 s);
+        -:  362:static int OJPEGWriteHeaderInfo(TIFF* tif);
+        -:  363:static void OJPEGLibjpegSessionAbort(TIFF* tif);
+        -:  364:
+        -:  365:static int OJPEGReadHeaderInfoSec(TIFF* tif);
+        -:  366:static int OJPEGReadHeaderInfoSecStreamDri(TIFF* tif);
+        -:  367:static int OJPEGReadHeaderInfoSecStreamDqt(TIFF* tif);
+        -:  368:static int OJPEGReadHeaderInfoSecStreamDht(TIFF* tif);
+        -:  369:static int OJPEGReadHeaderInfoSecStreamSof(TIFF* tif, uint8 marker_id);
+        -:  370:static int OJPEGReadHeaderInfoSecStreamSos(TIFF* tif);
+        -:  371:static int OJPEGReadHeaderInfoSecTablesQTable(TIFF* tif);
+        -:  372:static int OJPEGReadHeaderInfoSecTablesDcTable(TIFF* tif);
+        -:  373:static int OJPEGReadHeaderInfoSecTablesAcTable(TIFF* tif);
+        -:  374:
+        -:  375:static int OJPEGReadBufferFill(OJPEGState* sp);
+        -:  376:static int OJPEGReadByte(OJPEGState* sp, uint8* byte);
+        -:  377:static int OJPEGReadBytePeek(OJPEGState* sp, uint8* byte);
+        -:  378:static void OJPEGReadByteAdvance(OJPEGState* sp);
+        -:  379:static int OJPEGReadWord(OJPEGState* sp, uint16* word);
+        -:  380:static int OJPEGReadBlock(OJPEGState* sp, uint16 len, void* mem);
+        -:  381:static void OJPEGReadSkip(OJPEGState* sp, uint16 len);
+        -:  382:
+        -:  383:static int OJPEGWriteStream(TIFF* tif, void** mem, uint32* len);
+        -:  384:static void OJPEGWriteStreamSoi(TIFF* tif, void** mem, uint32* len);
+        -:  385:static void OJPEGWriteStreamQTable(TIFF* tif, uint8 table_index, void** mem, uint32* len);
+        -:  386:static void OJPEGWriteStreamDcTable(TIFF* tif, uint8 table_index, void** mem, uint32* len);
+        -:  387:static void OJPEGWriteStreamAcTable(TIFF* tif, uint8 table_index, void** mem, uint32* len);
+        -:  388:static void OJPEGWriteStreamDri(TIFF* tif, void** mem, uint32* len);
+        -:  389:static void OJPEGWriteStreamSof(TIFF* tif, void** mem, uint32* len);
+        -:  390:static void OJPEGWriteStreamSos(TIFF* tif, void** mem, uint32* len);
+        -:  391:static int OJPEGWriteStreamCompressed(TIFF* tif, void** mem, uint32* len);
+        -:  392:static void OJPEGWriteStreamRst(TIFF* tif, void** mem, uint32* len);
+        -:  393:static void OJPEGWriteStreamEoi(TIFF* tif, void** mem, uint32* len);
+        -:  394:
+        -:  395:#ifdef LIBJPEG_ENCAP_EXTERNAL
+        -:  396:extern int jpeg_create_decompress_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo);
+        -:  397:extern int jpeg_read_header_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, uint8 require_image);
+        -:  398:extern int jpeg_start_decompress_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo);
+        -:  399:extern int jpeg_read_scanlines_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, void* scanlines, uint32 max_lines);
+        -:  400:extern int jpeg_read_raw_data_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, void* data, uint32 max_lines);
+        -:  401:extern void jpeg_encap_unwind(TIFF* tif);
+        -:  402:#else
+        -:  403:static int jpeg_create_decompress_encap(OJPEGState* sp, jpeg_decompress_struct* j);
+        -:  404:static int jpeg_read_header_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, uint8 require_image);
+        -:  405:static int jpeg_start_decompress_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo);
+        -:  406:static int jpeg_read_scanlines_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, void* scanlines, uint32 max_lines);
+        -:  407:static int jpeg_read_raw_data_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, void* data, uint32 max_lines);
+        -:  408:static void jpeg_encap_unwind(TIFF* tif);
+        -:  409:#endif
+        -:  410:
+        -:  411:static void OJPEGLibjpegJpegErrorMgrOutputMessage(jpeg_common_struct* cinfo);
+        -:  412:static void OJPEGLibjpegJpegErrorMgrErrorExit(jpeg_common_struct* cinfo);
+        -:  413:static void OJPEGLibjpegJpegSourceMgrInitSource(jpeg_decompress_struct* cinfo);
+        -:  414:static boolean OJPEGLibjpegJpegSourceMgrFillInputBuffer(jpeg_decompress_struct* cinfo);
+        -:  415:static void OJPEGLibjpegJpegSourceMgrSkipInputData(jpeg_decompress_struct* cinfo, long num_bytes);
+        -:  416:static boolean OJPEGLibjpegJpegSourceMgrResyncToRestart(jpeg_decompress_struct* cinfo, int desired);
+        -:  417:static void OJPEGLibjpegJpegSourceMgrTermSource(jpeg_decompress_struct* cinfo);
+        -:  418:
+        -:  419:int
+    #####:  420:TIFFInitOJPEG(TIFF* tif, int scheme)
+        -:  421:{
+        -:  422:	static const char module[]="TIFFInitOJPEG";
+        -:  423:	OJPEGState* sp;
+        -:  424:
+    #####:  425:	assert(scheme==COMPRESSION_OJPEG);
+        -:  426:
+        -:  427:        /*
+        -:  428:	 * Merge codec-specific tag information.
+        -:  429:	 */
+    #####:  430:	if (!_TIFFMergeFields(tif, ojpegFields, TIFFArrayCount(ojpegFields))) {
+    #####:  431:		TIFFErrorExt(tif->tif_clientdata, module,
+        -:  432:		    "Merging Old JPEG codec-specific tags failed");
+    #####:  433:		return 0;
+        -:  434:	}
+        -:  435:
+        -:  436:	/* state block */
+    #####:  437:	sp=_TIFFmalloc(sizeof(OJPEGState));
+    #####:  438:	if (sp==NULL)
+        -:  439:	{
+    #####:  440:		TIFFErrorExt(tif->tif_clientdata,module,"No space for OJPEG state block");
+    #####:  441:		return(0);
+        -:  442:	}
+    #####:  443:	_TIFFmemset(sp,0,sizeof(OJPEGState));
+    #####:  444:	sp->tif=tif;
+    #####:  445:	sp->jpeg_proc=1;
+    #####:  446:	sp->subsampling_hor=2;
+    #####:  447:	sp->subsampling_ver=2;
+    #####:  448:	TIFFSetField(tif,TIFFTAG_YCBCRSUBSAMPLING,2,2);
+        -:  449:	/* tif codec methods */
+    #####:  450:	tif->tif_fixuptags=OJPEGFixupTags;  
+    #####:  451:	tif->tif_setupdecode=OJPEGSetupDecode;
+    #####:  452:	tif->tif_predecode=OJPEGPreDecode;
+    #####:  453:	tif->tif_postdecode=OJPEGPostDecode;  
+    #####:  454:	tif->tif_decoderow=OJPEGDecode;  
+    #####:  455:	tif->tif_decodestrip=OJPEGDecode;  
+    #####:  456:	tif->tif_decodetile=OJPEGDecode;  
+    #####:  457:	tif->tif_setupencode=OJPEGSetupEncode;
+    #####:  458:	tif->tif_preencode=OJPEGPreEncode;
+    #####:  459:	tif->tif_postencode=OJPEGPostEncode;
+    #####:  460:	tif->tif_encoderow=OJPEGEncode;  
+    #####:  461:	tif->tif_encodestrip=OJPEGEncode;  
+    #####:  462:	tif->tif_encodetile=OJPEGEncode;  
+    #####:  463:	tif->tif_cleanup=OJPEGCleanup;
+    #####:  464:	tif->tif_data=(uint8*)sp;
+        -:  465:	/* tif tag methods */
+    #####:  466:	sp->vgetparent=tif->tif_tagmethods.vgetfield;
+    #####:  467:	tif->tif_tagmethods.vgetfield=OJPEGVGetField;
+    #####:  468:	sp->vsetparent=tif->tif_tagmethods.vsetfield;
+    #####:  469:	tif->tif_tagmethods.vsetfield=OJPEGVSetField;
+    #####:  470:	sp->printdir=tif->tif_tagmethods.printdir;
+    #####:  471:	tif->tif_tagmethods.printdir=OJPEGPrintDir;
+        -:  472:	/* Some OJPEG files don't have strip or tile offsets or bytecounts tags.
+        -:  473:	   Some others do, but have totally meaningless or corrupt values
+        -:  474:	   in these tags. In these cases, the JpegInterchangeFormat stream is
+        -:  475:	   reliable. In any case, this decoder reads the compressed data itself,
+        -:  476:	   from the most reliable locations, and we need to notify encapsulating
+        -:  477:	   LibTiff not to read raw strips or tiles for us. */
+    #####:  478:	tif->tif_flags|=TIFF_NOREADRAW;
+    #####:  479:	return(1);
+        -:  480:}
+        -:  481:
+        -:  482:static int
+    #####:  483:OJPEGVGetField(TIFF* tif, uint32 tag, va_list ap)
+        -:  484:{
+    #####:  485:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####:  486:	switch(tag)
+        -:  487:	{
+    #####:  488:		case TIFFTAG_JPEGIFOFFSET:
+    #####:  489:			*va_arg(ap,uint64*)=(uint64)sp->jpeg_interchange_format;
+    #####:  490:			break;
+    #####:  491:		case TIFFTAG_JPEGIFBYTECOUNT:
+    #####:  492:			*va_arg(ap,uint64*)=(uint64)sp->jpeg_interchange_format_length;
+    #####:  493:			break;
+    #####:  494:		case TIFFTAG_YCBCRSUBSAMPLING:
+    #####:  495:			if (sp->subsamplingcorrect_done==0)
+    #####:  496:				OJPEGSubsamplingCorrect(tif);
+    #####:  497:			*va_arg(ap,uint16*)=(uint16)sp->subsampling_hor;
+    #####:  498:			*va_arg(ap,uint16*)=(uint16)sp->subsampling_ver;
+    #####:  499:			break;
+    #####:  500:		case TIFFTAG_JPEGQTABLES:
+    #####:  501:			*va_arg(ap,uint32*)=(uint32)sp->qtable_offset_count;
+    #####:  502:			*va_arg(ap,void**)=(void*)sp->qtable_offset; 
+    #####:  503:			break;
+    #####:  504:		case TIFFTAG_JPEGDCTABLES:
+    #####:  505:			*va_arg(ap,uint32*)=(uint32)sp->dctable_offset_count;
+    #####:  506:			*va_arg(ap,void**)=(void*)sp->dctable_offset;  
+    #####:  507:			break;
+    #####:  508:		case TIFFTAG_JPEGACTABLES:
+    #####:  509:			*va_arg(ap,uint32*)=(uint32)sp->actable_offset_count;
+    #####:  510:			*va_arg(ap,void**)=(void*)sp->actable_offset;
+    #####:  511:			break;
+    #####:  512:		case TIFFTAG_JPEGPROC:
+    #####:  513:			*va_arg(ap,uint16*)=(uint16)sp->jpeg_proc;
+    #####:  514:			break;
+    #####:  515:		case TIFFTAG_JPEGRESTARTINTERVAL:
+    #####:  516:			*va_arg(ap,uint16*)=sp->restart_interval;
+    #####:  517:			break;
+    #####:  518:		default:
+    #####:  519:			return (*sp->vgetparent)(tif,tag,ap);
+        -:  520:	}
+    #####:  521:	return (1);
+        -:  522:}
+        -:  523:
+        -:  524:static int
+    #####:  525:OJPEGVSetField(TIFF* tif, uint32 tag, va_list ap)
+        -:  526:{
+        -:  527:	static const char module[]="OJPEGVSetField";
+    #####:  528:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  529:	uint32 ma;
+        -:  530:	uint64* mb;
+        -:  531:	uint32 n;
+        -:  532:	const TIFFField* fip;
+        -:  533:
+    #####:  534:	switch(tag)
+        -:  535:	{
+    #####:  536:		case TIFFTAG_JPEGIFOFFSET:
+    #####:  537:			sp->jpeg_interchange_format=(uint64)va_arg(ap,uint64);
+    #####:  538:			break;
+    #####:  539:		case TIFFTAG_JPEGIFBYTECOUNT:
+    #####:  540:			sp->jpeg_interchange_format_length=(uint64)va_arg(ap,uint64);
+    #####:  541:			break;
+    #####:  542:		case TIFFTAG_YCBCRSUBSAMPLING:
+    #####:  543:			sp->subsampling_tag=1;
+    #####:  544:			sp->subsampling_hor=(uint8)va_arg(ap,uint16_vap);
+    #####:  545:			sp->subsampling_ver=(uint8)va_arg(ap,uint16_vap);
+    #####:  546:			tif->tif_dir.td_ycbcrsubsampling[0]=sp->subsampling_hor;
+    #####:  547:			tif->tif_dir.td_ycbcrsubsampling[1]=sp->subsampling_ver;
+    #####:  548:			break;
+    #####:  549:		case TIFFTAG_JPEGQTABLES:
+    #####:  550:			ma=(uint32)va_arg(ap,uint32);
+    #####:  551:			if (ma!=0)
+        -:  552:			{
+    #####:  553:				if (ma>3)
+        -:  554:				{
+    #####:  555:					TIFFErrorExt(tif->tif_clientdata,module,"JpegQTables tag has incorrect count");
+    #####:  556:					return(0);
+        -:  557:				}
+    #####:  558:				sp->qtable_offset_count=(uint8)ma;
+    #####:  559:				mb=(uint64*)va_arg(ap,uint64*);
+    #####:  560:				for (n=0; n<ma; n++)
+    #####:  561:					sp->qtable_offset[n]=mb[n];
+        -:  562:			}
+    #####:  563:			break;
+    #####:  564:		case TIFFTAG_JPEGDCTABLES:
+    #####:  565:			ma=(uint32)va_arg(ap,uint32);
+    #####:  566:			if (ma!=0)
+        -:  567:			{
+    #####:  568:				if (ma>3)
+        -:  569:				{
+    #####:  570:					TIFFErrorExt(tif->tif_clientdata,module,"JpegDcTables tag has incorrect count");
+    #####:  571:					return(0);
+        -:  572:				}
+    #####:  573:				sp->dctable_offset_count=(uint8)ma;
+    #####:  574:				mb=(uint64*)va_arg(ap,uint64*);
+    #####:  575:				for (n=0; n<ma; n++)
+    #####:  576:					sp->dctable_offset[n]=mb[n];
+        -:  577:			}
+    #####:  578:			break;
+    #####:  579:		case TIFFTAG_JPEGACTABLES:
+    #####:  580:			ma=(uint32)va_arg(ap,uint32);
+    #####:  581:			if (ma!=0)
+        -:  582:			{
+    #####:  583:				if (ma>3)
+        -:  584:				{
+    #####:  585:					TIFFErrorExt(tif->tif_clientdata,module,"JpegAcTables tag has incorrect count");
+    #####:  586:					return(0);
+        -:  587:				}
+    #####:  588:				sp->actable_offset_count=(uint8)ma;
+    #####:  589:				mb=(uint64*)va_arg(ap,uint64*);
+    #####:  590:				for (n=0; n<ma; n++)
+    #####:  591:					sp->actable_offset[n]=mb[n];
+        -:  592:			}
+    #####:  593:			break;
+    #####:  594:		case TIFFTAG_JPEGPROC:
+    #####:  595:			sp->jpeg_proc=(uint8)va_arg(ap,uint16_vap);
+    #####:  596:			break;
+    #####:  597:		case TIFFTAG_JPEGRESTARTINTERVAL:
+    #####:  598:			sp->restart_interval=(uint16)va_arg(ap,uint16_vap);
+    #####:  599:			break;
+    #####:  600:		default:
+    #####:  601:			return (*sp->vsetparent)(tif,tag,ap);
+        -:  602:	}
+    #####:  603:	fip = TIFFFieldWithTag(tif,tag);
+    #####:  604:	if( fip == NULL ) /* shouldn't happen */
+    #####:  605:	    return(0);
+    #####:  606:	TIFFSetFieldBit(tif,fip->field_bit);
+    #####:  607:	tif->tif_flags|=TIFF_DIRTYDIRECT;
+    #####:  608:	return(1);
+        -:  609:}
+        -:  610:
+        -:  611:static void
+    #####:  612:OJPEGPrintDir(TIFF* tif, FILE* fd, long flags)
+        -:  613:{
+    #####:  614:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  615:	uint8 m;
+        -:  616:	(void)flags;
+    #####:  617:	assert(sp!=NULL);
+    #####:  618:	if (TIFFFieldSet(tif,FIELD_OJPEG_JPEGINTERCHANGEFORMAT))
+    #####:  619:		fprintf(fd,"  JpegInterchangeFormat: " TIFF_UINT64_FORMAT "\n",(TIFF_UINT64_T)sp->jpeg_interchange_format);  
+    #####:  620:	if (TIFFFieldSet(tif,FIELD_OJPEG_JPEGINTERCHANGEFORMATLENGTH))
+    #####:  621:		fprintf(fd,"  JpegInterchangeFormatLength: " TIFF_UINT64_FORMAT "\n",(TIFF_UINT64_T)sp->jpeg_interchange_format_length);  
+    #####:  622:	if (TIFFFieldSet(tif,FIELD_OJPEG_JPEGQTABLES))
+        -:  623:	{
+    #####:  624:		fprintf(fd,"  JpegQTables:");
+    #####:  625:		for (m=0; m<sp->qtable_offset_count; m++)
+    #####:  626:			fprintf(fd," " TIFF_UINT64_FORMAT,(TIFF_UINT64_T)sp->qtable_offset[m]);
+    #####:  627:		fprintf(fd,"\n");
+        -:  628:	}
+    #####:  629:	if (TIFFFieldSet(tif,FIELD_OJPEG_JPEGDCTABLES))
+        -:  630:	{
+    #####:  631:		fprintf(fd,"  JpegDcTables:");
+    #####:  632:		for (m=0; m<sp->dctable_offset_count; m++)
+    #####:  633:			fprintf(fd," " TIFF_UINT64_FORMAT,(TIFF_UINT64_T)sp->dctable_offset[m]);
+    #####:  634:		fprintf(fd,"\n");
+        -:  635:	}
+    #####:  636:	if (TIFFFieldSet(tif,FIELD_OJPEG_JPEGACTABLES))
+        -:  637:	{
+    #####:  638:		fprintf(fd,"  JpegAcTables:");
+    #####:  639:		for (m=0; m<sp->actable_offset_count; m++)
+    #####:  640:			fprintf(fd," " TIFF_UINT64_FORMAT,(TIFF_UINT64_T)sp->actable_offset[m]);
+    #####:  641:		fprintf(fd,"\n");
+        -:  642:	}
+    #####:  643:	if (TIFFFieldSet(tif,FIELD_OJPEG_JPEGPROC))
+    #####:  644:		fprintf(fd,"  JpegProc: %u\n",(unsigned int)sp->jpeg_proc);
+    #####:  645:	if (TIFFFieldSet(tif,FIELD_OJPEG_JPEGRESTARTINTERVAL))
+    #####:  646:		fprintf(fd,"  JpegRestartInterval: %u\n",(unsigned int)sp->restart_interval);
+    #####:  647:	if (sp->printdir)
+    #####:  648:		(*sp->printdir)(tif, fd, flags);
+    #####:  649:}
+        -:  650:
+        -:  651:static int
+    #####:  652:OJPEGFixupTags(TIFF* tif)
+        -:  653:{
+        -:  654:	(void) tif;
+    #####:  655:	return(1);
+        -:  656:}
+        -:  657:
+        -:  658:static int
+    #####:  659:OJPEGSetupDecode(TIFF* tif)
+        -:  660:{
+        -:  661:	static const char module[]="OJPEGSetupDecode";
+    #####:  662:	TIFFWarningExt(tif->tif_clientdata,module,"Depreciated and troublesome old-style JPEG compression mode, please convert to new-style JPEG compression and notify vendor of writing software");
+    #####:  663:	return(1);
+        -:  664:}
+        -:  665:
+        -:  666:static int
+    #####:  667:OJPEGPreDecode(TIFF* tif, uint16 s)
+        -:  668:{
+    #####:  669:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  670:	uint32 m;
+    #####:  671:	if (sp->subsamplingcorrect_done==0)
+    #####:  672:		OJPEGSubsamplingCorrect(tif);
+    #####:  673:	if (sp->readheader_done==0)
+        -:  674:	{
+    #####:  675:		if (OJPEGReadHeaderInfo(tif)==0)
+    #####:  676:			return(0);
+        -:  677:	}
+    #####:  678:	if (sp->sos_end[s].log==0)
+        -:  679:	{
+    #####:  680:		if (OJPEGReadSecondarySos(tif,s)==0)
+    #####:  681:			return(0);
+        -:  682:	}
+    #####:  683:	if isTiled(tif)
+    #####:  684:		m=tif->tif_curtile;
+        -:  685:	else
+    #####:  686:		m=tif->tif_curstrip;
+    #####:  687:	if ((sp->writeheader_done!=0) && ((sp->write_cursample!=s) || (sp->write_curstrile>m)))
+        -:  688:	{
+    #####:  689:		if (sp->libjpeg_session_active!=0)
+    #####:  690:			OJPEGLibjpegSessionAbort(tif);
+    #####:  691:		sp->writeheader_done=0;
+        -:  692:	}
+    #####:  693:	if (sp->writeheader_done==0)
+        -:  694:	{
+    #####:  695:		sp->plane_sample_offset=(uint8)s;
+    #####:  696:		sp->write_cursample=s;
+    #####:  697:		sp->write_curstrile=s*tif->tif_dir.td_stripsperimage;
+    #####:  698:		if ((sp->in_buffer_file_pos_log==0) ||
+    #####:  699:		    (sp->in_buffer_file_pos-sp->in_buffer_togo!=sp->sos_end[s].in_buffer_file_pos))
+        -:  700:		{
+    #####:  701:			sp->in_buffer_source=sp->sos_end[s].in_buffer_source;
+    #####:  702:			sp->in_buffer_next_strile=sp->sos_end[s].in_buffer_next_strile;
+    #####:  703:			sp->in_buffer_file_pos=sp->sos_end[s].in_buffer_file_pos;
+    #####:  704:			sp->in_buffer_file_pos_log=0;
+    #####:  705:			sp->in_buffer_file_togo=sp->sos_end[s].in_buffer_file_togo;
+    #####:  706:			sp->in_buffer_togo=0;
+    #####:  707:			sp->in_buffer_cur=0;
+        -:  708:		}
+    #####:  709:		if (OJPEGWriteHeaderInfo(tif)==0)
+    #####:  710:			return(0);
+        -:  711:	}
+    #####:  712:	while (sp->write_curstrile<m)          
+        -:  713:	{
+    #####:  714:		if (sp->libjpeg_jpeg_query_style==0)
+        -:  715:		{
+    #####:  716:			if (OJPEGPreDecodeSkipRaw(tif)==0)
+    #####:  717:				return(0);
+        -:  718:		}
+        -:  719:		else
+        -:  720:		{
+    #####:  721:			if (OJPEGPreDecodeSkipScanlines(tif)==0)
+    #####:  722:				return(0);
+        -:  723:		}
+    #####:  724:		sp->write_curstrile++;
+        -:  725:	}
+    #####:  726:	sp->decoder_ok = 1;
+    #####:  727:	return(1);
+        -:  728:}
+        -:  729:
+        -:  730:static int
+    #####:  731:OJPEGPreDecodeSkipRaw(TIFF* tif)
+        -:  732:{
+    #####:  733:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  734:	uint32 m;
+    #####:  735:	m=sp->lines_per_strile;
+    #####:  736:	if (sp->subsampling_convert_state!=0)
+        -:  737:	{
+    #####:  738:		if (sp->subsampling_convert_clines-sp->subsampling_convert_state>=m)
+        -:  739:		{
+    #####:  740:			sp->subsampling_convert_state+=m;
+    #####:  741:			if (sp->subsampling_convert_state==sp->subsampling_convert_clines)
+    #####:  742:				sp->subsampling_convert_state=0;
+    #####:  743:			return(1);
+        -:  744:		}
+    #####:  745:		m-=sp->subsampling_convert_clines-sp->subsampling_convert_state;
+    #####:  746:		sp->subsampling_convert_state=0;
+        -:  747:	}
+    #####:  748:	while (m>=sp->subsampling_convert_clines)
+        -:  749:	{
+    #####:  750:		if (jpeg_read_raw_data_encap(sp,&(sp->libjpeg_jpeg_decompress_struct),sp->subsampling_convert_ycbcrimage,sp->subsampling_ver*8)==0)
+    #####:  751:			return(0);
+    #####:  752:		m-=sp->subsampling_convert_clines;
+        -:  753:	}
+    #####:  754:	if (m>0)
+        -:  755:	{
+    #####:  756:		if (jpeg_read_raw_data_encap(sp,&(sp->libjpeg_jpeg_decompress_struct),sp->subsampling_convert_ycbcrimage,sp->subsampling_ver*8)==0)
+    #####:  757:			return(0);
+    #####:  758:		sp->subsampling_convert_state=m;
+        -:  759:	}
+    #####:  760:	return(1);
+        -:  761:}
+        -:  762:
+        -:  763:static int
+    #####:  764:OJPEGPreDecodeSkipScanlines(TIFF* tif)
+        -:  765:{
+        -:  766:	static const char module[]="OJPEGPreDecodeSkipScanlines";
+    #####:  767:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  768:	uint32 m;
+    #####:  769:	if (sp->skip_buffer==NULL)
+        -:  770:	{
+    #####:  771:		sp->skip_buffer=_TIFFmalloc(sp->bytes_per_line);
+    #####:  772:		if (sp->skip_buffer==NULL)
+        -:  773:		{
+    #####:  774:			TIFFErrorExt(tif->tif_clientdata,module,"Out of memory");
+    #####:  775:			return(0);
+        -:  776:		}
+        -:  777:	}
+    #####:  778:	for (m=0; m<sp->lines_per_strile; m++)
+        -:  779:	{
+    #####:  780:		if (jpeg_read_scanlines_encap(sp,&(sp->libjpeg_jpeg_decompress_struct),&sp->skip_buffer,1)==0)
+    #####:  781:			return(0);
+        -:  782:	}
+    #####:  783:	return(1);
+        -:  784:}
+        -:  785:
+        -:  786:static int
+    #####:  787:OJPEGDecode(TIFF* tif, uint8* buf, tmsize_t cc, uint16 s)
+        -:  788:{
+        -:  789:        static const char module[]="OJPEGDecode";
+    #####:  790:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  791:	(void)s;
+    #####:  792:        if( !sp->decoder_ok )
+        -:  793:        {
+    #####:  794:            TIFFErrorExt(tif->tif_clientdata,module,"Cannot decode: decoder not correctly initialized");
+    #####:  795:            return 0;
+        -:  796:        }
+    #####:  797:	if (sp->libjpeg_jpeg_query_style==0)
+        -:  798:	{
+    #####:  799:		if (OJPEGDecodeRaw(tif,buf,cc)==0)
+    #####:  800:			return(0);
+        -:  801:	}
+        -:  802:	else
+        -:  803:	{
+    #####:  804:		if (OJPEGDecodeScanlines(tif,buf,cc)==0)
+    #####:  805:			return(0);
+        -:  806:	}
+    #####:  807:	return(1);
+        -:  808:}
+        -:  809:
+        -:  810:static int
+    #####:  811:OJPEGDecodeRaw(TIFF* tif, uint8* buf, tmsize_t cc)
+        -:  812:{
+        -:  813:	static const char module[]="OJPEGDecodeRaw";
+    #####:  814:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  815:	uint8* m;
+        -:  816:	tmsize_t n;
+        -:  817:	uint8* oy;
+        -:  818:	uint8* ocb;
+        -:  819:	uint8* ocr;
+        -:  820:	uint8* p;
+        -:  821:	uint32 q;
+        -:  822:	uint8* r;
+        -:  823:	uint8 sx,sy;
+    #####:  824:	if (cc%sp->bytes_per_line!=0)
+        -:  825:	{
+    #####:  826:		TIFFErrorExt(tif->tif_clientdata,module,"Fractional scanline not read");
+    #####:  827:		return(0);
+        -:  828:	}
+    #####:  829:	assert(cc>0);
+    #####:  830:	m=buf;
+    #####:  831:	n=cc;
+        -:  832:	do
+        -:  833:	{
+    #####:  834:		if (sp->subsampling_convert_state==0)
+        -:  835:		{
+    #####:  836:			if (jpeg_read_raw_data_encap(sp,&(sp->libjpeg_jpeg_decompress_struct),sp->subsampling_convert_ycbcrimage,sp->subsampling_ver*8)==0)
+    #####:  837:				return(0);
+        -:  838:		}
+    #####:  839:		oy=sp->subsampling_convert_ybuf+sp->subsampling_convert_state*sp->subsampling_ver*sp->subsampling_convert_ylinelen;
+    #####:  840:		ocb=sp->subsampling_convert_cbbuf+sp->subsampling_convert_state*sp->subsampling_convert_clinelen;
+    #####:  841:		ocr=sp->subsampling_convert_crbuf+sp->subsampling_convert_state*sp->subsampling_convert_clinelen;
+    #####:  842:		p=m;
+    #####:  843:		for (q=0; q<sp->subsampling_convert_clinelenout; q++)
+        -:  844:		{
+    #####:  845:			r=oy;
+    #####:  846:			for (sy=0; sy<sp->subsampling_ver; sy++)
+        -:  847:			{
+    #####:  848:				for (sx=0; sx<sp->subsampling_hor; sx++)
+    #####:  849:					*p++=*r++;
+    #####:  850:				r+=sp->subsampling_convert_ylinelen-sp->subsampling_hor;
+        -:  851:			}
+    #####:  852:			oy+=sp->subsampling_hor;
+    #####:  853:			*p++=*ocb++;
+    #####:  854:			*p++=*ocr++;
+        -:  855:		}
+    #####:  856:		sp->subsampling_convert_state++;
+    #####:  857:		if (sp->subsampling_convert_state==sp->subsampling_convert_clines)
+    #####:  858:			sp->subsampling_convert_state=0;
+    #####:  859:		m+=sp->bytes_per_line;
+    #####:  860:		n-=sp->bytes_per_line;
+    #####:  861:	} while(n>0);
+    #####:  862:	return(1);
+        -:  863:}
+        -:  864:
+        -:  865:static int
+    #####:  866:OJPEGDecodeScanlines(TIFF* tif, uint8* buf, tmsize_t cc)
+        -:  867:{
+        -:  868:	static const char module[]="OJPEGDecodeScanlines";
+    #####:  869:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####:  870:	uint8* m;
+        -:  871:	tmsize_t n;
+    #####:  872:	if (cc%sp->bytes_per_line!=0)
+        -:  873:	{
+    #####:  874:		TIFFErrorExt(tif->tif_clientdata,module,"Fractional scanline not read");
+    #####:  875:		return(0);
+        -:  876:	}
+    #####:  877:	assert(cc>0);
+    #####:  878:	m=buf;
+    #####:  879:	n=cc;
+        -:  880:	do
+        -:  881:	{
+    #####:  882:		if (jpeg_read_scanlines_encap(sp,&(sp->libjpeg_jpeg_decompress_struct),&m,1)==0)
+    #####:  883:			return(0);
+    #####:  884:		m+=sp->bytes_per_line;
+    #####:  885:		n-=sp->bytes_per_line;
+    #####:  886:	} while(n>0);
+    #####:  887:	return(1);
+        -:  888:}
+        -:  889:
+        -:  890:static void
+    #####:  891:OJPEGPostDecode(TIFF* tif, uint8* buf, tmsize_t cc)
+        -:  892:{
+    #####:  893:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  894:	(void)buf;
+        -:  895:	(void)cc;
+    #####:  896:	sp->write_curstrile++;
+    #####:  897:	if (sp->write_curstrile%tif->tif_dir.td_stripsperimage==0)  
+        -:  898:	{
+    #####:  899:		assert(sp->libjpeg_session_active!=0);
+    #####:  900:		OJPEGLibjpegSessionAbort(tif);
+    #####:  901:		sp->writeheader_done=0;
+        -:  902:	}
+    #####:  903:}
+        -:  904:
+        -:  905:static int
+    #####:  906:OJPEGSetupEncode(TIFF* tif)
+        -:  907:{
+        -:  908:	static const char module[]="OJPEGSetupEncode";
+    #####:  909:	TIFFErrorExt(tif->tif_clientdata,module,"OJPEG encoding not supported; use new-style JPEG compression instead");
+    #####:  910:	return(0);
+        -:  911:}
+        -:  912:
+        -:  913:static int
+    #####:  914:OJPEGPreEncode(TIFF* tif, uint16 s)
+        -:  915:{
+        -:  916:	static const char module[]="OJPEGPreEncode";
+        -:  917:	(void)s;
+    #####:  918:	TIFFErrorExt(tif->tif_clientdata,module,"OJPEG encoding not supported; use new-style JPEG compression instead");
+    #####:  919:	return(0);
+        -:  920:}
+        -:  921:
+        -:  922:static int
+    #####:  923:OJPEGEncode(TIFF* tif, uint8* buf, tmsize_t cc, uint16 s)
+        -:  924:{
+        -:  925:	static const char module[]="OJPEGEncode";
+        -:  926:	(void)buf;
+        -:  927:	(void)cc;
+        -:  928:	(void)s;
+    #####:  929:	TIFFErrorExt(tif->tif_clientdata,module,"OJPEG encoding not supported; use new-style JPEG compression instead");
+    #####:  930:	return(0);
+        -:  931:}
+        -:  932:
+        -:  933:static int
+    #####:  934:OJPEGPostEncode(TIFF* tif)
+        -:  935:{
+        -:  936:	static const char module[]="OJPEGPostEncode";
+    #####:  937:	TIFFErrorExt(tif->tif_clientdata,module,"OJPEG encoding not supported; use new-style JPEG compression instead");
+    #####:  938:	return(0);
+        -:  939:}
+        -:  940:
+        -:  941:static void
+    #####:  942:OJPEGCleanup(TIFF* tif)
+        -:  943:{
+    #####:  944:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####:  945:	if (sp!=0)
+        -:  946:	{
+    #####:  947:		tif->tif_tagmethods.vgetfield=sp->vgetparent;
+    #####:  948:		tif->tif_tagmethods.vsetfield=sp->vsetparent;
+    #####:  949:		tif->tif_tagmethods.printdir=sp->printdir;
+    #####:  950:		if (sp->qtable[0]!=0)
+    #####:  951:			_TIFFfree(sp->qtable[0]);
+    #####:  952:		if (sp->qtable[1]!=0)
+    #####:  953:			_TIFFfree(sp->qtable[1]);
+    #####:  954:		if (sp->qtable[2]!=0)
+    #####:  955:			_TIFFfree(sp->qtable[2]);
+    #####:  956:		if (sp->qtable[3]!=0)
+    #####:  957:			_TIFFfree(sp->qtable[3]);
+    #####:  958:		if (sp->dctable[0]!=0)
+    #####:  959:			_TIFFfree(sp->dctable[0]);
+    #####:  960:		if (sp->dctable[1]!=0)
+    #####:  961:			_TIFFfree(sp->dctable[1]);
+    #####:  962:		if (sp->dctable[2]!=0)
+    #####:  963:			_TIFFfree(sp->dctable[2]);
+    #####:  964:		if (sp->dctable[3]!=0)
+    #####:  965:			_TIFFfree(sp->dctable[3]);
+    #####:  966:		if (sp->actable[0]!=0)
+    #####:  967:			_TIFFfree(sp->actable[0]);
+    #####:  968:		if (sp->actable[1]!=0)
+    #####:  969:			_TIFFfree(sp->actable[1]);
+    #####:  970:		if (sp->actable[2]!=0)
+    #####:  971:			_TIFFfree(sp->actable[2]);
+    #####:  972:		if (sp->actable[3]!=0)
+    #####:  973:			_TIFFfree(sp->actable[3]);
+    #####:  974:		if (sp->libjpeg_session_active!=0)
+    #####:  975:			OJPEGLibjpegSessionAbort(tif);
+    #####:  976:		if (sp->subsampling_convert_ycbcrbuf!=0)
+    #####:  977:			_TIFFfree(sp->subsampling_convert_ycbcrbuf);
+    #####:  978:		if (sp->subsampling_convert_ycbcrimage!=0)
+    #####:  979:			_TIFFfree(sp->subsampling_convert_ycbcrimage);
+    #####:  980:		if (sp->skip_buffer!=0)
+    #####:  981:			_TIFFfree(sp->skip_buffer);
+    #####:  982:		_TIFFfree(sp);
+    #####:  983:		tif->tif_data=NULL;
+    #####:  984:		_TIFFSetDefaultCompressionState(tif);
+        -:  985:	}
+    #####:  986:}
+        -:  987:
+        -:  988:static void
+    #####:  989:OJPEGSubsamplingCorrect(TIFF* tif)
+        -:  990:{
+        -:  991:	static const char module[]="OJPEGSubsamplingCorrect";
+    #####:  992:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -:  993:	uint8 mh;
+        -:  994:	uint8 mv;
+    #####:  995:        _TIFFFillStriles( tif );
+        -:  996:        
+    #####:  997:	assert(sp->subsamplingcorrect_done==0);
+    #####:  998:	if ((tif->tif_dir.td_samplesperpixel!=3) || ((tif->tif_dir.td_photometric!=PHOTOMETRIC_YCBCR) &&
+    #####:  999:	    (tif->tif_dir.td_photometric!=PHOTOMETRIC_ITULAB)))
+        -: 1000:	{
+    #####: 1001:		if (sp->subsampling_tag!=0)
+    #####: 1002:			TIFFWarningExt(tif->tif_clientdata,module,"Subsampling tag not appropriate for this Photometric and/or SamplesPerPixel");
+    #####: 1003:		sp->subsampling_hor=1;
+    #####: 1004:		sp->subsampling_ver=1;
+    #####: 1005:		sp->subsampling_force_desubsampling_inside_decompression=0;
+        -: 1006:	}
+        -: 1007:	else
+        -: 1008:	{
+    #####: 1009:		sp->subsamplingcorrect_done=1;
+    #####: 1010:		mh=sp->subsampling_hor;
+    #####: 1011:		mv=sp->subsampling_ver;
+    #####: 1012:		sp->subsamplingcorrect=1;
+    #####: 1013:		OJPEGReadHeaderInfoSec(tif);
+    #####: 1014:		if (sp->subsampling_force_desubsampling_inside_decompression!=0)
+        -: 1015:		{
+    #####: 1016:			sp->subsampling_hor=1;
+    #####: 1017:			sp->subsampling_ver=1;
+        -: 1018:		}
+    #####: 1019:		sp->subsamplingcorrect=0;
+    #####: 1020:		if (((sp->subsampling_hor!=mh) || (sp->subsampling_ver!=mv)) && (sp->subsampling_force_desubsampling_inside_decompression==0))
+        -: 1021:		{
+    #####: 1022:			if (sp->subsampling_tag==0)
+    #####: 1023:				TIFFWarningExt(tif->tif_clientdata,module,"Subsampling tag is not set, yet subsampling inside JPEG data [%d,%d] does not match default values [2,2]; assuming subsampling inside JPEG data is correct",sp->subsampling_hor,sp->subsampling_ver);
+        -: 1024:			else
+    #####: 1025:				TIFFWarningExt(tif->tif_clientdata,module,"Subsampling inside JPEG data [%d,%d] does not match subsampling tag values [%d,%d]; assuming subsampling inside JPEG data is correct",sp->subsampling_hor,sp->subsampling_ver,mh,mv);
+        -: 1026:		}
+    #####: 1027:		if (sp->subsampling_force_desubsampling_inside_decompression!=0)
+        -: 1028:		{
+    #####: 1029:			if (sp->subsampling_tag==0)
+    #####: 1030:				TIFFWarningExt(tif->tif_clientdata,module,"Subsampling tag is not set, yet subsampling inside JPEG data does not match default values [2,2] (nor any other values allowed in TIFF); assuming subsampling inside JPEG data is correct and desubsampling inside JPEG decompression");
+        -: 1031:			else
+    #####: 1032:				TIFFWarningExt(tif->tif_clientdata,module,"Subsampling inside JPEG data does not match subsampling tag values [%d,%d] (nor any other values allowed in TIFF); assuming subsampling inside JPEG data is correct and desubsampling inside JPEG decompression",mh,mv);
+        -: 1033:		}
+    #####: 1034:		if (sp->subsampling_force_desubsampling_inside_decompression==0)
+        -: 1035:		{
+    #####: 1036:			if (sp->subsampling_hor<sp->subsampling_ver)
+    #####: 1037:				TIFFWarningExt(tif->tif_clientdata,module,"Subsampling values [%d,%d] are not allowed in TIFF",sp->subsampling_hor,sp->subsampling_ver);
+        -: 1038:		}
+        -: 1039:	}
+    #####: 1040:	sp->subsamplingcorrect_done=1;
+    #####: 1041:}
+        -: 1042:
+        -: 1043:static int
+    #####: 1044:OJPEGReadHeaderInfo(TIFF* tif)
+        -: 1045:{
+        -: 1046:	static const char module[]="OJPEGReadHeaderInfo";
+    #####: 1047:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1048:	assert(sp->readheader_done==0);
+    #####: 1049:	sp->image_width=tif->tif_dir.td_imagewidth;
+    #####: 1050:	sp->image_length=tif->tif_dir.td_imagelength;
+    #####: 1051:	if isTiled(tif)
+        -: 1052:	{
+    #####: 1053:		sp->strile_width=tif->tif_dir.td_tilewidth;
+    #####: 1054:		sp->strile_length=tif->tif_dir.td_tilelength;
+    #####: 1055:		sp->strile_length_total=((sp->image_length+sp->strile_length-1)/sp->strile_length)*sp->strile_length;
+        -: 1056:	}
+        -: 1057:	else
+        -: 1058:	{
+    #####: 1059:		sp->strile_width=sp->image_width;
+    #####: 1060:		sp->strile_length=tif->tif_dir.td_rowsperstrip;
+    #####: 1061:		sp->strile_length_total=sp->image_length;
+        -: 1062:	}
+    #####: 1063:	if (tif->tif_dir.td_samplesperpixel==1)
+        -: 1064:	{
+    #####: 1065:		sp->samples_per_pixel=1;
+    #####: 1066:		sp->plane_sample_offset=0;
+    #####: 1067:		sp->samples_per_pixel_per_plane=sp->samples_per_pixel;
+    #####: 1068:		sp->subsampling_hor=1;
+    #####: 1069:		sp->subsampling_ver=1;
+        -: 1070:	}
+        -: 1071:	else
+        -: 1072:	{
+    #####: 1073:		if (tif->tif_dir.td_samplesperpixel!=3)
+        -: 1074:		{
+    #####: 1075:			TIFFErrorExt(tif->tif_clientdata,module,"SamplesPerPixel %d not supported for this compression scheme",sp->samples_per_pixel);
+    #####: 1076:			return(0);
+        -: 1077:		}
+    #####: 1078:		sp->samples_per_pixel=3;
+    #####: 1079:		sp->plane_sample_offset=0;
+    #####: 1080:		if (tif->tif_dir.td_planarconfig==PLANARCONFIG_CONTIG)
+    #####: 1081:			sp->samples_per_pixel_per_plane=3;
+        -: 1082:		else
+    #####: 1083:			sp->samples_per_pixel_per_plane=1;
+        -: 1084:	}
+    #####: 1085:	if (sp->strile_length<sp->image_length)
+        -: 1086:	{
+    #####: 1087:		if (sp->strile_length%(sp->subsampling_ver*8)!=0)
+        -: 1088:		{
+    #####: 1089:			TIFFErrorExt(tif->tif_clientdata,module,"Incompatible vertical subsampling and image strip/tile length");
+    #####: 1090:			return(0);
+        -: 1091:		}
+    #####: 1092:		sp->restart_interval=(uint16)(((sp->strile_width+sp->subsampling_hor*8-1)/(sp->subsampling_hor*8))*(sp->strile_length/(sp->subsampling_ver*8)));
+        -: 1093:	}
+    #####: 1094:	if (OJPEGReadHeaderInfoSec(tif)==0)
+    #####: 1095:		return(0);
+    #####: 1096:	sp->sos_end[0].log=1;
+    #####: 1097:	sp->sos_end[0].in_buffer_source=sp->in_buffer_source;
+    #####: 1098:	sp->sos_end[0].in_buffer_next_strile=sp->in_buffer_next_strile;
+    #####: 1099:	sp->sos_end[0].in_buffer_file_pos=sp->in_buffer_file_pos-sp->in_buffer_togo;
+    #####: 1100:	sp->sos_end[0].in_buffer_file_togo=sp->in_buffer_file_togo+sp->in_buffer_togo; 
+    #####: 1101:	sp->readheader_done=1;
+    #####: 1102:	return(1);
+        -: 1103:}
+        -: 1104:
+        -: 1105:static int
+    #####: 1106:OJPEGReadSecondarySos(TIFF* tif, uint16 s)
+        -: 1107:{
+    #####: 1108:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1109:	uint8 m;
+    #####: 1110:	assert(s>0);
+    #####: 1111:	assert(s<3);
+    #####: 1112:	assert(sp->sos_end[0].log!=0);
+    #####: 1113:	assert(sp->sos_end[s].log==0);
+    #####: 1114:	sp->plane_sample_offset=(uint8)(s-1);
+    #####: 1115:	while(sp->sos_end[sp->plane_sample_offset].log==0)
+    #####: 1116:		sp->plane_sample_offset--;
+    #####: 1117:	sp->in_buffer_source=sp->sos_end[sp->plane_sample_offset].in_buffer_source;
+    #####: 1118:	sp->in_buffer_next_strile=sp->sos_end[sp->plane_sample_offset].in_buffer_next_strile;
+    #####: 1119:	sp->in_buffer_file_pos=sp->sos_end[sp->plane_sample_offset].in_buffer_file_pos;
+    #####: 1120:	sp->in_buffer_file_pos_log=0;
+    #####: 1121:	sp->in_buffer_file_togo=sp->sos_end[sp->plane_sample_offset].in_buffer_file_togo;
+    #####: 1122:	sp->in_buffer_togo=0;
+    #####: 1123:	sp->in_buffer_cur=0;
+    #####: 1124:	while(sp->plane_sample_offset<s)
+        -: 1125:	{
+        -: 1126:		do
+        -: 1127:		{
+    #####: 1128:			if (OJPEGReadByte(sp,&m)==0)
+    #####: 1129:				return(0);
+    #####: 1130:			if (m==255)
+        -: 1131:			{
+        -: 1132:				do
+        -: 1133:				{
+    #####: 1134:					if (OJPEGReadByte(sp,&m)==0)
+    #####: 1135:						return(0);
+    #####: 1136:					if (m!=255)
+    #####: 1137:						break;
+        -: 1138:				} while(1);
+    #####: 1139:				if (m==JPEG_MARKER_SOS)
+    #####: 1140:					break;
+        -: 1141:			}
+        -: 1142:		} while(1);
+    #####: 1143:		sp->plane_sample_offset++;
+    #####: 1144:		if (OJPEGReadHeaderInfoSecStreamSos(tif)==0)
+    #####: 1145:			return(0);
+    #####: 1146:		sp->sos_end[sp->plane_sample_offset].log=1;
+    #####: 1147:		sp->sos_end[sp->plane_sample_offset].in_buffer_source=sp->in_buffer_source;
+    #####: 1148:		sp->sos_end[sp->plane_sample_offset].in_buffer_next_strile=sp->in_buffer_next_strile;
+    #####: 1149:		sp->sos_end[sp->plane_sample_offset].in_buffer_file_pos=sp->in_buffer_file_pos-sp->in_buffer_togo;
+    #####: 1150:		sp->sos_end[sp->plane_sample_offset].in_buffer_file_togo=sp->in_buffer_file_togo+sp->in_buffer_togo;
+        -: 1151:	}
+    #####: 1152:	return(1);
+        -: 1153:}
+        -: 1154:
+        -: 1155:static int
+    #####: 1156:OJPEGWriteHeaderInfo(TIFF* tif)
+        -: 1157:{
+        -: 1158:	static const char module[]="OJPEGWriteHeaderInfo";
+    #####: 1159:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 1160:	uint8** m;
+        -: 1161:	uint32 n;
+        -: 1162:	/* if a previous attempt failed, don't try again */
+    #####: 1163:	if (sp->libjpeg_session_active != 0) 
+    #####: 1164:		return 0;
+    #####: 1165:	sp->out_state=ososSoi;
+    #####: 1166:	sp->restart_index=0;
+    #####: 1167:	jpeg_std_error(&(sp->libjpeg_jpeg_error_mgr));
+    #####: 1168:	sp->libjpeg_jpeg_error_mgr.output_message=OJPEGLibjpegJpegErrorMgrOutputMessage;
+    #####: 1169:	sp->libjpeg_jpeg_error_mgr.error_exit=OJPEGLibjpegJpegErrorMgrErrorExit;
+    #####: 1170:	sp->libjpeg_jpeg_decompress_struct.err=&(sp->libjpeg_jpeg_error_mgr);
+    #####: 1171:	sp->libjpeg_jpeg_decompress_struct.client_data=(void*)tif;
+    #####: 1172:	if (jpeg_create_decompress_encap(sp,&(sp->libjpeg_jpeg_decompress_struct))==0)
+    #####: 1173:		return(0);
+    #####: 1174:	sp->libjpeg_session_active=1;
+    #####: 1175:	sp->libjpeg_jpeg_source_mgr.bytes_in_buffer=0;
+    #####: 1176:	sp->libjpeg_jpeg_source_mgr.init_source=OJPEGLibjpegJpegSourceMgrInitSource;
+    #####: 1177:	sp->libjpeg_jpeg_source_mgr.fill_input_buffer=OJPEGLibjpegJpegSourceMgrFillInputBuffer;
+    #####: 1178:	sp->libjpeg_jpeg_source_mgr.skip_input_data=OJPEGLibjpegJpegSourceMgrSkipInputData;
+    #####: 1179:	sp->libjpeg_jpeg_source_mgr.resync_to_restart=OJPEGLibjpegJpegSourceMgrResyncToRestart;
+    #####: 1180:	sp->libjpeg_jpeg_source_mgr.term_source=OJPEGLibjpegJpegSourceMgrTermSource;
+    #####: 1181:	sp->libjpeg_jpeg_decompress_struct.src=&(sp->libjpeg_jpeg_source_mgr);
+    #####: 1182:	if (jpeg_read_header_encap(sp,&(sp->libjpeg_jpeg_decompress_struct),1)==0)
+    #####: 1183:		return(0);
+    #####: 1184:	if ((sp->subsampling_force_desubsampling_inside_decompression==0) && (sp->samples_per_pixel_per_plane>1))
+        -: 1185:	{
+    #####: 1186:		sp->libjpeg_jpeg_decompress_struct.raw_data_out=1;
+        -: 1187:#if JPEG_LIB_VERSION >= 70
+    #####: 1188:		sp->libjpeg_jpeg_decompress_struct.do_fancy_upsampling=FALSE;
+        -: 1189:#endif
+    #####: 1190:		sp->libjpeg_jpeg_query_style=0;
+    #####: 1191:		if (sp->subsampling_convert_log==0)
+        -: 1192:		{
+    #####: 1193:			assert(sp->subsampling_convert_ycbcrbuf==0);
+    #####: 1194:			assert(sp->subsampling_convert_ycbcrimage==0);
+    #####: 1195:			sp->subsampling_convert_ylinelen=((sp->strile_width+sp->subsampling_hor*8-1)/(sp->subsampling_hor*8)*sp->subsampling_hor*8);
+    #####: 1196:			sp->subsampling_convert_ylines=sp->subsampling_ver*8;
+    #####: 1197:			sp->subsampling_convert_clinelen=sp->subsampling_convert_ylinelen/sp->subsampling_hor;
+    #####: 1198:			sp->subsampling_convert_clines=8;
+    #####: 1199:			sp->subsampling_convert_ybuflen=sp->subsampling_convert_ylinelen*sp->subsampling_convert_ylines;
+    #####: 1200:			sp->subsampling_convert_cbuflen=sp->subsampling_convert_clinelen*sp->subsampling_convert_clines;
+    #####: 1201:			sp->subsampling_convert_ycbcrbuflen=sp->subsampling_convert_ybuflen+2*sp->subsampling_convert_cbuflen;
+    #####: 1202:			sp->subsampling_convert_ycbcrbuf=_TIFFmalloc(sp->subsampling_convert_ycbcrbuflen);
+    #####: 1203:			if (sp->subsampling_convert_ycbcrbuf==0)
+        -: 1204:			{
+    #####: 1205:				TIFFErrorExt(tif->tif_clientdata,module,"Out of memory");
+    #####: 1206:				return(0);
+        -: 1207:			}
+    #####: 1208:			sp->subsampling_convert_ybuf=sp->subsampling_convert_ycbcrbuf;
+    #####: 1209:			sp->subsampling_convert_cbbuf=sp->subsampling_convert_ybuf+sp->subsampling_convert_ybuflen;
+    #####: 1210:			sp->subsampling_convert_crbuf=sp->subsampling_convert_cbbuf+sp->subsampling_convert_cbuflen;
+    #####: 1211:			sp->subsampling_convert_ycbcrimagelen=3+sp->subsampling_convert_ylines+2*sp->subsampling_convert_clines;
+    #####: 1212:			sp->subsampling_convert_ycbcrimage=_TIFFmalloc(sp->subsampling_convert_ycbcrimagelen*sizeof(uint8*));
+    #####: 1213:			if (sp->subsampling_convert_ycbcrimage==0)
+        -: 1214:			{
+    #####: 1215:				TIFFErrorExt(tif->tif_clientdata,module,"Out of memory");
+    #####: 1216:				return(0);
+        -: 1217:			}
+    #####: 1218:			m=sp->subsampling_convert_ycbcrimage;
+    #####: 1219:			*m++=(uint8*)(sp->subsampling_convert_ycbcrimage+3);
+    #####: 1220:			*m++=(uint8*)(sp->subsampling_convert_ycbcrimage+3+sp->subsampling_convert_ylines);
+    #####: 1221:			*m++=(uint8*)(sp->subsampling_convert_ycbcrimage+3+sp->subsampling_convert_ylines+sp->subsampling_convert_clines);
+    #####: 1222:			for (n=0; n<sp->subsampling_convert_ylines; n++)
+    #####: 1223:				*m++=sp->subsampling_convert_ybuf+n*sp->subsampling_convert_ylinelen;
+    #####: 1224:			for (n=0; n<sp->subsampling_convert_clines; n++)
+    #####: 1225:				*m++=sp->subsampling_convert_cbbuf+n*sp->subsampling_convert_clinelen;
+    #####: 1226:			for (n=0; n<sp->subsampling_convert_clines; n++)
+    #####: 1227:				*m++=sp->subsampling_convert_crbuf+n*sp->subsampling_convert_clinelen;
+    #####: 1228:			sp->subsampling_convert_clinelenout=((sp->strile_width+sp->subsampling_hor-1)/sp->subsampling_hor);
+    #####: 1229:			sp->subsampling_convert_state=0;
+    #####: 1230:			sp->bytes_per_line=sp->subsampling_convert_clinelenout*(sp->subsampling_ver*sp->subsampling_hor+2);
+    #####: 1231:			sp->lines_per_strile=((sp->strile_length+sp->subsampling_ver-1)/sp->subsampling_ver);
+    #####: 1232:			sp->subsampling_convert_log=1;
+        -: 1233:		}
+        -: 1234:	}
+        -: 1235:	else
+        -: 1236:	{
+    #####: 1237:		sp->libjpeg_jpeg_decompress_struct.jpeg_color_space=JCS_UNKNOWN;
+    #####: 1238:		sp->libjpeg_jpeg_decompress_struct.out_color_space=JCS_UNKNOWN;
+    #####: 1239:		sp->libjpeg_jpeg_query_style=1;
+    #####: 1240:		sp->bytes_per_line=sp->samples_per_pixel_per_plane*sp->strile_width;
+    #####: 1241:		sp->lines_per_strile=sp->strile_length;
+        -: 1242:	}
+    #####: 1243:	if (jpeg_start_decompress_encap(sp,&(sp->libjpeg_jpeg_decompress_struct))==0)
+    #####: 1244:		return(0);
+    #####: 1245:	sp->writeheader_done=1;
+    #####: 1246:	return(1);
+        -: 1247:}
+        -: 1248:
+        -: 1249:static void
+    #####: 1250:OJPEGLibjpegSessionAbort(TIFF* tif)
+        -: 1251:{
+    #####: 1252:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1253:	assert(sp->libjpeg_session_active!=0);
+    #####: 1254:	jpeg_destroy((jpeg_common_struct*)(&(sp->libjpeg_jpeg_decompress_struct)));
+    #####: 1255:	sp->libjpeg_session_active=0;
+    #####: 1256:}
+        -: 1257:
+        -: 1258:static int
+    #####: 1259:OJPEGReadHeaderInfoSec(TIFF* tif)
+        -: 1260:{
+        -: 1261:	static const char module[]="OJPEGReadHeaderInfoSec";
+    #####: 1262:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1263:	uint8 m;
+    #####: 1264:	uint16 n;
+        -: 1265:	uint8 o;
+    #####: 1266:	if (sp->file_size==0)
+    #####: 1267:		sp->file_size=TIFFGetFileSize(tif);
+    #####: 1268:	if (sp->jpeg_interchange_format!=0)
+        -: 1269:	{
+    #####: 1270:		if (sp->jpeg_interchange_format>=sp->file_size)
+        -: 1271:		{
+    #####: 1272:			sp->jpeg_interchange_format=0;
+    #####: 1273:			sp->jpeg_interchange_format_length=0;
+        -: 1274:		}
+        -: 1275:		else
+        -: 1276:		{
+    #####: 1277:			if ((sp->jpeg_interchange_format_length==0) || (sp->jpeg_interchange_format+sp->jpeg_interchange_format_length>sp->file_size))
+    #####: 1278:				sp->jpeg_interchange_format_length=sp->file_size-sp->jpeg_interchange_format;
+        -: 1279:		}
+        -: 1280:	}
+    #####: 1281:	sp->in_buffer_source=osibsNotSetYet;
+    #####: 1282:	sp->in_buffer_next_strile=0;
+    #####: 1283:	sp->in_buffer_strile_count=tif->tif_dir.td_nstrips;
+    #####: 1284:	sp->in_buffer_file_togo=0;
+    #####: 1285:	sp->in_buffer_togo=0;
+        -: 1286:	do
+        -: 1287:	{
+    #####: 1288:		if (OJPEGReadBytePeek(sp,&m)==0)
+    #####: 1289:			return(0);
+    #####: 1290:		if (m!=255)
+    #####: 1291:			break;
+    #####: 1292:		OJPEGReadByteAdvance(sp);
+        -: 1293:		do
+        -: 1294:		{
+    #####: 1295:			if (OJPEGReadByte(sp,&m)==0)
+    #####: 1296:				return(0);
+    #####: 1297:		} while(m==255);
+    #####: 1298:		switch(m)
+        -: 1299:		{
+    #####: 1300:			case JPEG_MARKER_SOI:
+        -: 1301:				/* this type of marker has no data, and should be skipped */
+    #####: 1302:				break;
+    #####: 1303:			case JPEG_MARKER_COM:
+        -: 1304:			case JPEG_MARKER_APP0:
+        -: 1305:			case JPEG_MARKER_APP0+1:
+        -: 1306:			case JPEG_MARKER_APP0+2:
+        -: 1307:			case JPEG_MARKER_APP0+3:
+        -: 1308:			case JPEG_MARKER_APP0+4:
+        -: 1309:			case JPEG_MARKER_APP0+5:
+        -: 1310:			case JPEG_MARKER_APP0+6:
+        -: 1311:			case JPEG_MARKER_APP0+7:
+        -: 1312:			case JPEG_MARKER_APP0+8:
+        -: 1313:			case JPEG_MARKER_APP0+9:
+        -: 1314:			case JPEG_MARKER_APP0+10:
+        -: 1315:			case JPEG_MARKER_APP0+11:
+        -: 1316:			case JPEG_MARKER_APP0+12:
+        -: 1317:			case JPEG_MARKER_APP0+13:
+        -: 1318:			case JPEG_MARKER_APP0+14:
+        -: 1319:			case JPEG_MARKER_APP0+15:
+        -: 1320:				/* this type of marker has data, but it has no use to us (and no place here) and should be skipped */
+    #####: 1321:				if (OJPEGReadWord(sp,&n)==0)
+    #####: 1322:					return(0);
+    #####: 1323:				if (n<2)
+        -: 1324:				{
+    #####: 1325:					if (sp->subsamplingcorrect==0)
+    #####: 1326:						TIFFErrorExt(tif->tif_clientdata,module,"Corrupt JPEG data");
+    #####: 1327:					return(0);
+        -: 1328:				}
+    #####: 1329:				if (n>2)
+    #####: 1330:					OJPEGReadSkip(sp,n-2);
+    #####: 1331:				break;
+    #####: 1332:			case JPEG_MARKER_DRI:
+    #####: 1333:				if (OJPEGReadHeaderInfoSecStreamDri(tif)==0)
+    #####: 1334:					return(0);
+    #####: 1335:				break;
+    #####: 1336:			case JPEG_MARKER_DQT:
+    #####: 1337:				if (OJPEGReadHeaderInfoSecStreamDqt(tif)==0)
+    #####: 1338:					return(0);
+    #####: 1339:				break;
+    #####: 1340:			case JPEG_MARKER_DHT:
+    #####: 1341:				if (OJPEGReadHeaderInfoSecStreamDht(tif)==0)
+    #####: 1342:					return(0);
+    #####: 1343:				break;
+    #####: 1344:			case JPEG_MARKER_SOF0:
+        -: 1345:			case JPEG_MARKER_SOF1:
+        -: 1346:			case JPEG_MARKER_SOF3:
+    #####: 1347:				if (OJPEGReadHeaderInfoSecStreamSof(tif,m)==0)
+    #####: 1348:					return(0);
+    #####: 1349:				if (sp->subsamplingcorrect!=0)
+    #####: 1350:					return(1);
+    #####: 1351:				break;
+    #####: 1352:			case JPEG_MARKER_SOS:
+    #####: 1353:				if (sp->subsamplingcorrect!=0)
+    #####: 1354:					return(1);
+    #####: 1355:				assert(sp->plane_sample_offset==0);
+    #####: 1356:				if (OJPEGReadHeaderInfoSecStreamSos(tif)==0)
+    #####: 1357:					return(0);
+    #####: 1358:				break;
+    #####: 1359:			default:
+    #####: 1360:				TIFFErrorExt(tif->tif_clientdata,module,"Unknown marker type %d in JPEG data",m);
+    #####: 1361:				return(0);
+        -: 1362:		}
+    #####: 1363:	} while(m!=JPEG_MARKER_SOS);
+    #####: 1364:	if (sp->subsamplingcorrect)
+    #####: 1365:		return(1);
+    #####: 1366:	if (sp->sof_log==0)
+        -: 1367:	{
+    #####: 1368:		if (OJPEGReadHeaderInfoSecTablesQTable(tif)==0)
+    #####: 1369:			return(0);
+    #####: 1370:		sp->sof_marker_id=JPEG_MARKER_SOF0;
+    #####: 1371:		for (o=0; o<sp->samples_per_pixel; o++)
+    #####: 1372:			sp->sof_c[o]=o;
+    #####: 1373:		sp->sof_hv[0]=((sp->subsampling_hor<<4)|sp->subsampling_ver);
+    #####: 1374:		for (o=1; o<sp->samples_per_pixel; o++)
+    #####: 1375:			sp->sof_hv[o]=17;
+    #####: 1376:		sp->sof_x=sp->strile_width;
+    #####: 1377:		sp->sof_y=sp->strile_length_total;
+    #####: 1378:		sp->sof_log=1;
+    #####: 1379:		if (OJPEGReadHeaderInfoSecTablesDcTable(tif)==0)
+    #####: 1380:			return(0);
+    #####: 1381:		if (OJPEGReadHeaderInfoSecTablesAcTable(tif)==0)
+    #####: 1382:			return(0);
+    #####: 1383:		for (o=1; o<sp->samples_per_pixel; o++)
+    #####: 1384:			sp->sos_cs[o]=o;
+        -: 1385:	}
+    #####: 1386:	return(1);
+        -: 1387:}
+        -: 1388:
+        -: 1389:static int
+    #####: 1390:OJPEGReadHeaderInfoSecStreamDri(TIFF* tif)
+        -: 1391:{
+        -: 1392:	/* This could easily cause trouble in some cases... but no such cases have
+        -: 1393:           occurred so far */
+        -: 1394:	static const char module[]="OJPEGReadHeaderInfoSecStreamDri";
+    #####: 1395:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1396:	uint16 m;
+    #####: 1397:	if (OJPEGReadWord(sp,&m)==0)
+    #####: 1398:		return(0);
+    #####: 1399:	if (m!=4)
+        -: 1400:	{
+    #####: 1401:		TIFFErrorExt(tif->tif_clientdata,module,"Corrupt DRI marker in JPEG data");
+    #####: 1402:		return(0);
+        -: 1403:	}
+    #####: 1404:	if (OJPEGReadWord(sp,&m)==0)
+    #####: 1405:		return(0);
+    #####: 1406:	sp->restart_interval=m;
+    #####: 1407:	return(1);
+        -: 1408:}
+        -: 1409:
+        -: 1410:static int
+    #####: 1411:OJPEGReadHeaderInfoSecStreamDqt(TIFF* tif)
+        -: 1412:{
+        -: 1413:	/* this is a table marker, and it is to be saved as a whole for exact pushing on the jpeg stream later on */
+        -: 1414:	static const char module[]="OJPEGReadHeaderInfoSecStreamDqt";
+    #####: 1415:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1416:	uint16 m;
+        -: 1417:	uint32 na;
+        -: 1418:	uint8* nb;
+        -: 1419:	uint8 o;
+    #####: 1420:	if (OJPEGReadWord(sp,&m)==0)
+    #####: 1421:		return(0);
+    #####: 1422:	if (m<=2)
+        -: 1423:	{
+    #####: 1424:		if (sp->subsamplingcorrect==0)
+    #####: 1425:			TIFFErrorExt(tif->tif_clientdata,module,"Corrupt DQT marker in JPEG data");
+    #####: 1426:		return(0);
+        -: 1427:	}
+    #####: 1428:	if (sp->subsamplingcorrect!=0)
+    #####: 1429:		OJPEGReadSkip(sp,m-2);
+        -: 1430:	else
+        -: 1431:	{
+    #####: 1432:		m-=2;
+        -: 1433:		do
+        -: 1434:		{
+    #####: 1435:			if (m<65)
+        -: 1436:			{
+    #####: 1437:				TIFFErrorExt(tif->tif_clientdata,module,"Corrupt DQT marker in JPEG data");
+    #####: 1438:				return(0);
+        -: 1439:			}
+    #####: 1440:			na=sizeof(uint32)+69;
+    #####: 1441:			nb=_TIFFmalloc(na);
+    #####: 1442:			if (nb==0)
+        -: 1443:			{
+    #####: 1444:				TIFFErrorExt(tif->tif_clientdata,module,"Out of memory");
+    #####: 1445:				return(0);
+        -: 1446:			}
+    #####: 1447:			*(uint32*)nb=na;
+    #####: 1448:			nb[sizeof(uint32)]=255;
+    #####: 1449:			nb[sizeof(uint32)+1]=JPEG_MARKER_DQT;
+    #####: 1450:			nb[sizeof(uint32)+2]=0;
+    #####: 1451:			nb[sizeof(uint32)+3]=67;
+    #####: 1452:			if (OJPEGReadBlock(sp,65,&nb[sizeof(uint32)+4])==0) {
+    #####: 1453:				_TIFFfree(nb);
+    #####: 1454:				return(0);
+        -: 1455:			}
+    #####: 1456:			o=nb[sizeof(uint32)+4]&15;
+    #####: 1457:			if (3<o)
+        -: 1458:			{
+    #####: 1459:				TIFFErrorExt(tif->tif_clientdata,module,"Corrupt DQT marker in JPEG data");
+    #####: 1460:				_TIFFfree(nb);
+    #####: 1461:				return(0);
+        -: 1462:			}
+    #####: 1463:			if (sp->qtable[o]!=0)
+    #####: 1464:				_TIFFfree(sp->qtable[o]);
+    #####: 1465:			sp->qtable[o]=nb;
+    #####: 1466:			m-=65;
+    #####: 1467:		} while(m>0);
+        -: 1468:	}
+    #####: 1469:	return(1);
+        -: 1470:}
+        -: 1471:
+        -: 1472:static int
+    #####: 1473:OJPEGReadHeaderInfoSecStreamDht(TIFF* tif)
+        -: 1474:{
+        -: 1475:	/* this is a table marker, and it is to be saved as a whole for exact pushing on the jpeg stream later on */
+        -: 1476:	/* TODO: the following assumes there is only one table in this marker... but i'm not quite sure that assumption is guaranteed correct */
+        -: 1477:	static const char module[]="OJPEGReadHeaderInfoSecStreamDht";
+    #####: 1478:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1479:	uint16 m;
+        -: 1480:	uint32 na;
+        -: 1481:	uint8* nb;
+        -: 1482:	uint8 o;
+    #####: 1483:	if (OJPEGReadWord(sp,&m)==0)
+    #####: 1484:		return(0);
+    #####: 1485:	if (m<=2)
+        -: 1486:	{
+    #####: 1487:		if (sp->subsamplingcorrect==0)
+    #####: 1488:			TIFFErrorExt(tif->tif_clientdata,module,"Corrupt DHT marker in JPEG data");
+    #####: 1489:		return(0);
+        -: 1490:	}
+    #####: 1491:	if (sp->subsamplingcorrect!=0)
+        -: 1492:	{
+    #####: 1493:		OJPEGReadSkip(sp,m-2);
+        -: 1494:	}
+        -: 1495:	else
+        -: 1496:	{
+    #####: 1497:		na=sizeof(uint32)+2+m;
+    #####: 1498:		nb=_TIFFmalloc(na);
+    #####: 1499:		if (nb==0)
+        -: 1500:		{
+    #####: 1501:			TIFFErrorExt(tif->tif_clientdata,module,"Out of memory");
+    #####: 1502:			return(0);
+        -: 1503:		}
+    #####: 1504:		*(uint32*)nb=na;
+    #####: 1505:		nb[sizeof(uint32)]=255;
+    #####: 1506:		nb[sizeof(uint32)+1]=JPEG_MARKER_DHT;
+    #####: 1507:		nb[sizeof(uint32)+2]=(m>>8);
+    #####: 1508:		nb[sizeof(uint32)+3]=(m&255);
+    #####: 1509:		if (OJPEGReadBlock(sp,m-2,&nb[sizeof(uint32)+4])==0) {
+    #####: 1510:                        _TIFFfree(nb);
+    #####: 1511:			return(0);
+        -: 1512:                }
+    #####: 1513:		o=nb[sizeof(uint32)+4];
+    #####: 1514:		if ((o&240)==0)
+        -: 1515:		{
+    #####: 1516:			if (3<o)
+        -: 1517:			{
+    #####: 1518:				TIFFErrorExt(tif->tif_clientdata,module,"Corrupt DHT marker in JPEG data");
+    #####: 1519:                                _TIFFfree(nb);
+    #####: 1520:				return(0);
+        -: 1521:			}
+    #####: 1522:			if (sp->dctable[o]!=0)
+    #####: 1523:				_TIFFfree(sp->dctable[o]);
+    #####: 1524:			sp->dctable[o]=nb;
+        -: 1525:		}
+        -: 1526:		else
+        -: 1527:		{
+    #####: 1528:			if ((o&240)!=16)
+        -: 1529:			{
+    #####: 1530:				TIFFErrorExt(tif->tif_clientdata,module,"Corrupt DHT marker in JPEG data");
+    #####: 1531:                                _TIFFfree(nb);
+    #####: 1532:				return(0);
+        -: 1533:			}
+    #####: 1534:			o&=15;
+    #####: 1535:			if (3<o)
+        -: 1536:			{
+    #####: 1537:				TIFFErrorExt(tif->tif_clientdata,module,"Corrupt DHT marker in JPEG data");
+    #####: 1538:                                _TIFFfree(nb);
+    #####: 1539:				return(0);
+        -: 1540:			}
+    #####: 1541:			if (sp->actable[o]!=0)
+    #####: 1542:				_TIFFfree(sp->actable[o]);
+    #####: 1543:			sp->actable[o]=nb;
+        -: 1544:		}
+        -: 1545:	}
+    #####: 1546:	return(1);
+        -: 1547:}
+        -: 1548:
+        -: 1549:static int
+    #####: 1550:OJPEGReadHeaderInfoSecStreamSof(TIFF* tif, uint8 marker_id)
+        -: 1551:{
+        -: 1552:	/* this marker needs to be checked, and part of its data needs to be saved for regeneration later on */
+        -: 1553:	static const char module[]="OJPEGReadHeaderInfoSecStreamSof";
+    #####: 1554:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1555:	uint16 m;
+        -: 1556:	uint16 n;
+    #####: 1557:	uint8 o;
+    #####: 1558:	uint16 p;
+        -: 1559:	uint16 q;
+    #####: 1560:	if (sp->sof_log!=0)
+        -: 1561:	{
+    #####: 1562:		TIFFErrorExt(tif->tif_clientdata,module,"Corrupt JPEG data");
+    #####: 1563:		return(0);
+        -: 1564:	}
+    #####: 1565:	if (sp->subsamplingcorrect==0)
+    #####: 1566:		sp->sof_marker_id=marker_id;
+        -: 1567:	/* Lf: data length */
+    #####: 1568:	if (OJPEGReadWord(sp,&m)==0)
+    #####: 1569:		return(0);
+    #####: 1570:	if (m<11)
+        -: 1571:	{
+    #####: 1572:		if (sp->subsamplingcorrect==0)
+    #####: 1573:			TIFFErrorExt(tif->tif_clientdata,module,"Corrupt SOF marker in JPEG data");
+    #####: 1574:		return(0);
+        -: 1575:	}
+    #####: 1576:	m-=8;
+    #####: 1577:	if (m%3!=0)
+        -: 1578:	{
+    #####: 1579:		if (sp->subsamplingcorrect==0)
+    #####: 1580:			TIFFErrorExt(tif->tif_clientdata,module,"Corrupt SOF marker in JPEG data");
+    #####: 1581:		return(0);
+        -: 1582:	}
+    #####: 1583:	n=m/3;
+    #####: 1584:	if (sp->subsamplingcorrect==0)
+        -: 1585:	{
+    #####: 1586:		if (n!=sp->samples_per_pixel)
+        -: 1587:		{
+    #####: 1588:			TIFFErrorExt(tif->tif_clientdata,module,"JPEG compressed data indicates unexpected number of samples");
+    #####: 1589:			return(0);
+        -: 1590:		}
+        -: 1591:	}
+        -: 1592:	/* P: Sample precision */
+    #####: 1593:	if (OJPEGReadByte(sp,&o)==0)
+    #####: 1594:		return(0);
+    #####: 1595:	if (o!=8)
+        -: 1596:	{
+    #####: 1597:		if (sp->subsamplingcorrect==0)
+    #####: 1598:			TIFFErrorExt(tif->tif_clientdata,module,"JPEG compressed data indicates unexpected number of bits per sample");
+    #####: 1599:		return(0);
+        -: 1600:	}
+        -: 1601:	/* Y: Number of lines, X: Number of samples per line */
+    #####: 1602:	if (sp->subsamplingcorrect)
+    #####: 1603:		OJPEGReadSkip(sp,4);
+        -: 1604:	else
+        -: 1605:	{
+        -: 1606:		/* Y: Number of lines */
+    #####: 1607:		if (OJPEGReadWord(sp,&p)==0)
+    #####: 1608:			return(0);
+    #####: 1609:		if (((uint32)p<sp->image_length) && ((uint32)p<sp->strile_length_total))
+        -: 1610:		{
+    #####: 1611:			TIFFErrorExt(tif->tif_clientdata,module,"JPEG compressed data indicates unexpected height");
+    #####: 1612:			return(0);
+        -: 1613:		}
+    #####: 1614:		sp->sof_y=p;
+        -: 1615:		/* X: Number of samples per line */
+    #####: 1616:		if (OJPEGReadWord(sp,&p)==0)
+    #####: 1617:			return(0);
+    #####: 1618:		if (((uint32)p<sp->image_width) && ((uint32)p<sp->strile_width))
+        -: 1619:		{
+    #####: 1620:			TIFFErrorExt(tif->tif_clientdata,module,"JPEG compressed data indicates unexpected width");
+    #####: 1621:			return(0);
+        -: 1622:		}
+    #####: 1623:		if ((uint32)p>sp->strile_width)
+        -: 1624:		{
+    #####: 1625:			TIFFErrorExt(tif->tif_clientdata,module,"JPEG compressed data image width exceeds expected image width");
+    #####: 1626:			return(0);
+        -: 1627:		}
+    #####: 1628:		sp->sof_x=p;
+        -: 1629:	}
+        -: 1630:	/* Nf: Number of image components in frame */
+    #####: 1631:	if (OJPEGReadByte(sp,&o)==0)
+    #####: 1632:		return(0);
+    #####: 1633:	if (o!=n)
+        -: 1634:	{
+    #####: 1635:		if (sp->subsamplingcorrect==0)
+    #####: 1636:			TIFFErrorExt(tif->tif_clientdata,module,"Corrupt SOF marker in JPEG data");
+    #####: 1637:		return(0);
+        -: 1638:	}
+        -: 1639:	/* per component stuff */
+        -: 1640:	/* TODO: double-check that flow implies that n cannot be as big as to make us overflow sof_c, sof_hv and sof_tq arrays */
+    #####: 1641:	for (q=0; q<n; q++)
+        -: 1642:	{
+        -: 1643:		/* C: Component identifier */
+    #####: 1644:		if (OJPEGReadByte(sp,&o)==0)
+    #####: 1645:			return(0);
+    #####: 1646:		if (sp->subsamplingcorrect==0)
+    #####: 1647:			sp->sof_c[q]=o;
+        -: 1648:		/* H: Horizontal sampling factor, and V: Vertical sampling factor */
+    #####: 1649:		if (OJPEGReadByte(sp,&o)==0)
+    #####: 1650:			return(0);
+    #####: 1651:		if (sp->subsamplingcorrect!=0)
+        -: 1652:		{
+    #####: 1653:			if (q==0)
+        -: 1654:			{
+    #####: 1655:				sp->subsampling_hor=(o>>4);
+    #####: 1656:				sp->subsampling_ver=(o&15);
+    #####: 1657:				if (((sp->subsampling_hor!=1) && (sp->subsampling_hor!=2) && (sp->subsampling_hor!=4)) ||
+    #####: 1658:					((sp->subsampling_ver!=1) && (sp->subsampling_ver!=2) && (sp->subsampling_ver!=4)))
+    #####: 1659:					sp->subsampling_force_desubsampling_inside_decompression=1;
+        -: 1660:			}
+        -: 1661:			else
+        -: 1662:			{
+    #####: 1663:				if (o!=17)
+    #####: 1664:					sp->subsampling_force_desubsampling_inside_decompression=1;
+        -: 1665:			}
+        -: 1666:		}
+        -: 1667:		else
+        -: 1668:		{
+    #####: 1669:			sp->sof_hv[q]=o;
+    #####: 1670:			if (sp->subsampling_force_desubsampling_inside_decompression==0)
+        -: 1671:			{
+    #####: 1672:				if (q==0)
+        -: 1673:				{
+    #####: 1674:					if (o!=((sp->subsampling_hor<<4)|sp->subsampling_ver))
+        -: 1675:					{
+    #####: 1676:						TIFFErrorExt(tif->tif_clientdata,module,"JPEG compressed data indicates unexpected subsampling values");
+    #####: 1677:						return(0);
+        -: 1678:					}
+        -: 1679:				}
+        -: 1680:				else
+        -: 1681:				{
+    #####: 1682:					if (o!=17)
+        -: 1683:					{
+    #####: 1684:						TIFFErrorExt(tif->tif_clientdata,module,"JPEG compressed data indicates unexpected subsampling values");
+    #####: 1685:						return(0);
+        -: 1686:					}
+        -: 1687:				}
+        -: 1688:			}
+        -: 1689:		}
+        -: 1690:		/* Tq: Quantization table destination selector */
+    #####: 1691:		if (OJPEGReadByte(sp,&o)==0)
+    #####: 1692:			return(0);
+    #####: 1693:		if (sp->subsamplingcorrect==0)
+    #####: 1694:			sp->sof_tq[q]=o;
+        -: 1695:	}
+    #####: 1696:	if (sp->subsamplingcorrect==0)
+    #####: 1697:		sp->sof_log=1;
+    #####: 1698:	return(1);
+        -: 1699:}
+        -: 1700:
+        -: 1701:static int
+    #####: 1702:OJPEGReadHeaderInfoSecStreamSos(TIFF* tif)
+        -: 1703:{
+        -: 1704:	/* this marker needs to be checked, and part of its data needs to be saved for regeneration later on */
+        -: 1705:	static const char module[]="OJPEGReadHeaderInfoSecStreamSos";
+    #####: 1706:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 1707:	uint16 m;
+    #####: 1708:	uint8 n;
+        -: 1709:	uint8 o;
+    #####: 1710:	assert(sp->subsamplingcorrect==0);
+    #####: 1711:	if (sp->sof_log==0)
+        -: 1712:	{
+    #####: 1713:		TIFFErrorExt(tif->tif_clientdata,module,"Corrupt SOS marker in JPEG data");
+    #####: 1714:		return(0);
+        -: 1715:	}
+        -: 1716:	/* Ls */
+    #####: 1717:	if (OJPEGReadWord(sp,&m)==0)
+    #####: 1718:		return(0);
+    #####: 1719:	if (m!=6+sp->samples_per_pixel_per_plane*2)
+        -: 1720:	{
+    #####: 1721:		TIFFErrorExt(tif->tif_clientdata,module,"Corrupt SOS marker in JPEG data");
+    #####: 1722:		return(0);
+        -: 1723:	}
+        -: 1724:	/* Ns */
+    #####: 1725:	if (OJPEGReadByte(sp,&n)==0)
+    #####: 1726:		return(0);
+    #####: 1727:	if (n!=sp->samples_per_pixel_per_plane)
+        -: 1728:	{
+    #####: 1729:		TIFFErrorExt(tif->tif_clientdata,module,"Corrupt SOS marker in JPEG data");
+    #####: 1730:		return(0);
+        -: 1731:	}
+        -: 1732:	/* Cs, Td, and Ta */
+    #####: 1733:	for (o=0; o<sp->samples_per_pixel_per_plane; o++)
+        -: 1734:	{
+        -: 1735:		/* Cs */
+    #####: 1736:		if (OJPEGReadByte(sp,&n)==0)
+    #####: 1737:			return(0);
+    #####: 1738:		sp->sos_cs[sp->plane_sample_offset+o]=n;
+        -: 1739:		/* Td and Ta */
+    #####: 1740:		if (OJPEGReadByte(sp,&n)==0)
+    #####: 1741:			return(0);
+    #####: 1742:		sp->sos_tda[sp->plane_sample_offset+o]=n;
+        -: 1743:	}
+        -: 1744:	/* skip Ss, Se, Ah, en Al -> no check, as per Tom Lane recommendation, as per LibJpeg source */
+    #####: 1745:	OJPEGReadSkip(sp,3);
+    #####: 1746:	return(1);
+        -: 1747:}
+        -: 1748:
+        -: 1749:static int
+    #####: 1750:OJPEGReadHeaderInfoSecTablesQTable(TIFF* tif)
+        -: 1751:{
+        -: 1752:	static const char module[]="OJPEGReadHeaderInfoSecTablesQTable";
+    #####: 1753:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 1754:	uint8 m;
+        -: 1755:	uint8 n;
+        -: 1756:	uint32 oa;
+        -: 1757:	uint8* ob;
+        -: 1758:	uint32 p;
+    #####: 1759:	if (sp->qtable_offset[0]==0)
+        -: 1760:	{
+    #####: 1761:		TIFFErrorExt(tif->tif_clientdata,module,"Missing JPEG tables");
+    #####: 1762:		return(0);
+        -: 1763:	}
+    #####: 1764:	sp->in_buffer_file_pos_log=0;
+    #####: 1765:	for (m=0; m<sp->samples_per_pixel; m++)
+        -: 1766:	{
+    #####: 1767:		if ((sp->qtable_offset[m]!=0) && ((m==0) || (sp->qtable_offset[m]!=sp->qtable_offset[m-1])))
+        -: 1768:		{
+    #####: 1769:			for (n=0; n<m-1; n++)
+        -: 1770:			{
+    #####: 1771:				if (sp->qtable_offset[m]==sp->qtable_offset[n])
+        -: 1772:				{
+    #####: 1773:					TIFFErrorExt(tif->tif_clientdata,module,"Corrupt JpegQTables tag value");
+    #####: 1774:					return(0);
+        -: 1775:				}
+        -: 1776:			}
+    #####: 1777:			oa=sizeof(uint32)+69;
+    #####: 1778:			ob=_TIFFmalloc(oa);
+    #####: 1779:			if (ob==0)
+        -: 1780:			{
+    #####: 1781:				TIFFErrorExt(tif->tif_clientdata,module,"Out of memory");
+    #####: 1782:				return(0);
+        -: 1783:			}
+    #####: 1784:			*(uint32*)ob=oa;
+    #####: 1785:			ob[sizeof(uint32)]=255;
+    #####: 1786:			ob[sizeof(uint32)+1]=JPEG_MARKER_DQT;
+    #####: 1787:			ob[sizeof(uint32)+2]=0;
+    #####: 1788:			ob[sizeof(uint32)+3]=67;
+    #####: 1789:			ob[sizeof(uint32)+4]=m;
+    #####: 1790:			TIFFSeekFile(tif,sp->qtable_offset[m],SEEK_SET); 
+    #####: 1791:			p=(uint32)TIFFReadFile(tif,&ob[sizeof(uint32)+5],64);
+    #####: 1792:			if (p!=64)
+    #####: 1793:				return(0);
+    #####: 1794:			sp->qtable[m]=ob;
+    #####: 1795:			sp->sof_tq[m]=m;
+        -: 1796:		}
+        -: 1797:		else
+    #####: 1798:			sp->sof_tq[m]=sp->sof_tq[m-1];
+        -: 1799:	}
+    #####: 1800:	return(1);
+        -: 1801:}
+        -: 1802:
+        -: 1803:static int
+    #####: 1804:OJPEGReadHeaderInfoSecTablesDcTable(TIFF* tif)
+        -: 1805:{
+        -: 1806:	static const char module[]="OJPEGReadHeaderInfoSecTablesDcTable";
+    #####: 1807:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 1808:	uint8 m;
+        -: 1809:	uint8 n;
+    #####: 1810:	uint8 o[16];
+        -: 1811:	uint32 p;
+        -: 1812:	uint32 q;
+        -: 1813:	uint32 ra;
+        -: 1814:	uint8* rb;
+    #####: 1815:	if (sp->dctable_offset[0]==0)
+        -: 1816:	{
+    #####: 1817:		TIFFErrorExt(tif->tif_clientdata,module,"Missing JPEG tables");
+    #####: 1818:		return(0);
+        -: 1819:	}
+    #####: 1820:	sp->in_buffer_file_pos_log=0;
+    #####: 1821:	for (m=0; m<sp->samples_per_pixel; m++)
+        -: 1822:	{
+    #####: 1823:		if ((sp->dctable_offset[m]!=0) && ((m==0) || (sp->dctable_offset[m]!=sp->dctable_offset[m-1])))
+        -: 1824:		{
+    #####: 1825:			for (n=0; n<m-1; n++)
+        -: 1826:			{
+    #####: 1827:				if (sp->dctable_offset[m]==sp->dctable_offset[n])
+        -: 1828:				{
+    #####: 1829:					TIFFErrorExt(tif->tif_clientdata,module,"Corrupt JpegDcTables tag value");
+    #####: 1830:					return(0);
+        -: 1831:				}
+        -: 1832:			}
+    #####: 1833:			TIFFSeekFile(tif,sp->dctable_offset[m],SEEK_SET);
+    #####: 1834:			p=(uint32)TIFFReadFile(tif,o,16);
+    #####: 1835:			if (p!=16)
+    #####: 1836:				return(0);
+    #####: 1837:			q=0;
+    #####: 1838:			for (n=0; n<16; n++)
+    #####: 1839:				q+=o[n];
+    #####: 1840:			ra=sizeof(uint32)+21+q;
+    #####: 1841:			rb=_TIFFmalloc(ra);
+    #####: 1842:			if (rb==0)
+        -: 1843:			{
+    #####: 1844:				TIFFErrorExt(tif->tif_clientdata,module,"Out of memory");
+    #####: 1845:				return(0);
+        -: 1846:			}
+    #####: 1847:			*(uint32*)rb=ra;
+    #####: 1848:			rb[sizeof(uint32)]=255;
+    #####: 1849:			rb[sizeof(uint32)+1]=JPEG_MARKER_DHT;
+    #####: 1850:			rb[sizeof(uint32)+2]=(uint8)((19+q)>>8);
+    #####: 1851:			rb[sizeof(uint32)+3]=((19+q)&255);
+    #####: 1852:			rb[sizeof(uint32)+4]=m;
+    #####: 1853:			for (n=0; n<16; n++)
+    #####: 1854:				rb[sizeof(uint32)+5+n]=o[n];
+    #####: 1855:			p=(uint32)TIFFReadFile(tif,&(rb[sizeof(uint32)+21]),q);
+    #####: 1856:			if (p!=q)
+    #####: 1857:				return(0);
+    #####: 1858:			sp->dctable[m]=rb;
+    #####: 1859:			sp->sos_tda[m]=(m<<4);
+        -: 1860:		}
+        -: 1861:		else
+    #####: 1862:			sp->sos_tda[m]=sp->sos_tda[m-1];
+        -: 1863:	}
+    #####: 1864:	return(1);
+        -: 1865:}
+        -: 1866:
+        -: 1867:static int
+    #####: 1868:OJPEGReadHeaderInfoSecTablesAcTable(TIFF* tif)
+        -: 1869:{
+        -: 1870:	static const char module[]="OJPEGReadHeaderInfoSecTablesAcTable";
+    #####: 1871:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 1872:	uint8 m;
+        -: 1873:	uint8 n;
+    #####: 1874:	uint8 o[16];
+        -: 1875:	uint32 p;
+        -: 1876:	uint32 q;
+        -: 1877:	uint32 ra;
+        -: 1878:	uint8* rb;
+    #####: 1879:	if (sp->actable_offset[0]==0)
+        -: 1880:	{
+    #####: 1881:		TIFFErrorExt(tif->tif_clientdata,module,"Missing JPEG tables");
+    #####: 1882:		return(0);
+        -: 1883:	}
+    #####: 1884:	sp->in_buffer_file_pos_log=0;
+    #####: 1885:	for (m=0; m<sp->samples_per_pixel; m++)
+        -: 1886:	{
+    #####: 1887:		if ((sp->actable_offset[m]!=0) && ((m==0) || (sp->actable_offset[m]!=sp->actable_offset[m-1])))
+        -: 1888:		{
+    #####: 1889:			for (n=0; n<m-1; n++)
+        -: 1890:			{
+    #####: 1891:				if (sp->actable_offset[m]==sp->actable_offset[n])
+        -: 1892:				{
+    #####: 1893:					TIFFErrorExt(tif->tif_clientdata,module,"Corrupt JpegAcTables tag value");
+    #####: 1894:					return(0);
+        -: 1895:				}
+        -: 1896:			}
+    #####: 1897:			TIFFSeekFile(tif,sp->actable_offset[m],SEEK_SET);  
+    #####: 1898:			p=(uint32)TIFFReadFile(tif,o,16);
+    #####: 1899:			if (p!=16)
+    #####: 1900:				return(0);
+    #####: 1901:			q=0;
+    #####: 1902:			for (n=0; n<16; n++)
+    #####: 1903:				q+=o[n];
+    #####: 1904:			ra=sizeof(uint32)+21+q;
+    #####: 1905:			rb=_TIFFmalloc(ra);
+    #####: 1906:			if (rb==0)
+        -: 1907:			{
+    #####: 1908:				TIFFErrorExt(tif->tif_clientdata,module,"Out of memory");
+    #####: 1909:				return(0);
+        -: 1910:			}
+    #####: 1911:			*(uint32*)rb=ra;
+    #####: 1912:			rb[sizeof(uint32)]=255;
+    #####: 1913:			rb[sizeof(uint32)+1]=JPEG_MARKER_DHT;
+    #####: 1914:			rb[sizeof(uint32)+2]=(uint8)((19+q)>>8);
+    #####: 1915:			rb[sizeof(uint32)+3]=((19+q)&255);
+    #####: 1916:			rb[sizeof(uint32)+4]=(16|m);
+    #####: 1917:			for (n=0; n<16; n++)
+    #####: 1918:				rb[sizeof(uint32)+5+n]=o[n];
+    #####: 1919:			p=(uint32)TIFFReadFile(tif,&(rb[sizeof(uint32)+21]),q);
+    #####: 1920:			if (p!=q)
+    #####: 1921:				return(0);
+    #####: 1922:			sp->actable[m]=rb;
+    #####: 1923:			sp->sos_tda[m]=(sp->sos_tda[m]|m);
+        -: 1924:		}
+        -: 1925:		else
+    #####: 1926:			sp->sos_tda[m]=(sp->sos_tda[m]|(sp->sos_tda[m-1]&15));
+        -: 1927:	}
+    #####: 1928:	return(1);
+        -: 1929:}
+        -: 1930:
+        -: 1931:static int
+    #####: 1932:OJPEGReadBufferFill(OJPEGState* sp)
+        -: 1933:{
+        -: 1934:	uint16 m;
+        -: 1935:	tmsize_t n;
+        -: 1936:	/* TODO: double-check: when subsamplingcorrect is set, no call to TIFFErrorExt or TIFFWarningExt should be made
+        -: 1937:	 * in any other case, seek or read errors should be passed through */
+        -: 1938:	do
+        -: 1939:	{
+    #####: 1940:		if (sp->in_buffer_file_togo!=0)
+        -: 1941:		{
+    #####: 1942:			if (sp->in_buffer_file_pos_log==0)
+        -: 1943:			{
+    #####: 1944:				TIFFSeekFile(sp->tif,sp->in_buffer_file_pos,SEEK_SET);
+    #####: 1945:				sp->in_buffer_file_pos_log=1;
+        -: 1946:			}
+    #####: 1947:			m=OJPEG_BUFFER;
+    #####: 1948:			if ((uint64)m>sp->in_buffer_file_togo)
+    #####: 1949:				m=(uint16)sp->in_buffer_file_togo;
+    #####: 1950:			n=TIFFReadFile(sp->tif,sp->in_buffer,(tmsize_t)m);
+    #####: 1951:			if (n==0)
+    #####: 1952:				return(0);
+    #####: 1953:			assert(n>0);
+    #####: 1954:			assert(n<=OJPEG_BUFFER);
+    #####: 1955:			assert(n<65536);
+    #####: 1956:			assert((uint64)n<=sp->in_buffer_file_togo);
+    #####: 1957:			m=(uint16)n;
+    #####: 1958:			sp->in_buffer_togo=m;
+    #####: 1959:			sp->in_buffer_cur=sp->in_buffer;
+    #####: 1960:			sp->in_buffer_file_togo-=m;
+    #####: 1961:			sp->in_buffer_file_pos+=m;
+    #####: 1962:			break;
+        -: 1963:		}
+    #####: 1964:		sp->in_buffer_file_pos_log=0;
+    #####: 1965:		switch(sp->in_buffer_source)
+        -: 1966:		{
+    #####: 1967:			case osibsNotSetYet:
+    #####: 1968:				if (sp->jpeg_interchange_format!=0)
+        -: 1969:				{
+    #####: 1970:					sp->in_buffer_file_pos=sp->jpeg_interchange_format;
+    #####: 1971:					sp->in_buffer_file_togo=sp->jpeg_interchange_format_length;
+        -: 1972:				}
+    #####: 1973:				sp->in_buffer_source=osibsJpegInterchangeFormat;
+    #####: 1974:				break;
+    #####: 1975:			case osibsJpegInterchangeFormat:
+    #####: 1976:				sp->in_buffer_source=osibsStrile;
+    #####: 1977:                                break;
+    #####: 1978:			case osibsStrile:
+    #####: 1979:				if (!_TIFFFillStriles( sp->tif ) 
+    #####: 1980:				    || sp->tif->tif_dir.td_stripoffset == NULL
+    #####: 1981:				    || sp->tif->tif_dir.td_stripbytecount == NULL)
+    #####: 1982:					return 0;
+        -: 1983:
+    #####: 1984:				if (sp->in_buffer_next_strile==sp->in_buffer_strile_count)
+    #####: 1985:					sp->in_buffer_source=osibsEof;
+        -: 1986:				else
+        -: 1987:				{
+    #####: 1988:					sp->in_buffer_file_pos=sp->tif->tif_dir.td_stripoffset[sp->in_buffer_next_strile];
+    #####: 1989:					if (sp->in_buffer_file_pos!=0)
+        -: 1990:					{
+    #####: 1991:						if (sp->in_buffer_file_pos>=sp->file_size)
+    #####: 1992:							sp->in_buffer_file_pos=0;
+    #####: 1993:						else if (sp->tif->tif_dir.td_stripbytecount==NULL)
+    #####: 1994:							sp->in_buffer_file_togo=sp->file_size-sp->in_buffer_file_pos;
+        -: 1995:						else
+        -: 1996:						{
+    #####: 1997:							if (sp->tif->tif_dir.td_stripbytecount == 0) {
+    #####: 1998:								TIFFErrorExt(sp->tif->tif_clientdata,sp->tif->tif_name,"Strip byte counts are missing");
+    #####: 1999:								return(0);
+        -: 2000:							}
+    #####: 2001:							sp->in_buffer_file_togo=sp->tif->tif_dir.td_stripbytecount[sp->in_buffer_next_strile];
+    #####: 2002:							if (sp->in_buffer_file_togo==0)
+    #####: 2003:								sp->in_buffer_file_pos=0;
+    #####: 2004:							else if (sp->in_buffer_file_pos+sp->in_buffer_file_togo>sp->file_size)
+    #####: 2005:								sp->in_buffer_file_togo=sp->file_size-sp->in_buffer_file_pos;
+        -: 2006:						}
+        -: 2007:					}
+    #####: 2008:					sp->in_buffer_next_strile++;
+        -: 2009:				}
+    #####: 2010:				break;
+    #####: 2011:			default:
+    #####: 2012:				return(0);
+        -: 2013:		}
+        -: 2014:	} while (1);
+    #####: 2015:	return(1);
+        -: 2016:}
+        -: 2017:
+        -: 2018:static int
+    #####: 2019:OJPEGReadByte(OJPEGState* sp, uint8* byte)
+        -: 2020:{
+    #####: 2021:	if (sp->in_buffer_togo==0)
+        -: 2022:	{
+    #####: 2023:		if (OJPEGReadBufferFill(sp)==0)
+    #####: 2024:			return(0);
+    #####: 2025:		assert(sp->in_buffer_togo>0);
+        -: 2026:	}
+    #####: 2027:	*byte=*(sp->in_buffer_cur);
+    #####: 2028:	sp->in_buffer_cur++;
+    #####: 2029:	sp->in_buffer_togo--;
+    #####: 2030:	return(1);
+        -: 2031:}
+        -: 2032:
+        -: 2033:static int
+    #####: 2034:OJPEGReadBytePeek(OJPEGState* sp, uint8* byte)
+        -: 2035:{
+    #####: 2036:	if (sp->in_buffer_togo==0)
+        -: 2037:	{
+    #####: 2038:		if (OJPEGReadBufferFill(sp)==0)
+    #####: 2039:			return(0);
+    #####: 2040:		assert(sp->in_buffer_togo>0);
+        -: 2041:	}
+    #####: 2042:	*byte=*(sp->in_buffer_cur);
+    #####: 2043:	return(1);
+        -: 2044:}
+        -: 2045:
+        -: 2046:static void
+    #####: 2047:OJPEGReadByteAdvance(OJPEGState* sp)
+        -: 2048:{
+    #####: 2049:	assert(sp->in_buffer_togo>0);
+    #####: 2050:	sp->in_buffer_cur++;
+    #####: 2051:	sp->in_buffer_togo--;
+    #####: 2052:}
+        -: 2053:
+        -: 2054:static int
+    #####: 2055:OJPEGReadWord(OJPEGState* sp, uint16* word)
+        -: 2056:{
+    #####: 2057:	uint8 m;
+    #####: 2058:	if (OJPEGReadByte(sp,&m)==0)
+    #####: 2059:		return(0);
+    #####: 2060:	*word=(m<<8);
+    #####: 2061:	if (OJPEGReadByte(sp,&m)==0)
+    #####: 2062:		return(0);
+    #####: 2063:	*word|=m;
+    #####: 2064:	return(1);
+        -: 2065:}
+        -: 2066:
+        -: 2067:static int
+    #####: 2068:OJPEGReadBlock(OJPEGState* sp, uint16 len, void* mem)
+        -: 2069:{
+        -: 2070:	uint16 mlen;
+        -: 2071:	uint8* mmem;
+        -: 2072:	uint16 n;
+    #####: 2073:	assert(len>0);
+    #####: 2074:	mlen=len;
+    #####: 2075:	mmem=mem;
+        -: 2076:	do
+        -: 2077:	{
+    #####: 2078:		if (sp->in_buffer_togo==0)
+        -: 2079:		{
+    #####: 2080:			if (OJPEGReadBufferFill(sp)==0)
+    #####: 2081:				return(0);
+    #####: 2082:			assert(sp->in_buffer_togo>0);
+        -: 2083:		}
+    #####: 2084:		n=mlen;
+    #####: 2085:		if (n>sp->in_buffer_togo)
+    #####: 2086:			n=sp->in_buffer_togo;
+    #####: 2087:		_TIFFmemcpy(mmem,sp->in_buffer_cur,n);
+    #####: 2088:		sp->in_buffer_cur+=n;
+    #####: 2089:		sp->in_buffer_togo-=n;
+    #####: 2090:		mlen-=n;
+    #####: 2091:		mmem+=n;
+    #####: 2092:	} while(mlen>0);
+    #####: 2093:	return(1);
+        -: 2094:}
+        -: 2095:
+        -: 2096:static void
+    #####: 2097:OJPEGReadSkip(OJPEGState* sp, uint16 len)
+        -: 2098:{
+        -: 2099:	uint16 m;
+        -: 2100:	uint16 n;
+    #####: 2101:	m=len;
+    #####: 2102:	n=m;
+    #####: 2103:	if (n>sp->in_buffer_togo)
+    #####: 2104:		n=sp->in_buffer_togo;
+    #####: 2105:	sp->in_buffer_cur+=n;
+    #####: 2106:	sp->in_buffer_togo-=n;
+    #####: 2107:	m-=n;
+    #####: 2108:	if (m>0)
+        -: 2109:	{
+    #####: 2110:		assert(sp->in_buffer_togo==0);
+    #####: 2111:		n=m;
+    #####: 2112:		if ((uint64)n>sp->in_buffer_file_togo)
+    #####: 2113:			n=(uint16)sp->in_buffer_file_togo;
+    #####: 2114:		sp->in_buffer_file_pos+=n;
+    #####: 2115:		sp->in_buffer_file_togo-=n;
+    #####: 2116:		sp->in_buffer_file_pos_log=0;
+        -: 2117:		/* we don't skip past jpeginterchangeformat/strile block...
+        -: 2118:		 * if that is asked from us, we're dealing with totally bazurk
+        -: 2119:		 * data anyway, and we've not seen this happening on any
+        -: 2120:		 * testfile, so we might as well likely cause some other
+        -: 2121:		 * meaningless error to be passed at some later time
+        -: 2122:		 */
+        -: 2123:	}
+    #####: 2124:}
+        -: 2125:
+        -: 2126:static int
+    #####: 2127:OJPEGWriteStream(TIFF* tif, void** mem, uint32* len)
+        -: 2128:{
+    #####: 2129:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 2130:	*len=0;
+        -: 2131:	do
+        -: 2132:	{
+    #####: 2133:		assert(sp->out_state<=ososEoi);
+    #####: 2134:		switch(sp->out_state)
+        -: 2135:		{
+    #####: 2136:			case ososSoi:
+    #####: 2137:				OJPEGWriteStreamSoi(tif,mem,len);
+    #####: 2138:				break;
+    #####: 2139:			case ososQTable0:
+    #####: 2140:				OJPEGWriteStreamQTable(tif,0,mem,len);
+    #####: 2141:				break;
+    #####: 2142:			case ososQTable1:
+    #####: 2143:				OJPEGWriteStreamQTable(tif,1,mem,len);
+    #####: 2144:				break;
+    #####: 2145:			case ososQTable2:
+    #####: 2146:				OJPEGWriteStreamQTable(tif,2,mem,len);
+    #####: 2147:				break;
+    #####: 2148:			case ososQTable3:
+    #####: 2149:				OJPEGWriteStreamQTable(tif,3,mem,len);
+    #####: 2150:				break;
+    #####: 2151:			case ososDcTable0:
+    #####: 2152:				OJPEGWriteStreamDcTable(tif,0,mem,len);
+    #####: 2153:				break;
+    #####: 2154:			case ososDcTable1:
+    #####: 2155:				OJPEGWriteStreamDcTable(tif,1,mem,len);
+    #####: 2156:				break;
+    #####: 2157:			case ososDcTable2:
+    #####: 2158:				OJPEGWriteStreamDcTable(tif,2,mem,len);
+    #####: 2159:				break;
+    #####: 2160:			case ososDcTable3:
+    #####: 2161:				OJPEGWriteStreamDcTable(tif,3,mem,len);
+    #####: 2162:				break;
+    #####: 2163:			case ososAcTable0:
+    #####: 2164:				OJPEGWriteStreamAcTable(tif,0,mem,len);
+    #####: 2165:				break;
+    #####: 2166:			case ososAcTable1:
+    #####: 2167:				OJPEGWriteStreamAcTable(tif,1,mem,len);
+    #####: 2168:				break;
+    #####: 2169:			case ososAcTable2:
+    #####: 2170:				OJPEGWriteStreamAcTable(tif,2,mem,len);
+    #####: 2171:				break;
+    #####: 2172:			case ososAcTable3:
+    #####: 2173:				OJPEGWriteStreamAcTable(tif,3,mem,len);
+    #####: 2174:				break;
+    #####: 2175:			case ososDri:
+    #####: 2176:				OJPEGWriteStreamDri(tif,mem,len);
+    #####: 2177:				break;
+    #####: 2178:			case ososSof:
+    #####: 2179:				OJPEGWriteStreamSof(tif,mem,len);
+    #####: 2180:				break;
+    #####: 2181:			case ososSos:
+    #####: 2182:				OJPEGWriteStreamSos(tif,mem,len);
+    #####: 2183:				break;
+    #####: 2184:			case ososCompressed:
+    #####: 2185:				if (OJPEGWriteStreamCompressed(tif,mem,len)==0)
+    #####: 2186:					return(0);
+    #####: 2187:				break;
+    #####: 2188:			case ososRst:
+    #####: 2189:				OJPEGWriteStreamRst(tif,mem,len);
+    #####: 2190:				break;
+    #####: 2191:			case ososEoi:
+    #####: 2192:				OJPEGWriteStreamEoi(tif,mem,len);
+    #####: 2193:				break;
+        -: 2194:		}
+    #####: 2195:	} while (*len==0);
+    #####: 2196:	return(1);
+        -: 2197:}
+        -: 2198:
+        -: 2199:static void
+    #####: 2200:OJPEGWriteStreamSoi(TIFF* tif, void** mem, uint32* len)
+        -: 2201:{
+    #####: 2202:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 2203:	assert(OJPEG_BUFFER>=2);
+    #####: 2204:	sp->out_buffer[0]=255;
+    #####: 2205:	sp->out_buffer[1]=JPEG_MARKER_SOI;
+    #####: 2206:	*len=2;
+    #####: 2207:	*mem=(void*)sp->out_buffer;
+    #####: 2208:	sp->out_state++;
+    #####: 2209:}
+        -: 2210:
+        -: 2211:static void
+    #####: 2212:OJPEGWriteStreamQTable(TIFF* tif, uint8 table_index, void** mem, uint32* len)
+        -: 2213:{
+    #####: 2214:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 2215:	if (sp->qtable[table_index]!=0)
+        -: 2216:	{
+    #####: 2217:		*mem=(void*)(sp->qtable[table_index]+sizeof(uint32));
+    #####: 2218:		*len=*((uint32*)sp->qtable[table_index])-sizeof(uint32);
+        -: 2219:	}
+    #####: 2220:	sp->out_state++;
+    #####: 2221:}
+        -: 2222:
+        -: 2223:static void
+    #####: 2224:OJPEGWriteStreamDcTable(TIFF* tif, uint8 table_index, void** mem, uint32* len)
+        -: 2225:{
+    #####: 2226:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 2227:	if (sp->dctable[table_index]!=0)
+        -: 2228:	{
+    #####: 2229:		*mem=(void*)(sp->dctable[table_index]+sizeof(uint32));
+    #####: 2230:		*len=*((uint32*)sp->dctable[table_index])-sizeof(uint32);
+        -: 2231:	}
+    #####: 2232:	sp->out_state++;
+    #####: 2233:}
+        -: 2234:
+        -: 2235:static void
+    #####: 2236:OJPEGWriteStreamAcTable(TIFF* tif, uint8 table_index, void** mem, uint32* len)
+        -: 2237:{
+    #####: 2238:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 2239:	if (sp->actable[table_index]!=0)
+        -: 2240:	{
+    #####: 2241:		*mem=(void*)(sp->actable[table_index]+sizeof(uint32));
+    #####: 2242:		*len=*((uint32*)sp->actable[table_index])-sizeof(uint32);
+        -: 2243:	}
+    #####: 2244:	sp->out_state++;
+    #####: 2245:}
+        -: 2246:
+        -: 2247:static void
+    #####: 2248:OJPEGWriteStreamDri(TIFF* tif, void** mem, uint32* len)
+        -: 2249:{
+    #####: 2250:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 2251:	assert(OJPEG_BUFFER>=6);
+    #####: 2252:	if (sp->restart_interval!=0)
+        -: 2253:	{
+    #####: 2254:		sp->out_buffer[0]=255;
+    #####: 2255:		sp->out_buffer[1]=JPEG_MARKER_DRI;
+    #####: 2256:		sp->out_buffer[2]=0;
+    #####: 2257:		sp->out_buffer[3]=4;
+    #####: 2258:		sp->out_buffer[4]=(sp->restart_interval>>8);
+    #####: 2259:		sp->out_buffer[5]=(sp->restart_interval&255);
+    #####: 2260:		*len=6;
+    #####: 2261:		*mem=(void*)sp->out_buffer;
+        -: 2262:	}
+    #####: 2263:	sp->out_state++;
+    #####: 2264:}
+        -: 2265:
+        -: 2266:static void
+    #####: 2267:OJPEGWriteStreamSof(TIFF* tif, void** mem, uint32* len)
+        -: 2268:{
+    #####: 2269:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 2270:	uint8 m;
+    #####: 2271:	assert(OJPEG_BUFFER>=2+8+sp->samples_per_pixel_per_plane*3);
+    #####: 2272:	assert(255>=8+sp->samples_per_pixel_per_plane*3);
+    #####: 2273:	sp->out_buffer[0]=255;
+    #####: 2274:	sp->out_buffer[1]=sp->sof_marker_id;
+        -: 2275:	/* Lf */
+    #####: 2276:	sp->out_buffer[2]=0;
+    #####: 2277:	sp->out_buffer[3]=8+sp->samples_per_pixel_per_plane*3;
+        -: 2278:	/* P */
+    #####: 2279:	sp->out_buffer[4]=8;
+        -: 2280:	/* Y */
+    #####: 2281:	sp->out_buffer[5]=(uint8)(sp->sof_y>>8);
+    #####: 2282:	sp->out_buffer[6]=(sp->sof_y&255);
+        -: 2283:	/* X */
+    #####: 2284:	sp->out_buffer[7]=(uint8)(sp->sof_x>>8);
+    #####: 2285:	sp->out_buffer[8]=(sp->sof_x&255);
+        -: 2286:	/* Nf */
+    #####: 2287:	sp->out_buffer[9]=sp->samples_per_pixel_per_plane;
+    #####: 2288:	for (m=0; m<sp->samples_per_pixel_per_plane; m++)
+        -: 2289:	{
+        -: 2290:		/* C */
+    #####: 2291:		sp->out_buffer[10+m*3]=sp->sof_c[sp->plane_sample_offset+m];
+        -: 2292:		/* H and V */
+    #####: 2293:		sp->out_buffer[10+m*3+1]=sp->sof_hv[sp->plane_sample_offset+m];
+        -: 2294:		/* Tq */
+    #####: 2295:		sp->out_buffer[10+m*3+2]=sp->sof_tq[sp->plane_sample_offset+m];
+        -: 2296:	}
+    #####: 2297:	*len=10+sp->samples_per_pixel_per_plane*3;
+    #####: 2298:	*mem=(void*)sp->out_buffer;
+    #####: 2299:	sp->out_state++;
+    #####: 2300:}
+        -: 2301:
+        -: 2302:static void
+    #####: 2303:OJPEGWriteStreamSos(TIFF* tif, void** mem, uint32* len)
+        -: 2304:{
+    #####: 2305:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 2306:	uint8 m;
+    #####: 2307:	assert(OJPEG_BUFFER>=2+6+sp->samples_per_pixel_per_plane*2);
+    #####: 2308:	assert(255>=6+sp->samples_per_pixel_per_plane*2);
+    #####: 2309:	sp->out_buffer[0]=255;
+    #####: 2310:	sp->out_buffer[1]=JPEG_MARKER_SOS;
+        -: 2311:	/* Ls */
+    #####: 2312:	sp->out_buffer[2]=0;
+    #####: 2313:	sp->out_buffer[3]=6+sp->samples_per_pixel_per_plane*2;
+        -: 2314:	/* Ns */
+    #####: 2315:	sp->out_buffer[4]=sp->samples_per_pixel_per_plane;
+    #####: 2316:	for (m=0; m<sp->samples_per_pixel_per_plane; m++)
+        -: 2317:	{
+        -: 2318:		/* Cs */
+    #####: 2319:		sp->out_buffer[5+m*2]=sp->sos_cs[sp->plane_sample_offset+m];
+        -: 2320:		/* Td and Ta */
+    #####: 2321:		sp->out_buffer[5+m*2+1]=sp->sos_tda[sp->plane_sample_offset+m];
+        -: 2322:	}
+        -: 2323:	/* Ss */
+    #####: 2324:	sp->out_buffer[5+sp->samples_per_pixel_per_plane*2]=0;
+        -: 2325:	/* Se */
+    #####: 2326:	sp->out_buffer[5+sp->samples_per_pixel_per_plane*2+1]=63;
+        -: 2327:	/* Ah and Al */
+    #####: 2328:	sp->out_buffer[5+sp->samples_per_pixel_per_plane*2+2]=0;
+    #####: 2329:	*len=8+sp->samples_per_pixel_per_plane*2;
+    #####: 2330:	*mem=(void*)sp->out_buffer;
+    #####: 2331:	sp->out_state++;
+    #####: 2332:}
+        -: 2333:
+        -: 2334:static int
+    #####: 2335:OJPEGWriteStreamCompressed(TIFF* tif, void** mem, uint32* len)
+        -: 2336:{
+    #####: 2337:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 2338:	if (sp->in_buffer_togo==0)
+        -: 2339:	{
+    #####: 2340:		if (OJPEGReadBufferFill(sp)==0)
+    #####: 2341:			return(0);
+    #####: 2342:		assert(sp->in_buffer_togo>0);
+        -: 2343:	}
+    #####: 2344:	*len=sp->in_buffer_togo;
+    #####: 2345:	*mem=(void*)sp->in_buffer_cur;
+    #####: 2346:	sp->in_buffer_togo=0;
+    #####: 2347:	if (sp->in_buffer_file_togo==0)
+        -: 2348:	{
+    #####: 2349:		switch(sp->in_buffer_source)
+        -: 2350:		{
+    #####: 2351:			case osibsStrile:
+    #####: 2352:				if (sp->in_buffer_next_strile<sp->in_buffer_strile_count)
+    #####: 2353:					sp->out_state=ososRst;
+        -: 2354:				else
+    #####: 2355:					sp->out_state=ososEoi;
+    #####: 2356:				break;
+    #####: 2357:			case osibsEof:
+    #####: 2358:				sp->out_state=ososEoi;
+    #####: 2359:				break;
+    #####: 2360:			default:
+    #####: 2361:				break;
+        -: 2362:		}
+    #####: 2363:	}
+    #####: 2364:	return(1);
+        -: 2365:}
+        -: 2366:
+        -: 2367:static void
+    #####: 2368:OJPEGWriteStreamRst(TIFF* tif, void** mem, uint32* len)
+        -: 2369:{
+    #####: 2370:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 2371:	assert(OJPEG_BUFFER>=2);
+    #####: 2372:	sp->out_buffer[0]=255;
+    #####: 2373:	sp->out_buffer[1]=JPEG_MARKER_RST0+sp->restart_index;
+    #####: 2374:	sp->restart_index++;
+    #####: 2375:	if (sp->restart_index==8)
+    #####: 2376:		sp->restart_index=0;
+    #####: 2377:	*len=2;
+    #####: 2378:	*mem=(void*)sp->out_buffer;
+    #####: 2379:	sp->out_state=ososCompressed;
+    #####: 2380:}
+        -: 2381:
+        -: 2382:static void
+    #####: 2383:OJPEGWriteStreamEoi(TIFF* tif, void** mem, uint32* len)
+        -: 2384:{
+    #####: 2385:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+        -: 2386:	assert(OJPEG_BUFFER>=2);
+    #####: 2387:	sp->out_buffer[0]=255;
+    #####: 2388:	sp->out_buffer[1]=JPEG_MARKER_EOI;
+    #####: 2389:	*len=2;
+    #####: 2390:	*mem=(void*)sp->out_buffer;
+    #####: 2391:}
+        -: 2392:
+        -: 2393:#ifndef LIBJPEG_ENCAP_EXTERNAL
+        -: 2394:static int
+    #####: 2395:jpeg_create_decompress_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo)
+        -: 2396:{
+    #####: 2397:	if( SETJMP(sp->exit_jmpbuf) )
+    #####: 2398:		return 0;
+        -: 2399:	else {
+    #####: 2400:		jpeg_create_decompress(cinfo);
+    #####: 2401:		return 1;
+        -: 2402:	}
+        -: 2403:}
+        -: 2404:#endif
+        -: 2405:
+        -: 2406:#ifndef LIBJPEG_ENCAP_EXTERNAL
+        -: 2407:static int
+    #####: 2408:jpeg_read_header_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, uint8 require_image)
+        -: 2409:{
+    #####: 2410:	if( SETJMP(sp->exit_jmpbuf) )
+    #####: 2411:		return 0;
+        -: 2412:	else {
+    #####: 2413:		jpeg_read_header(cinfo,require_image);
+    #####: 2414:		return 1;
+        -: 2415:	}
+        -: 2416:}
+        -: 2417:#endif
+        -: 2418:
+        -: 2419:#ifndef LIBJPEG_ENCAP_EXTERNAL
+        -: 2420:static int
+    #####: 2421:jpeg_start_decompress_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo)
+        -: 2422:{
+    #####: 2423:	if( SETJMP(sp->exit_jmpbuf) )
+    #####: 2424:		return 0;
+        -: 2425:	else {
+    #####: 2426:		jpeg_start_decompress(cinfo);
+    #####: 2427:		return 1;
+        -: 2428:	}
+        -: 2429:}
+        -: 2430:#endif
+        -: 2431:
+        -: 2432:#ifndef LIBJPEG_ENCAP_EXTERNAL
+        -: 2433:static int
+    #####: 2434:jpeg_read_scanlines_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, void* scanlines, uint32 max_lines)
+        -: 2435:{
+    #####: 2436:	if( SETJMP(sp->exit_jmpbuf) )
+    #####: 2437:		return 0;
+        -: 2438:	else {
+    #####: 2439:		jpeg_read_scanlines(cinfo,scanlines,max_lines);
+    #####: 2440:		return 1;
+        -: 2441:	}
+        -: 2442:}
+        -: 2443:#endif
+        -: 2444:
+        -: 2445:#ifndef LIBJPEG_ENCAP_EXTERNAL
+        -: 2446:static int
+    #####: 2447:jpeg_read_raw_data_encap(OJPEGState* sp, jpeg_decompress_struct* cinfo, void* data, uint32 max_lines)
+        -: 2448:{
+    #####: 2449:	if( SETJMP(sp->exit_jmpbuf) )
+    #####: 2450:		return 0;
+        -: 2451:	else {
+    #####: 2452:		jpeg_read_raw_data(cinfo,data,max_lines);
+    #####: 2453:		return 1;
+        -: 2454:	}
+        -: 2455:}
+        -: 2456:#endif
+        -: 2457:
+        -: 2458:#ifndef LIBJPEG_ENCAP_EXTERNAL
+        -: 2459:static void
+    #####: 2460:jpeg_encap_unwind(TIFF* tif)
+        -: 2461:{
+    #####: 2462:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 2463:	LONGJMP(sp->exit_jmpbuf,1);
+        -: 2464:}
+        -: 2465:#endif
+        -: 2466:
+        -: 2467:static void
+    #####: 2468:OJPEGLibjpegJpegErrorMgrOutputMessage(jpeg_common_struct* cinfo)
+        -: 2469:{
+    #####: 2470:	char buffer[JMSG_LENGTH_MAX];
+    #####: 2471:	(*cinfo->err->format_message)(cinfo,buffer);
+    #####: 2472:	TIFFWarningExt(((TIFF*)(cinfo->client_data))->tif_clientdata,"LibJpeg","%s",buffer);
+    #####: 2473:}
+        -: 2474:
+        -: 2475:static void
+    #####: 2476:OJPEGLibjpegJpegErrorMgrErrorExit(jpeg_common_struct* cinfo)
+        -: 2477:{
+    #####: 2478:	char buffer[JMSG_LENGTH_MAX];
+    #####: 2479:	(*cinfo->err->format_message)(cinfo,buffer);
+    #####: 2480:	TIFFErrorExt(((TIFF*)(cinfo->client_data))->tif_clientdata,"LibJpeg","%s",buffer);
+    #####: 2481:	jpeg_encap_unwind((TIFF*)(cinfo->client_data));
+    #####: 2482:}
+        -: 2483:
+        -: 2484:static void
+    #####: 2485:OJPEGLibjpegJpegSourceMgrInitSource(jpeg_decompress_struct* cinfo)
+        -: 2486:{
+        -: 2487:	(void)cinfo;
+    #####: 2488:}
+        -: 2489:
+        -: 2490:static boolean
+    #####: 2491:OJPEGLibjpegJpegSourceMgrFillInputBuffer(jpeg_decompress_struct* cinfo)
+        -: 2492:{
+    #####: 2493:	TIFF* tif=(TIFF*)cinfo->client_data;
+    #####: 2494:	OJPEGState* sp=(OJPEGState*)tif->tif_data;
+    #####: 2495:	void* mem=0;
+    #####: 2496:	uint32 len=0U;
+    #####: 2497:	if (OJPEGWriteStream(tif,&mem,&len)==0)
+        -: 2498:	{
+    #####: 2499:		TIFFErrorExt(tif->tif_clientdata,"LibJpeg","Premature end of JPEG data");
+    #####: 2500:		jpeg_encap_unwind(tif);
+        -: 2501:	}
+    #####: 2502:	sp->libjpeg_jpeg_source_mgr.bytes_in_buffer=len;
+    #####: 2503:	sp->libjpeg_jpeg_source_mgr.next_input_byte=mem;
+    #####: 2504:	return(1);
+        -: 2505:}
+        -: 2506:
+        -: 2507:static void
+    #####: 2508:OJPEGLibjpegJpegSourceMgrSkipInputData(jpeg_decompress_struct* cinfo, long num_bytes)
+        -: 2509:{
+    #####: 2510:	TIFF* tif=(TIFF*)cinfo->client_data;
+        -: 2511:	(void)num_bytes;
+    #####: 2512:	TIFFErrorExt(tif->tif_clientdata,"LibJpeg","Unexpected error");
+    #####: 2513:	jpeg_encap_unwind(tif);
+    #####: 2514:}
+        -: 2515:
+        -: 2516:#ifdef _MSC_VER
+        -: 2517:#pragma warning( push )
+        -: 2518:#pragma warning( disable : 4702 ) /* unreachable code */
+        -: 2519:#endif
+        -: 2520:static boolean
+    #####: 2521:OJPEGLibjpegJpegSourceMgrResyncToRestart(jpeg_decompress_struct* cinfo, int desired)
+        -: 2522:{
+    #####: 2523:	TIFF* tif=(TIFF*)cinfo->client_data;
+        -: 2524:	(void)desired;
+    #####: 2525:	TIFFErrorExt(tif->tif_clientdata,"LibJpeg","Unexpected error");
+    #####: 2526:	jpeg_encap_unwind(tif);
+    #####: 2527:	return(0);
+        -: 2528:}
+        -: 2529:#ifdef _MSC_VER
+        -: 2530:#pragma warning( pop ) 
+        -: 2531:#endif
+        -: 2532:
+        -: 2533:static void
+    #####: 2534:OJPEGLibjpegJpegSourceMgrTermSource(jpeg_decompress_struct* cinfo)
+        -: 2535:{
+        -: 2536:	(void)cinfo;
+    #####: 2537:}
+        -: 2538:
+        -: 2539:#endif
+        -: 2540:
+        -: 2541:
+        -: 2542:/*
+        -: 2543: * Local Variables:
+        -: 2544: * mode: c
+        -: 2545: * c-basic-offset: 8
+        -: 2546: * fill-column: 78
+        -: 2547: * End:
+        -: 2548: */

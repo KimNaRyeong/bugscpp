@@ -1,0 +1,1894 @@
+        -:    0:Source:tiffcp.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1988-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: *  Revised:  2/18/01 BAR -- added syntax for extracting single images from
+        -:    8: *                          multi-image TIFF files.
+        -:    9: *
+        -:   10: *    New syntax is:  sourceFileName,image#
+        -:   11: *
+        -:   12: * image# ranges from 0..<n-1> where n is the # of images in the file.
+        -:   13: * There may be no white space between the comma and the filename or
+        -:   14: * image number.
+        -:   15: *
+        -:   16: *    Example:   tiffcp source.tif,1 destination.tif
+        -:   17: *
+        -:   18: * Copies the 2nd image in source.tif to the destination.
+        -:   19: *
+        -:   20: *****
+        -:   21: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:   22: * its documentation for any purpose is hereby granted without fee, provided
+        -:   23: * that (i) the above copyright notices and this permission notice appear in
+        -:   24: * all copies of the software and related documentation, and (ii) the names of
+        -:   25: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   26: * publicity relating to the software without the specific, prior written
+        -:   27: * permission of Sam Leffler and Silicon Graphics.
+        -:   28: * 
+        -:   29: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   30: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   31: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   32: * 
+        -:   33: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   34: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   35: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   36: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   37: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   38: * OF THIS SOFTWARE.
+        -:   39: */
+        -:   40:
+        -:   41:#include "tif_config.h"
+        -:   42:
+        -:   43:#include <stdio.h>
+        -:   44:#include <stdlib.h>
+        -:   45:#include <string.h>
+        -:   46:
+        -:   47:#include <ctype.h>
+        -:   48:
+        -:   49:#ifdef HAVE_UNISTD_H
+        -:   50:# include <unistd.h>
+        -:   51:#endif
+        -:   52:
+        -:   53:#include "tiffio.h"
+        -:   54:
+        -:   55:#ifndef HAVE_GETOPT
+        -:   56:extern int getopt(int, char**, char*);
+        -:   57:#endif
+        -:   58:
+        -:   59:#if defined(VMS)
+        -:   60:# define unlink delete
+        -:   61:#endif
+        -:   62:
+        -:   63:#define	streq(a,b)	(strcmp(a,b) == 0)
+        -:   64:#define	strneq(a,b,n)	(strncmp(a,b,n) == 0)
+        -:   65:
+        -:   66:#define	TRUE	1
+        -:   67:#define	FALSE	0
+        -:   68:
+        -:   69:static int outtiled = -1;
+        -:   70:static uint32 tilewidth;
+        -:   71:static uint32 tilelength;
+        -:   72:
+        -:   73:static uint16 config;
+        -:   74:static uint16 compression;
+        -:   75:static uint16 predictor;
+        -:   76:static int preset;
+        -:   77:static uint16 fillorder;
+        -:   78:static uint16 orientation;
+        -:   79:static uint32 rowsperstrip;
+        -:   80:static uint32 g3opts;
+        -:   81:static int ignore = FALSE;		/* if true, ignore read errors */
+        -:   82:static uint32 defg3opts = (uint32) -1;
+        -:   83:static int quality = 75;		/* JPEG quality */
+        -:   84:static int jpegcolormode = JPEGCOLORMODE_RGB;
+        -:   85:static uint16 defcompression = (uint16) -1;
+        -:   86:static uint16 defpredictor = (uint16) -1;
+        -:   87:static int defpreset =  -1;
+        -:   88:
+        -:   89:static int tiffcp(TIFF*, TIFF*);
+        -:   90:static int processCompressOptions(char*);
+        -:   91:static void usage(void);
+        -:   92:
+        -:   93:static char comma = ',';  /* (default) comma separator character */
+        -:   94:static TIFF* bias = NULL;
+        -:   95:static int pageNum = 0;
+        -:   96:static int pageInSeq = 0;
+        -:   97:
+    #####:   98:static int nextSrcImage (TIFF *tif, char **imageSpec)
+        -:   99:/*
+        -:  100:  seek to the next image specified in *imageSpec
+        -:  101:  returns 1 if success, 0 if no more images to process
+        -:  102:  *imageSpec=NULL if subsequent images should be processed in sequence
+        -:  103:*/
+        -:  104:{
+    #####:  105:	if (**imageSpec == comma) {  /* if not @comma, we've done all images */
+    #####:  106:		char *start = *imageSpec + 1;
+    #####:  107:		tdir_t nextImage = (tdir_t)strtol(start, imageSpec, 0);
+    #####:  108:		if (start == *imageSpec) nextImage = TIFFCurrentDirectory (tif);
+    #####:  109:		if (**imageSpec)
+        -:  110:		{
+    #####:  111:			if (**imageSpec == comma) {
+        -:  112:				/* a trailing comma denotes remaining images in sequence */
+    #####:  113:				if ((*imageSpec)[1] == '\0') *imageSpec = NULL;
+        -:  114:			}else{
+    #####:  115:				fprintf (stderr,
+        -:  116:				    "Expected a %c separated image # list after %s\n",
+        -:  117:				    comma, TIFFFileName (tif));
+    #####:  118:				exit (-4);   /* syntax error */
+        -:  119:			}
+        -:  120:		}
+    #####:  121:		if (TIFFSetDirectory (tif, nextImage)) return 1;
+    #####:  122:		fprintf (stderr, "%s%c%d not found!\n",
+        -:  123:		    TIFFFileName(tif), comma, (int) nextImage);
+        -:  124:	}
+    #####:  125:	return 0;
+        -:  126:}
+        -:  127:
+        -:  128:  
+    #####:  129:static TIFF* openSrcImage (char **imageSpec)
+        -:  130:/*
+        -:  131:  imageSpec points to a pointer to a filename followed by optional ,image#'s
+        -:  132:  Open the TIFF file and assign *imageSpec to either NULL if there are
+        -:  133:  no images specified, or a pointer to the next image number text
+        -:  134:*/
+        -:  135:{
+        -:  136:	TIFF *tif;
+    #####:  137:	char *fn = *imageSpec;
+    #####:  138:	*imageSpec = strchr (fn, comma);
+    #####:  139:	if (*imageSpec) {  /* there is at least one image number specifier */
+    #####:  140:		**imageSpec = '\0';
+    #####:  141:		tif = TIFFOpen (fn, "r");
+        -:  142:		/* but, ignore any single trailing comma */
+    #####:  143:		if (!(*imageSpec)[1]) {*imageSpec = NULL; return tif;}
+    #####:  144:		if (tif) {
+    #####:  145:			**imageSpec = comma;  /* replace the comma */
+    #####:  146:			if (!nextSrcImage(tif, imageSpec)) {
+    #####:  147:				TIFFClose (tif);
+    #####:  148:				tif = NULL;
+        -:  149:			}
+        -:  150:		}
+        -:  151:	}else
+    #####:  152:		tif = TIFFOpen (fn, "r");
+    #####:  153:	return tif;
+        -:  154:}
+        -:  155:
+        -:  156:int
+    #####:  157:main(int argc, char* argv[])
+        -:  158:{
+    #####:  159:	uint16 defconfig = (uint16) -1;
+    #####:  160:	uint16 deffillorder = 0;
+    #####:  161:	uint32 deftilewidth = (uint32) -1;
+    #####:  162:	uint32 deftilelength = (uint32) -1;
+    #####:  163:	uint32 defrowsperstrip = (uint32) 0;
+    #####:  164:	uint64 diroff = 0;
+        -:  165:	TIFF* in;
+        -:  166:	TIFF* out;
+    #####:  167:	char mode[10];
+    #####:  168:	char* mp = mode;
+        -:  169:	int c;
+        -:  170:#if !HAVE_DECL_OPTARG
+        -:  171:	extern int optind;
+        -:  172:	extern char* optarg;
+        -:  173:#endif
+        -:  174:
+    #####:  175:	*mp++ = 'w';
+    #####:  176:	*mp = '\0';
+    #####:  177:	while ((c = getopt(argc, argv, ",:b:c:f:l:o:p:r:w:aistBLMC8x")) != -1)
+    #####:  178:		switch (c) {
+    #####:  179:		case ',':
+    #####:  180:			if (optarg[0] != '=') usage();
+    #####:  181:			comma = optarg[1];
+    #####:  182:			break;
+    #####:  183:		case 'b':   /* this file is bias image subtracted from others */
+    #####:  184:			if (bias) {
+    #####:  185:				fputs ("Only 1 bias image may be specified\n", stderr);
+    #####:  186:				exit (-2);
+        -:  187:			}
+        -:  188:			{
+    #####:  189:				uint16 samples = (uint16) -1;
+    #####:  190:				char **biasFn = &optarg;
+    #####:  191:				bias = openSrcImage (biasFn);
+    #####:  192:				if (!bias) exit (-5);
+    #####:  193:				if (TIFFIsTiled (bias)) {
+    #####:  194:					fputs ("Bias image must be organized in strips\n", stderr);
+    #####:  195:					exit (-7);
+        -:  196:				}
+    #####:  197:				TIFFGetField(bias, TIFFTAG_SAMPLESPERPIXEL, &samples);
+    #####:  198:				if (samples != 1) {
+    #####:  199:					fputs ("Bias image must be monochrome\n", stderr);
+    #####:  200:					exit (-7);
+        -:  201:				}
+        -:  202:			}
+        -:  203:			break;
+    #####:  204:		case 'a':   /* append to output */
+    #####:  205:			mode[0] = 'a';
+    #####:  206:			break;
+    #####:  207:		case 'c':   /* compression scheme */
+    #####:  208:			if (!processCompressOptions(optarg))
+    #####:  209:				usage();
+    #####:  210:			break;
+    #####:  211:		case 'f':   /* fill order */
+    #####:  212:			if (streq(optarg, "lsb2msb"))
+    #####:  213:				deffillorder = FILLORDER_LSB2MSB;
+    #####:  214:			else if (streq(optarg, "msb2lsb"))
+    #####:  215:				deffillorder = FILLORDER_MSB2LSB;
+        -:  216:			else
+    #####:  217:				usage();
+    #####:  218:			break;
+    #####:  219:		case 'i':   /* ignore errors */
+    #####:  220:			ignore = TRUE;
+    #####:  221:			break;
+    #####:  222:		case 'l':   /* tile length */
+    #####:  223:			outtiled = TRUE;
+    #####:  224:			deftilelength = atoi(optarg);
+    #####:  225:			break;
+    #####:  226:		case 'o':   /* initial directory offset */
+    #####:  227:			diroff = strtoul(optarg, NULL, 0);
+    #####:  228:			break;
+    #####:  229:		case 'p':   /* planar configuration */
+    #####:  230:			if (streq(optarg, "separate"))
+    #####:  231:				defconfig = PLANARCONFIG_SEPARATE;
+    #####:  232:			else if (streq(optarg, "contig"))
+    #####:  233:				defconfig = PLANARCONFIG_CONTIG;
+        -:  234:			else
+    #####:  235:				usage();
+    #####:  236:			break;
+    #####:  237:		case 'r':   /* rows/strip */
+    #####:  238:			defrowsperstrip = atol(optarg);
+    #####:  239:			break;
+    #####:  240:		case 's':   /* generate stripped output */
+    #####:  241:			outtiled = FALSE;
+    #####:  242:			break;
+    #####:  243:		case 't':   /* generate tiled output */
+    #####:  244:			outtiled = TRUE;
+    #####:  245:			break;
+    #####:  246:		case 'w':   /* tile width */
+    #####:  247:			outtiled = TRUE;
+    #####:  248:			deftilewidth = atoi(optarg);
+    #####:  249:			break;
+    #####:  250:		case 'B':
+    #####:  251:			*mp++ = 'b'; *mp = '\0';
+    #####:  252:			break;
+    #####:  253:		case 'L':
+    #####:  254:			*mp++ = 'l'; *mp = '\0';
+    #####:  255:			break;
+    #####:  256:		case 'M':
+    #####:  257:			*mp++ = 'm'; *mp = '\0';
+    #####:  258:			break;
+    #####:  259:		case 'C':
+    #####:  260:			*mp++ = 'c'; *mp = '\0';
+    #####:  261:			break;
+    #####:  262:		case '8':
+    #####:  263:			*mp++ = '8'; *mp = '\0';
+    #####:  264:			break;
+    #####:  265:		case 'x':
+    #####:  266:			pageInSeq = 1;
+    #####:  267:			break;
+    #####:  268:		case '?':
+    #####:  269:			usage();
+        -:  270:			/*NOTREACHED*/
+        -:  271:		}
+    #####:  272:	if (argc - optind < 2)
+    #####:  273:		usage();
+    #####:  274:	out = TIFFOpen(argv[argc-1], mode);
+    #####:  275:	if (out == NULL)
+    #####:  276:		return (-2);
+    #####:  277:	if ((argc - optind) == 2)
+    #####:  278:		pageNum = -1;
+    #####:  279:	for (; optind < argc-1 ; optind++) {
+    #####:  280:		char *imageCursor = argv[optind];
+    #####:  281:		in = openSrcImage (&imageCursor);
+    #####:  282:		if (in == NULL) {
+    #####:  283:			(void) TIFFClose(out);
+    #####:  284:			return (-3);
+        -:  285:		}
+    #####:  286:		if (diroff != 0 && !TIFFSetSubDirectory(in, diroff)) {
+    #####:  287:			TIFFError(TIFFFileName(in),
+        -:  288:			    "Error, setting subdirectory at " TIFF_UINT64_FORMAT, diroff);
+    #####:  289:			(void) TIFFClose(in);
+    #####:  290:			(void) TIFFClose(out);
+    #####:  291:			return (1);
+        -:  292:		}
+        -:  293:		for (;;) {
+    #####:  294:			config = defconfig;
+    #####:  295:			compression = defcompression;
+    #####:  296:			predictor = defpredictor;
+    #####:  297:                        preset = defpreset;
+    #####:  298:			fillorder = deffillorder;
+    #####:  299:			rowsperstrip = defrowsperstrip;
+    #####:  300:			tilewidth = deftilewidth;
+    #####:  301:			tilelength = deftilelength;
+    #####:  302:			g3opts = defg3opts;
+    #####:  303:			if (!tiffcp(in, out) || !TIFFWriteDirectory(out)) {
+    #####:  304:				(void) TIFFClose(in);
+    #####:  305:				(void) TIFFClose(out);
+    #####:  306:				return (1);
+        -:  307:			}
+    #####:  308:			if (imageCursor) { /* seek next image directory */
+    #####:  309:				if (!nextSrcImage(in, &imageCursor)) break;
+        -:  310:			}else
+    #####:  311:				if (!TIFFReadDirectory(in)) break;
+        -:  312:		}
+    #####:  313:		(void) TIFFClose(in);
+        -:  314:	}
+        -:  315:
+    #####:  316:	(void) TIFFClose(out);
+    #####:  317:	return (0);
+        -:  318:}
+        -:  319:
+        -:  320:static void
+    #####:  321:processZIPOptions(char* cp)
+        -:  322:{
+    #####:  323:	if ( (cp = strchr(cp, ':')) ) {
+        -:  324:		do {
+    #####:  325:			cp++;
+    #####:  326:			if (isdigit((int)*cp))
+    #####:  327:				defpredictor = atoi(cp);
+    #####:  328:			else if (*cp == 'p')
+    #####:  329:				defpreset = atoi(++cp);
+        -:  330:			else
+    #####:  331:				usage();
+    #####:  332:		} while( (cp = strchr(cp, ':')) );
+        -:  333:	}
+    #####:  334:}
+        -:  335:
+        -:  336:static void
+    #####:  337:processG3Options(char* cp)
+        -:  338:{
+    #####:  339:	if( (cp = strchr(cp, ':')) ) {
+    #####:  340:		if (defg3opts == (uint32) -1)
+    #####:  341:			defg3opts = 0;
+        -:  342:		do {
+    #####:  343:			cp++;
+    #####:  344:			if (strneq(cp, "1d", 2))
+    #####:  345:				defg3opts &= ~GROUP3OPT_2DENCODING;
+    #####:  346:			else if (strneq(cp, "2d", 2))
+    #####:  347:				defg3opts |= GROUP3OPT_2DENCODING;
+    #####:  348:			else if (strneq(cp, "fill", 4))
+    #####:  349:				defg3opts |= GROUP3OPT_FILLBITS;
+        -:  350:			else
+    #####:  351:				usage();
+    #####:  352:		} while( (cp = strchr(cp, ':')) );
+        -:  353:	}
+    #####:  354:}
+        -:  355:
+        -:  356:static int
+    #####:  357:processCompressOptions(char* opt)
+        -:  358:{
+    #####:  359:	if (streq(opt, "none")) {
+    #####:  360:		defcompression = COMPRESSION_NONE;
+    #####:  361:	} else if (streq(opt, "packbits")) {
+    #####:  362:		defcompression = COMPRESSION_PACKBITS;
+    #####:  363:	} else if (strneq(opt, "jpeg", 4)) {
+    #####:  364:		char* cp = strchr(opt, ':');
+        -:  365:
+    #####:  366:		defcompression = COMPRESSION_JPEG;
+    #####:  367:		while( cp )
+        -:  368:		{
+    #####:  369:			if (isdigit((int)cp[1]))
+    #####:  370:				quality = atoi(cp+1);
+    #####:  371:			else if (cp[1] == 'r' )
+    #####:  372:				jpegcolormode = JPEGCOLORMODE_RAW;
+        -:  373:			else
+    #####:  374:				usage();
+        -:  375:
+    #####:  376:			cp = strchr(cp+1,':');
+        -:  377:		}
+    #####:  378:	} else if (strneq(opt, "g3", 2)) {
+    #####:  379:		processG3Options(opt);
+    #####:  380:		defcompression = COMPRESSION_CCITTFAX3;
+    #####:  381:	} else if (streq(opt, "g4")) {
+    #####:  382:		defcompression = COMPRESSION_CCITTFAX4;
+    #####:  383:	} else if (strneq(opt, "lzw", 3)) {
+    #####:  384:		char* cp = strchr(opt, ':');
+    #####:  385:		if (cp)
+    #####:  386:			defpredictor = atoi(cp+1);
+    #####:  387:		defcompression = COMPRESSION_LZW;
+    #####:  388:	} else if (strneq(opt, "zip", 3)) {
+    #####:  389:		processZIPOptions(opt);
+    #####:  390:		defcompression = COMPRESSION_ADOBE_DEFLATE;
+    #####:  391:	} else if (strneq(opt, "lzma", 4)) {
+    #####:  392:		processZIPOptions(opt);
+    #####:  393:		defcompression = COMPRESSION_LZMA;
+    #####:  394:	} else if (strneq(opt, "jbig", 4)) {
+    #####:  395:		defcompression = COMPRESSION_JBIG;
+    #####:  396:	} else if (strneq(opt, "sgilog", 6)) {
+    #####:  397:		defcompression = COMPRESSION_SGILOG;
+        -:  398:	} else
+    #####:  399:		return (0);
+    #####:  400:	return (1);
+        -:  401:}
+        -:  402:
+        -:  403:char* stuff[] = {
+        -:  404:"usage: tiffcp [options] input... output",
+        -:  405:"where options are:",
+        -:  406:" -a              append to output instead of overwriting",
+        -:  407:" -o offset       set initial directory offset",
+        -:  408:" -p contig       pack samples contiguously (e.g. RGBRGB...)",
+        -:  409:" -p separate     store samples separately (e.g. RRR...GGG...BBB...)",
+        -:  410:" -s              write output in strips",
+        -:  411:" -t              write output in tiles",
+        -:  412:" -x              force the merged tiff pages in sequence",
+        -:  413:" -8              write BigTIFF instead of default ClassicTIFF",
+        -:  414:" -B              write big-endian instead of native byte order",
+        -:  415:" -L              write little-endian instead of native byte order",
+        -:  416:" -M              disable use of memory-mapped files",
+        -:  417:" -C              disable strip chopping",
+        -:  418:" -i              ignore read errors",
+        -:  419:" -b file[,#]     bias (dark) monochrome image to be subtracted from all others",
+        -:  420:" -,=%            use % rather than , to separate image #'s (per Note below)",
+        -:  421:"",
+        -:  422:" -r #            make each strip have no more than # rows",
+        -:  423:" -w #            set output tile width (pixels)",
+        -:  424:" -l #            set output tile length (pixels)",
+        -:  425:"",
+        -:  426:" -f lsb2msb      force lsb-to-msb FillOrder for output",
+        -:  427:" -f msb2lsb      force msb-to-lsb FillOrder for output",
+        -:  428:"",
+        -:  429:" -c lzw[:opts]   compress output with Lempel-Ziv & Welch encoding",
+        -:  430:" -c zip[:opts]   compress output with deflate encoding",
+        -:  431:" -c lzma[:opts]  compress output with LZMA2 encoding",
+        -:  432:" -c jpeg[:opts]  compress output with JPEG encoding",
+        -:  433:" -c jbig         compress output with ISO JBIG encoding",
+        -:  434:" -c packbits     compress output with packbits encoding",
+        -:  435:" -c g3[:opts]    compress output with CCITT Group 3 encoding",
+        -:  436:" -c g4           compress output with CCITT Group 4 encoding",
+        -:  437:" -c sgilog       compress output with SGILOG encoding",
+        -:  438:" -c none         use no compression algorithm on output",
+        -:  439:"",
+        -:  440:"Group 3 options:",
+        -:  441:" 1d              use default CCITT Group 3 1D-encoding",
+        -:  442:" 2d              use optional CCITT Group 3 2D-encoding",
+        -:  443:" fill            byte-align EOL codes",
+        -:  444:"For example, -c g3:2d:fill to get G3-2D-encoded data with byte-aligned EOLs",
+        -:  445:"",
+        -:  446:"JPEG options:",
+        -:  447:" #               set compression quality level (0-100, default 75)",
+        -:  448:" r               output color image as RGB rather than YCbCr",
+        -:  449:"For example, -c jpeg:r:50 to get JPEG-encoded RGB data with 50% comp. quality",
+        -:  450:"",
+        -:  451:"LZW, Deflate (ZIP) and LZMA2 options:",
+        -:  452:" #               set predictor value",
+        -:  453:" p#              set compression level (preset)",
+        -:  454:"For example, -c lzw:2 to get LZW-encoded data with horizontal differencing,",
+        -:  455:"-c zip:3:p9 for Deflate encoding with maximum compression level and floating",
+        -:  456:"point predictor.",
+        -:  457:"",
+        -:  458:"Note that input filenames may be of the form filename,x,y,z",
+        -:  459:"where x, y, and z specify image numbers in the filename to copy.",
+        -:  460:"example:  tiffcp -c none -b esp.tif,1 esp.tif,0 test.tif",
+        -:  461:"  subtract 2nd image in esp.tif from 1st yielding uncompressed result test.tif",
+        -:  462:NULL
+        -:  463:};
+        -:  464:
+        -:  465:static void
+    #####:  466:usage(void)
+        -:  467:{
+    #####:  468:	char buf[BUFSIZ];
+        -:  469:	int i;
+        -:  470:
+    #####:  471:	setbuf(stderr, buf);
+    #####:  472:	fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:  473:	for (i = 0; stuff[i] != NULL; i++)
+    #####:  474:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:  475:	exit(-1);
+        -:  476:}
+        -:  477:
+        -:  478:#define	CopyField(tag, v) \
+        -:  479:    if (TIFFGetField(in, tag, &v)) TIFFSetField(out, tag, v)
+        -:  480:#define	CopyField2(tag, v1, v2) \
+        -:  481:    if (TIFFGetField(in, tag, &v1, &v2)) TIFFSetField(out, tag, v1, v2)
+        -:  482:#define	CopyField3(tag, v1, v2, v3) \
+        -:  483:    if (TIFFGetField(in, tag, &v1, &v2, &v3)) TIFFSetField(out, tag, v1, v2, v3)
+        -:  484:#define	CopyField4(tag, v1, v2, v3, v4) \
+        -:  485:    if (TIFFGetField(in, tag, &v1, &v2, &v3, &v4)) TIFFSetField(out, tag, v1, v2, v3, v4)
+        -:  486:
+        -:  487:static void
+    #####:  488:cpTag(TIFF* in, TIFF* out, uint16 tag, uint16 count, TIFFDataType type)
+        -:  489:{
+    #####:  490:	switch (type) {
+    #####:  491:	case TIFF_SHORT:
+    #####:  492:		if (count == 1) {
+    #####:  493:			uint16 shortv;
+    #####:  494:			CopyField(tag, shortv);
+    #####:  495:		} else if (count == 2) {
+    #####:  496:			uint16 shortv1, shortv2;
+    #####:  497:			CopyField2(tag, shortv1, shortv2);
+    #####:  498:		} else if (count == 4) {
+    #####:  499:			uint16 *tr, *tg, *tb, *ta;
+    #####:  500:			CopyField4(tag, tr, tg, tb, ta);
+    #####:  501:		} else if (count == (uint16) -1) {
+    #####:  502:			uint16 shortv1;
+    #####:  503:			uint16* shortav;
+    #####:  504:			CopyField2(tag, shortv1, shortav);
+        -:  505:		}
+    #####:  506:		break;
+    #####:  507:	case TIFF_LONG:
+    #####:  508:		{ uint32 longv;
+    #####:  509:		  CopyField(tag, longv);
+        -:  510:		}
+        -:  511:		break;
+    #####:  512:	case TIFF_RATIONAL:
+    #####:  513:		if (count == 1) {
+    #####:  514:			float floatv;
+    #####:  515:			CopyField(tag, floatv);
+    #####:  516:		} else if (count == (uint16) -1) {
+    #####:  517:			float* floatav;
+    #####:  518:			CopyField(tag, floatav);
+        -:  519:		}
+    #####:  520:		break;
+    #####:  521:	case TIFF_ASCII:
+    #####:  522:		{ char* stringv;
+    #####:  523:		  CopyField(tag, stringv);
+        -:  524:		}
+        -:  525:		break;
+    #####:  526:	case TIFF_DOUBLE:
+    #####:  527:		if (count == 1) {
+    #####:  528:			double doublev;
+    #####:  529:			CopyField(tag, doublev);
+    #####:  530:		} else if (count == (uint16) -1) {
+    #####:  531:			double* doubleav;
+    #####:  532:			CopyField(tag, doubleav);
+        -:  533:		}
+    #####:  534:		break;
+    #####:  535:	default:
+    #####:  536:		TIFFError(TIFFFileName(in),
+        -:  537:		    "Data type %d is not supported, tag %d skipped.",
+        -:  538:		    tag, type);
+        -:  539:	}
+    #####:  540:}
+        -:  541:
+        -:  542:static struct cpTag {
+        -:  543:	uint16 tag;
+        -:  544:	uint16 count;
+        -:  545:	TIFFDataType type;
+        -:  546:} tags[] = {
+        -:  547:	{ TIFFTAG_SUBFILETYPE,		1, TIFF_LONG },
+        -:  548:	{ TIFFTAG_THRESHHOLDING,	1, TIFF_SHORT },
+        -:  549:	{ TIFFTAG_DOCUMENTNAME,		1, TIFF_ASCII },
+        -:  550:	{ TIFFTAG_IMAGEDESCRIPTION,	1, TIFF_ASCII },
+        -:  551:	{ TIFFTAG_MAKE,			1, TIFF_ASCII },
+        -:  552:	{ TIFFTAG_MODEL,		1, TIFF_ASCII },
+        -:  553:	{ TIFFTAG_MINSAMPLEVALUE,	1, TIFF_SHORT },
+        -:  554:	{ TIFFTAG_MAXSAMPLEVALUE,	1, TIFF_SHORT },
+        -:  555:	{ TIFFTAG_XRESOLUTION,		1, TIFF_RATIONAL },
+        -:  556:	{ TIFFTAG_YRESOLUTION,		1, TIFF_RATIONAL },
+        -:  557:	{ TIFFTAG_PAGENAME,		1, TIFF_ASCII },
+        -:  558:	{ TIFFTAG_XPOSITION,		1, TIFF_RATIONAL },
+        -:  559:	{ TIFFTAG_YPOSITION,		1, TIFF_RATIONAL },
+        -:  560:	{ TIFFTAG_RESOLUTIONUNIT,	1, TIFF_SHORT },
+        -:  561:	{ TIFFTAG_SOFTWARE,		1, TIFF_ASCII },
+        -:  562:	{ TIFFTAG_DATETIME,		1, TIFF_ASCII },
+        -:  563:	{ TIFFTAG_ARTIST,		1, TIFF_ASCII },
+        -:  564:	{ TIFFTAG_HOSTCOMPUTER,		1, TIFF_ASCII },
+        -:  565:	{ TIFFTAG_WHITEPOINT,		(uint16) -1, TIFF_RATIONAL },
+        -:  566:	{ TIFFTAG_PRIMARYCHROMATICITIES,(uint16) -1,TIFF_RATIONAL },
+        -:  567:	{ TIFFTAG_HALFTONEHINTS,	2, TIFF_SHORT },
+        -:  568:	{ TIFFTAG_INKSET,		1, TIFF_SHORT },
+        -:  569:	{ TIFFTAG_DOTRANGE,		2, TIFF_SHORT },
+        -:  570:	{ TIFFTAG_TARGETPRINTER,	1, TIFF_ASCII },
+        -:  571:	{ TIFFTAG_SAMPLEFORMAT,		1, TIFF_SHORT },
+        -:  572:	{ TIFFTAG_YCBCRCOEFFICIENTS,	(uint16) -1,TIFF_RATIONAL },
+        -:  573:	{ TIFFTAG_YCBCRSUBSAMPLING,	2, TIFF_SHORT },
+        -:  574:	{ TIFFTAG_YCBCRPOSITIONING,	1, TIFF_SHORT },
+        -:  575:	{ TIFFTAG_REFERENCEBLACKWHITE,	(uint16) -1,TIFF_RATIONAL },
+        -:  576:	{ TIFFTAG_EXTRASAMPLES,		(uint16) -1, TIFF_SHORT },
+        -:  577:	{ TIFFTAG_SMINSAMPLEVALUE,	1, TIFF_DOUBLE },
+        -:  578:	{ TIFFTAG_SMAXSAMPLEVALUE,	1, TIFF_DOUBLE },
+        -:  579:	{ TIFFTAG_STONITS,		1, TIFF_DOUBLE },
+        -:  580:};
+        -:  581:#define	NTAGS	(sizeof (tags) / sizeof (tags[0]))
+        -:  582:
+        -:  583:#define	CopyTag(tag, count, type)	cpTag(in, out, tag, count, type)
+        -:  584:
+        -:  585:typedef int (*copyFunc)
+        -:  586:    (TIFF* in, TIFF* out, uint32 l, uint32 w, uint16 samplesperpixel);
+        -:  587:static	copyFunc pickCopyFunc(TIFF*, TIFF*, uint16, uint16);
+        -:  588:
+        -:  589:/* PODD */
+        -:  590:
+        -:  591:static int
+    #####:  592:tiffcp(TIFF* in, TIFF* out)
+        -:  593:{
+    #####:  594:	uint16 bitspersample, samplesperpixel = 1;
+    #####:  595:	uint16 input_compression, input_photometric = PHOTOMETRIC_MINISBLACK;
+        -:  596:	copyFunc cf;
+    #####:  597:	uint32 width, length;
+        -:  598:	struct cpTag* p;
+        -:  599:
+    #####:  600:	CopyField(TIFFTAG_IMAGEWIDTH, width);
+    #####:  601:	CopyField(TIFFTAG_IMAGELENGTH, length);
+    #####:  602:	CopyField(TIFFTAG_BITSPERSAMPLE, bitspersample);
+    #####:  603:	CopyField(TIFFTAG_SAMPLESPERPIXEL, samplesperpixel);
+    #####:  604:	if (compression != (uint16)-1)
+    #####:  605:		TIFFSetField(out, TIFFTAG_COMPRESSION, compression);
+        -:  606:	else
+    #####:  607:		CopyField(TIFFTAG_COMPRESSION, compression);
+    #####:  608:	TIFFGetFieldDefaulted(in, TIFFTAG_COMPRESSION, &input_compression);
+    #####:  609:	TIFFGetFieldDefaulted(in, TIFFTAG_PHOTOMETRIC, &input_photometric);
+    #####:  610:	if (input_compression == COMPRESSION_JPEG) {
+        -:  611:		/* Force conversion to RGB */
+    #####:  612:		TIFFSetField(in, TIFFTAG_JPEGCOLORMODE, JPEGCOLORMODE_RGB);
+    #####:  613:	} else if (input_photometric == PHOTOMETRIC_YCBCR) {
+        -:  614:		/* Otherwise, can't handle subsampled input */
+    #####:  615:		uint16 subsamplinghor,subsamplingver;
+        -:  616:
+    #####:  617:		TIFFGetFieldDefaulted(in, TIFFTAG_YCBCRSUBSAMPLING,
+        -:  618:				      &subsamplinghor, &subsamplingver);
+    #####:  619:		if (subsamplinghor!=1 || subsamplingver!=1) {
+    #####:  620:			fprintf(stderr, "tiffcp: %s: Can't copy/convert subsampled image.\n",
+        -:  621:				TIFFFileName(in));
+    #####:  622:			return FALSE;
+        -:  623:		}
+        -:  624:	}
+    #####:  625:	if (compression == COMPRESSION_JPEG) {
+    #####:  626:		if (input_photometric == PHOTOMETRIC_RGB &&
+    #####:  627:		    jpegcolormode == JPEGCOLORMODE_RGB)
+    #####:  628:		  TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_YCBCR);
+        -:  629:		else
+    #####:  630:		  TIFFSetField(out, TIFFTAG_PHOTOMETRIC, input_photometric);
+        -:  631:	}
+    #####:  632:	else if (compression == COMPRESSION_SGILOG
+    #####:  633:	    || compression == COMPRESSION_SGILOG24)
+    #####:  634:		TIFFSetField(out, TIFFTAG_PHOTOMETRIC,
+    #####:  635:		    samplesperpixel == 1 ?
+        -:  636:		    PHOTOMETRIC_LOGL : PHOTOMETRIC_LOGLUV);
+    #####:  637:	else if (input_compression == COMPRESSION_JPEG &&
+    #####:  638:			 samplesperpixel == 3 ) {
+        -:  639:		/* RGB conversion was forced above
+        -:  640:		hence the output will be of the same type */
+    #####:  641:		TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
+        -:  642:	}
+        -:  643:	else
+    #####:  644:		CopyTag(TIFFTAG_PHOTOMETRIC, 1, TIFF_SHORT);
+    #####:  645:	if (fillorder != 0)
+    #####:  646:		TIFFSetField(out, TIFFTAG_FILLORDER, fillorder);
+        -:  647:	else
+    #####:  648:		CopyTag(TIFFTAG_FILLORDER, 1, TIFF_SHORT);
+        -:  649:	/*
+        -:  650:	 * Will copy `Orientation' tag from input image
+        -:  651:	 */
+    #####:  652:	TIFFGetFieldDefaulted(in, TIFFTAG_ORIENTATION, &orientation);
+    #####:  653:	switch (orientation) {
+    #####:  654:		case ORIENTATION_BOTRIGHT:
+        -:  655:		case ORIENTATION_RIGHTBOT:	/* XXX */
+    #####:  656:			TIFFWarning(TIFFFileName(in), "using bottom-left orientation");
+    #####:  657:			orientation = ORIENTATION_BOTLEFT;
+        -:  658:		/* fall thru... */
+    #####:  659:		case ORIENTATION_LEFTBOT:	/* XXX */
+        -:  660:		case ORIENTATION_BOTLEFT:
+    #####:  661:			break;
+    #####:  662:		case ORIENTATION_TOPRIGHT:
+        -:  663:		case ORIENTATION_RIGHTTOP:	/* XXX */
+        -:  664:		default:
+    #####:  665:			TIFFWarning(TIFFFileName(in), "using top-left orientation");
+    #####:  666:			orientation = ORIENTATION_TOPLEFT;
+        -:  667:		/* fall thru... */
+    #####:  668:		case ORIENTATION_LEFTTOP:	/* XXX */
+        -:  669:		case ORIENTATION_TOPLEFT:
+    #####:  670:			break;
+        -:  671:	}
+    #####:  672:	TIFFSetField(out, TIFFTAG_ORIENTATION, orientation);
+        -:  673:	/*
+        -:  674:	 * Choose tiles/strip for the output image according to
+        -:  675:	 * the command line arguments (-tiles, -strips) and the
+        -:  676:	 * structure of the input image.
+        -:  677:	 */
+    #####:  678:	if (outtiled == -1)
+    #####:  679:		outtiled = TIFFIsTiled(in);
+    #####:  680:	if (outtiled) {
+        -:  681:		/*
+        -:  682:		 * Setup output file's tile width&height.  If either
+        -:  683:		 * is not specified, use either the value from the
+        -:  684:		 * input image or, if nothing is defined, use the
+        -:  685:		 * library default.
+        -:  686:		 */
+    #####:  687:		if (tilewidth == (uint32) -1)
+    #####:  688:			TIFFGetField(in, TIFFTAG_TILEWIDTH, &tilewidth);
+    #####:  689:		if (tilelength == (uint32) -1)
+    #####:  690:			TIFFGetField(in, TIFFTAG_TILELENGTH, &tilelength);
+    #####:  691:		TIFFDefaultTileSize(out, &tilewidth, &tilelength);
+    #####:  692:		TIFFSetField(out, TIFFTAG_TILEWIDTH, tilewidth);
+    #####:  693:		TIFFSetField(out, TIFFTAG_TILELENGTH, tilelength);
+        -:  694:	} else {
+        -:  695:		/*
+        -:  696:		 * RowsPerStrip is left unspecified: use either the
+        -:  697:		 * value from the input image or, if nothing is defined,
+        -:  698:		 * use the library default.
+        -:  699:		 */
+    #####:  700:		if (rowsperstrip == (uint32) 0) {
+    #####:  701:			if (!TIFFGetField(in, TIFFTAG_ROWSPERSTRIP,
+        -:  702:			    &rowsperstrip)) {
+    #####:  703:				rowsperstrip =
+    #####:  704:				    TIFFDefaultStripSize(out, rowsperstrip);
+        -:  705:			}
+    #####:  706:			if (rowsperstrip > length && rowsperstrip != (uint32)-1)
+    #####:  707:				rowsperstrip = length;
+        -:  708:		}
+    #####:  709:		else if (rowsperstrip == (uint32) -1)
+    #####:  710:			rowsperstrip = length;
+    #####:  711:		TIFFSetField(out, TIFFTAG_ROWSPERSTRIP, rowsperstrip);
+        -:  712:	}
+    #####:  713:	if (config != (uint16) -1)
+    #####:  714:		TIFFSetField(out, TIFFTAG_PLANARCONFIG, config);
+        -:  715:	else
+    #####:  716:		CopyField(TIFFTAG_PLANARCONFIG, config);
+    #####:  717:	if (samplesperpixel <= 4)
+    #####:  718:		CopyTag(TIFFTAG_TRANSFERFUNCTION, 4, TIFF_SHORT);
+    #####:  719:	CopyTag(TIFFTAG_COLORMAP, 4, TIFF_SHORT);
+        -:  720:/* SMinSampleValue & SMaxSampleValue */
+    #####:  721:	switch (compression) {
+    #####:  722:		case COMPRESSION_JPEG:
+    #####:  723:			TIFFSetField(out, TIFFTAG_JPEGQUALITY, quality);
+    #####:  724:			TIFFSetField(out, TIFFTAG_JPEGCOLORMODE, jpegcolormode);
+    #####:  725:			break;
+    #####:  726:		case COMPRESSION_JBIG:
+    #####:  727:			CopyTag(TIFFTAG_FAXRECVPARAMS, 1, TIFF_LONG);
+    #####:  728:			CopyTag(TIFFTAG_FAXRECVTIME, 1, TIFF_LONG);
+    #####:  729:			CopyTag(TIFFTAG_FAXSUBADDRESS, 1, TIFF_ASCII);
+    #####:  730:			CopyTag(TIFFTAG_FAXDCS, 1, TIFF_ASCII);
+    #####:  731:			break;
+    #####:  732:		case COMPRESSION_LZW:
+        -:  733:		case COMPRESSION_ADOBE_DEFLATE:
+        -:  734:		case COMPRESSION_DEFLATE:
+        -:  735:                case COMPRESSION_LZMA:
+    #####:  736:			if (predictor != (uint16)-1)
+    #####:  737:				TIFFSetField(out, TIFFTAG_PREDICTOR, predictor);
+        -:  738:			else
+    #####:  739:				CopyField(TIFFTAG_PREDICTOR, predictor);
+    #####:  740:			if (preset != -1) {
+    #####:  741:                                if (compression == COMPRESSION_ADOBE_DEFLATE
+    #####:  742:                                         || compression == COMPRESSION_DEFLATE)
+    #####:  743:                                        TIFFSetField(out, TIFFTAG_ZIPQUALITY, preset);
+    #####:  744:				else if (compression == COMPRESSION_LZMA)
+    #####:  745:					TIFFSetField(out, TIFFTAG_LZMAPRESET, preset);
+        -:  746:                        }
+    #####:  747:			break;
+    #####:  748:		case COMPRESSION_CCITTFAX3:
+        -:  749:		case COMPRESSION_CCITTFAX4:
+    #####:  750:			if (compression == COMPRESSION_CCITTFAX3) {
+    #####:  751:				if (g3opts != (uint32) -1)
+    #####:  752:					TIFFSetField(out, TIFFTAG_GROUP3OPTIONS,
+        -:  753:					    g3opts);
+        -:  754:				else
+    #####:  755:					CopyField(TIFFTAG_GROUP3OPTIONS, g3opts);
+        -:  756:			} else
+    #####:  757:				CopyTag(TIFFTAG_GROUP4OPTIONS, 1, TIFF_LONG);
+    #####:  758:			CopyTag(TIFFTAG_BADFAXLINES, 1, TIFF_LONG);
+    #####:  759:			CopyTag(TIFFTAG_CLEANFAXDATA, 1, TIFF_LONG);
+    #####:  760:			CopyTag(TIFFTAG_CONSECUTIVEBADFAXLINES, 1, TIFF_LONG);
+    #####:  761:			CopyTag(TIFFTAG_FAXRECVPARAMS, 1, TIFF_LONG);
+    #####:  762:			CopyTag(TIFFTAG_FAXRECVTIME, 1, TIFF_LONG);
+    #####:  763:			CopyTag(TIFFTAG_FAXSUBADDRESS, 1, TIFF_ASCII);
+    #####:  764:			break;
+        -:  765:	}
+    #####:  766:	{
+    #####:  767:		uint32 len32;
+    #####:  768:		void** data;
+    #####:  769:		if (TIFFGetField(in, TIFFTAG_ICCPROFILE, &len32, &data))
+    #####:  770:			TIFFSetField(out, TIFFTAG_ICCPROFILE, len32, data);
+        -:  771:	}
+        -:  772:	{
+    #####:  773:		uint16 ninks;
+    #####:  774:		const char* inknames;
+    #####:  775:		if (TIFFGetField(in, TIFFTAG_NUMBEROFINKS, &ninks)) {
+    #####:  776:			TIFFSetField(out, TIFFTAG_NUMBEROFINKS, ninks);
+    #####:  777:			if (TIFFGetField(in, TIFFTAG_INKNAMES, &inknames)) {
+    #####:  778:				int inknameslen = strlen(inknames) + 1;
+    #####:  779:				const char* cp = inknames;
+    #####:  780:				while (ninks > 1) {
+    #####:  781:					cp = strchr(cp, '\0');
+    #####:  782:                                        cp++;
+    #####:  783:                                        inknameslen += (strlen(cp) + 1);
+    #####:  784:					ninks--;
+        -:  785:				}
+    #####:  786:				TIFFSetField(out, TIFFTAG_INKNAMES, inknameslen, inknames);
+        -:  787:			}
+        -:  788:		}
+        -:  789:	}
+        -:  790:	{
+    #####:  791:		unsigned short pg0, pg1;
+        -:  792:
+    #####:  793:		if (pageInSeq == 1) {
+    #####:  794:			if (pageNum < 0) /* only one input file */ {
+    #####:  795:				if (TIFFGetField(in, TIFFTAG_PAGENUMBER, &pg0, &pg1))
+    #####:  796:					TIFFSetField(out, TIFFTAG_PAGENUMBER, pg0, pg1);
+        -:  797:			} else
+    #####:  798:				TIFFSetField(out, TIFFTAG_PAGENUMBER, pageNum++, 0);
+        -:  799:
+        -:  800:		} else {
+    #####:  801:			if (TIFFGetField(in, TIFFTAG_PAGENUMBER, &pg0, &pg1)) {
+    #####:  802:				if (pageNum < 0) /* only one input file */
+    #####:  803:					TIFFSetField(out, TIFFTAG_PAGENUMBER, pg0, pg1);
+        -:  804:				else
+    #####:  805:					TIFFSetField(out, TIFFTAG_PAGENUMBER, pageNum++, 0);
+        -:  806:			}
+        -:  807:		}
+        -:  808:	}
+        -:  809:
+    #####:  810:	for (p = tags; p < &tags[NTAGS]; p++)
+    #####:  811:		CopyTag(p->tag, p->count, p->type);
+        -:  812:
+    #####:  813:	cf = pickCopyFunc(in, out, bitspersample, samplesperpixel);
+    #####:  814:	return (cf ? (*cf)(in, out, length, width, samplesperpixel) : FALSE);
+        -:  815:}
+        -:  816:
+        -:  817:/*
+        -:  818: * Copy Functions.
+        -:  819: */
+        -:  820:#define	DECLAREcpFunc(x) \
+        -:  821:static int x(TIFF* in, TIFF* out, \
+        -:  822:    uint32 imagelength, uint32 imagewidth, tsample_t spp)
+        -:  823:
+        -:  824:#define	DECLAREreadFunc(x) \
+        -:  825:static int x(TIFF* in, \
+        -:  826:    uint8* buf, uint32 imagelength, uint32 imagewidth, tsample_t spp)
+        -:  827:typedef int (*readFunc)(TIFF*, uint8*, uint32, uint32, tsample_t);
+        -:  828:
+        -:  829:#define	DECLAREwriteFunc(x) \
+        -:  830:static int x(TIFF* out, \
+        -:  831:    uint8* buf, uint32 imagelength, uint32 imagewidth, tsample_t spp)
+        -:  832:typedef int (*writeFunc)(TIFF*, uint8*, uint32, uint32, tsample_t);
+        -:  833:
+        -:  834:/*
+        -:  835: * Contig -> contig by scanline for rows/strip change.
+        -:  836: */
+    #####:  837:DECLAREcpFunc(cpContig2ContigByRow)
+        -:  838:{
+    #####:  839:	tsize_t scanlinesize = TIFFScanlineSize(in);
+        -:  840:	tdata_t buf;
+        -:  841:	uint32 row;
+        -:  842:
+    #####:  843:	buf = _TIFFmalloc(scanlinesize);
+    #####:  844:	if (!buf)
+    #####:  845:		return 0;
+    #####:  846:	_TIFFmemset(buf, 0, scanlinesize);
+        -:  847:	(void) imagewidth; (void) spp;
+    #####:  848:	for (row = 0; row < imagelength; row++) {
+    #####:  849:		if (TIFFReadScanline(in, buf, row, 0) < 0 && !ignore) {
+    #####:  850:			TIFFError(TIFFFileName(in),
+        -:  851:				  "Error, can't read scanline %lu",
+        -:  852:				  (unsigned long) row);
+    #####:  853:			goto bad;
+        -:  854:		}
+    #####:  855:		if (TIFFWriteScanline(out, buf, row, 0) < 0) {
+    #####:  856:			TIFFError(TIFFFileName(out),
+        -:  857:				  "Error, can't write scanline %lu",
+        -:  858:				  (unsigned long) row);
+    #####:  859:			goto bad;
+        -:  860:		}
+        -:  861:	}
+    #####:  862:	_TIFFfree(buf);
+    #####:  863:	return 1;
+    #####:  864:bad:
+    #####:  865:	_TIFFfree(buf);
+    #####:  866:	return 0;
+        -:  867:}
+        -:  868:
+        -:  869:
+        -:  870:typedef void biasFn (void *image, void *bias, uint32 pixels);
+        -:  871:
+        -:  872:#define subtract(bits) \
+        -:  873:static void subtract##bits (void *i, void *b, uint32 pixels)\
+        -:  874:{\
+        -:  875:   uint##bits *image = i;\
+        -:  876:   uint##bits *bias = b;\
+        -:  877:   while (pixels--) {\
+        -:  878:     *image = *image > *bias ? *image-*bias : 0;\
+        -:  879:     image++, bias++; \
+        -:  880:   } \
+        -:  881:}
+        -:  882:
+    #####:  883:subtract(8)
+    #####:  884:subtract(16)
+    #####:  885:subtract(32)
+        -:  886:
+    #####:  887:static biasFn *lineSubtractFn (unsigned bits)
+        -:  888:{
+    #####:  889:	switch (bits) {
+    #####:  890:		case  8:  return subtract8;
+    #####:  891:		case 16:  return subtract16;
+    #####:  892:		case 32:  return subtract32;
+        -:  893:	}
+    #####:  894:	return NULL;
+        -:  895:}
+        -:  896:
+        -:  897:/*
+        -:  898: * Contig -> contig by scanline while subtracting a bias image.
+        -:  899: */
+    #####:  900:DECLAREcpFunc(cpBiasedContig2Contig)
+        -:  901:{
+    #####:  902:	if (spp == 1) {
+    #####:  903:		tsize_t biasSize = TIFFScanlineSize(bias);
+    #####:  904:		tsize_t bufSize = TIFFScanlineSize(in);
+        -:  905:		tdata_t buf, biasBuf;
+    #####:  906:		uint32 biasWidth = 0, biasLength = 0;
+    #####:  907:		TIFFGetField(bias, TIFFTAG_IMAGEWIDTH, &biasWidth);
+    #####:  908:		TIFFGetField(bias, TIFFTAG_IMAGELENGTH, &biasLength);
+    #####:  909:		if (biasSize == bufSize &&
+    #####:  910:		    imagelength == biasLength && imagewidth == biasWidth) {
+    #####:  911:			uint16 sampleBits = 0;
+        -:  912:			biasFn *subtractLine;
+    #####:  913:			TIFFGetField(in, TIFFTAG_BITSPERSAMPLE, &sampleBits);
+    #####:  914:			subtractLine = lineSubtractFn (sampleBits);
+    #####:  915:			if (subtractLine) {
+        -:  916:				uint32 row;
+    #####:  917:				buf = _TIFFmalloc(bufSize);
+    #####:  918:				biasBuf = _TIFFmalloc(bufSize);
+    #####:  919:				for (row = 0; row < imagelength; row++) {
+    #####:  920:					if (TIFFReadScanline(in, buf, row, 0) < 0
+    #####:  921:					    && !ignore) {
+    #####:  922:						TIFFError(TIFFFileName(in),
+        -:  923:						    "Error, can't read scanline %lu",
+        -:  924:						    (unsigned long) row);
+    #####:  925:						goto bad;
+        -:  926:					}
+    #####:  927:					if (TIFFReadScanline(bias, biasBuf, row, 0) < 0
+    #####:  928:					    && !ignore) {
+    #####:  929:						TIFFError(TIFFFileName(in),
+        -:  930:						    "Error, can't read biased scanline %lu",
+        -:  931:						    (unsigned long) row);
+    #####:  932:						goto bad;
+        -:  933:					}
+    #####:  934:					subtractLine (buf, biasBuf, imagewidth);
+    #####:  935:					if (TIFFWriteScanline(out, buf, row, 0) < 0) {
+    #####:  936:						TIFFError(TIFFFileName(out),
+        -:  937:						    "Error, can't write scanline %lu",
+        -:  938:						    (unsigned long) row);
+    #####:  939:						goto bad;
+        -:  940:					}
+        -:  941:				}
+        -:  942:
+    #####:  943:				_TIFFfree(buf);
+    #####:  944:				_TIFFfree(biasBuf);
+    #####:  945:				TIFFSetDirectory(bias,
+    #####:  946:				    TIFFCurrentDirectory(bias)); /* rewind */
+    #####:  947:				return 1;
+    #####:  948:bad:
+    #####:  949:				_TIFFfree(buf);
+    #####:  950:				_TIFFfree(biasBuf);
+    #####:  951:				return 0;
+        -:  952:			} else {
+    #####:  953:				TIFFError(TIFFFileName(in),
+        -:  954:				    "No support for biasing %d bit pixels\n",
+        -:  955:				    sampleBits);
+    #####:  956:				return 0;
+        -:  957:			}
+        -:  958:		}
+    #####:  959:		TIFFError(TIFFFileName(in),
+        -:  960:		    "Bias image %s,%d\nis not the same size as %s,%d\n",
+    #####:  961:		    TIFFFileName(bias), TIFFCurrentDirectory(bias),
+    #####:  962:		    TIFFFileName(in), TIFFCurrentDirectory(in));
+    #####:  963:		return 0;
+        -:  964:	} else {
+    #####:  965:		TIFFError(TIFFFileName(in),
+        -:  966:		    "Can't bias %s,%d as it has >1 Sample/Pixel\n",
+    #####:  967:		    TIFFFileName(in), TIFFCurrentDirectory(in));
+    #####:  968:		return 0;
+        -:  969:	}
+        -:  970:
+        -:  971:}
+        -:  972:
+        -:  973:
+        -:  974:/*
+        -:  975: * Strip -> strip for change in encoding.
+        -:  976: */
+    #####:  977:DECLAREcpFunc(cpDecodedStrips)
+        -:  978:{
+    #####:  979:	tsize_t stripsize  = TIFFStripSize(in);
+    #####:  980:	tdata_t buf = _TIFFmalloc(stripsize);
+        -:  981:
+        -:  982:	(void) imagewidth; (void) spp;
+    #####:  983:	if (buf) {
+    #####:  984:		tstrip_t s, ns = TIFFNumberOfStrips(in);
+    #####:  985:		uint32 row = 0;
+    #####:  986:		_TIFFmemset(buf, 0, stripsize);
+    #####:  987:		for (s = 0; s < ns && row < imagelength; s++) {
+    #####:  988:			tsize_t cc = (row + rowsperstrip > imagelength) ?
+    #####:  989:			    TIFFVStripSize(in, imagelength - row) : stripsize;
+    #####:  990:			if (TIFFReadEncodedStrip(in, s, buf, cc) < 0
+    #####:  991:			    && !ignore) {
+    #####:  992:				TIFFError(TIFFFileName(in),
+        -:  993:				    "Error, can't read strip %lu",
+        -:  994:				    (unsigned long) s);
+    #####:  995:				goto bad;
+        -:  996:			}
+    #####:  997:			if (TIFFWriteEncodedStrip(out, s, buf, cc) < 0) {
+    #####:  998:				TIFFError(TIFFFileName(out),
+        -:  999:				    "Error, can't write strip %lu",
+        -: 1000:				    (unsigned long) s);
+    #####: 1001:				goto bad;
+        -: 1002:			}
+    #####: 1003:			row += rowsperstrip;
+        -: 1004:		}
+    #####: 1005:		_TIFFfree(buf);
+    #####: 1006:		return 1;
+        -: 1007:	} else {
+    #####: 1008:		TIFFError(TIFFFileName(in),
+        -: 1009:		    "Error, can't allocate memory buffer of size %lu "
+        -: 1010:		    "to read strips", (unsigned long) stripsize);
+    #####: 1011:		return 0;
+        -: 1012:	}
+        -: 1013:
+    #####: 1014:bad:
+    #####: 1015:	_TIFFfree(buf);
+    #####: 1016:	return 0;
+        -: 1017:}
+        -: 1018:
+        -: 1019:/*
+        -: 1020: * Separate -> separate by row for rows/strip change.
+        -: 1021: */
+    #####: 1022:DECLAREcpFunc(cpSeparate2SeparateByRow)
+        -: 1023:{
+    #####: 1024:	tsize_t scanlinesize = TIFFScanlineSize(in);
+        -: 1025:	tdata_t buf;
+        -: 1026:	uint32 row;
+        -: 1027:	tsample_t s;
+        -: 1028:
+        -: 1029:	(void) imagewidth;
+    #####: 1030:	buf = _TIFFmalloc(scanlinesize);
+    #####: 1031:	if (!buf)
+    #####: 1032:		return 0;
+    #####: 1033:	_TIFFmemset(buf, 0, scanlinesize);
+    #####: 1034:	for (s = 0; s < spp; s++) {
+    #####: 1035:		for (row = 0; row < imagelength; row++) {
+    #####: 1036:			if (TIFFReadScanline(in, buf, row, s) < 0 && !ignore) {
+    #####: 1037:				TIFFError(TIFFFileName(in),
+        -: 1038:				    "Error, can't read scanline %lu",
+        -: 1039:				    (unsigned long) row);
+    #####: 1040:				goto bad;
+        -: 1041:			}
+    #####: 1042:			if (TIFFWriteScanline(out, buf, row, s) < 0) {
+    #####: 1043:				TIFFError(TIFFFileName(out),
+        -: 1044:				    "Error, can't write scanline %lu",
+        -: 1045:				    (unsigned long) row);
+    #####: 1046:				goto bad;
+        -: 1047:			}
+        -: 1048:		}
+        -: 1049:	}
+    #####: 1050:	_TIFFfree(buf);
+    #####: 1051:	return 1;
+    #####: 1052:bad:
+    #####: 1053:	_TIFFfree(buf);
+    #####: 1054:	return 0;
+        -: 1055:}
+        -: 1056:
+        -: 1057:/*
+        -: 1058: * Contig -> separate by row.
+        -: 1059: */
+    #####: 1060:DECLAREcpFunc(cpContig2SeparateByRow)
+        -: 1061:{
+    #####: 1062:	tsize_t scanlinesizein = TIFFScanlineSize(in);
+    #####: 1063:	tsize_t scanlinesizeout = TIFFScanlineSize(out);
+        -: 1064:	tdata_t inbuf;
+        -: 1065:	tdata_t outbuf;
+        -: 1066:	register uint8 *inp, *outp;
+        -: 1067:	register uint32 n;
+        -: 1068:	uint32 row;
+        -: 1069:	tsample_t s;
+        -: 1070:
+    #####: 1071:	inbuf = _TIFFmalloc(scanlinesizein);
+    #####: 1072:	outbuf = _TIFFmalloc(scanlinesizeout);
+    #####: 1073:	if (!inbuf || !outbuf)
+    #####: 1074:		goto bad;
+    #####: 1075:	_TIFFmemset(inbuf, 0, scanlinesizein);
+    #####: 1076:	_TIFFmemset(outbuf, 0, scanlinesizeout);
+        -: 1077:	/* unpack channels */
+    #####: 1078:	for (s = 0; s < spp; s++) {
+    #####: 1079:		for (row = 0; row < imagelength; row++) {
+    #####: 1080:			if (TIFFReadScanline(in, inbuf, row, 0) < 0
+    #####: 1081:			    && !ignore) {
+    #####: 1082:				TIFFError(TIFFFileName(in),
+        -: 1083:				    "Error, can't read scanline %lu",
+        -: 1084:				    (unsigned long) row);
+    #####: 1085:				goto bad;
+        -: 1086:			}
+    #####: 1087:			inp = ((uint8*)inbuf) + s;
+    #####: 1088:			outp = (uint8*)outbuf;
+    #####: 1089:			for (n = imagewidth; n-- > 0;) {
+    #####: 1090:				*outp++ = *inp;
+    #####: 1091:				inp += spp;
+        -: 1092:			}
+    #####: 1093:			if (TIFFWriteScanline(out, outbuf, row, s) < 0) {
+    #####: 1094:				TIFFError(TIFFFileName(out),
+        -: 1095:				    "Error, can't write scanline %lu",
+        -: 1096:				    (unsigned long) row);
+    #####: 1097:				goto bad;
+        -: 1098:			}
+        -: 1099:		}
+        -: 1100:	}
+    #####: 1101:	if (inbuf) _TIFFfree(inbuf);
+    #####: 1102:	if (outbuf) _TIFFfree(outbuf);
+    #####: 1103:	return 1;
+    #####: 1104:bad:
+    #####: 1105:	if (inbuf) _TIFFfree(inbuf);
+    #####: 1106:	if (outbuf) _TIFFfree(outbuf);
+    #####: 1107:	return 0;
+        -: 1108:}
+        -: 1109:
+        -: 1110:/*
+        -: 1111: * Separate -> contig by row.
+        -: 1112: */
+    #####: 1113:DECLAREcpFunc(cpSeparate2ContigByRow)
+        -: 1114:{
+    #####: 1115:	tsize_t scanlinesizein = TIFFScanlineSize(in);
+    #####: 1116:	tsize_t scanlinesizeout = TIFFScanlineSize(out);
+        -: 1117:	tdata_t inbuf;
+        -: 1118:	tdata_t outbuf;
+        -: 1119:	register uint8 *inp, *outp;
+        -: 1120:	register uint32 n;
+        -: 1121:	uint32 row;
+        -: 1122:	tsample_t s;
+        -: 1123:
+    #####: 1124:	inbuf = _TIFFmalloc(scanlinesizein);
+    #####: 1125:	outbuf = _TIFFmalloc(scanlinesizeout);
+    #####: 1126:	if (!inbuf || !outbuf)
+    #####: 1127:                goto bad;
+    #####: 1128:	_TIFFmemset(inbuf, 0, scanlinesizein);
+    #####: 1129:	_TIFFmemset(outbuf, 0, scanlinesizeout);
+    #####: 1130:	for (row = 0; row < imagelength; row++) {
+        -: 1131:		/* merge channels */
+    #####: 1132:		for (s = 0; s < spp; s++) {
+    #####: 1133:			if (TIFFReadScanline(in, inbuf, row, s) < 0
+    #####: 1134:			    && !ignore) {
+    #####: 1135:				TIFFError(TIFFFileName(in),
+        -: 1136:				    "Error, can't read scanline %lu",
+        -: 1137:				    (unsigned long) row);
+    #####: 1138:				goto bad;
+        -: 1139:			}
+    #####: 1140:			inp = (uint8*)inbuf;
+    #####: 1141:			outp = ((uint8*)outbuf) + s;
+    #####: 1142:			for (n = imagewidth; n-- > 0;) {
+    #####: 1143:				*outp = *inp++;
+    #####: 1144:				outp += spp;
+        -: 1145:			}
+        -: 1146:		}
+    #####: 1147:		if (TIFFWriteScanline(out, outbuf, row, 0) < 0) {
+    #####: 1148:			TIFFError(TIFFFileName(out),
+        -: 1149:			    "Error, can't write scanline %lu",
+        -: 1150:			    (unsigned long) row);
+    #####: 1151:			goto bad;
+        -: 1152:		}
+        -: 1153:	}
+    #####: 1154:	if (inbuf) _TIFFfree(inbuf);
+    #####: 1155:	if (outbuf) _TIFFfree(outbuf);
+    #####: 1156:	return 1;
+    #####: 1157:bad:
+    #####: 1158:	if (inbuf) _TIFFfree(inbuf);
+    #####: 1159:	if (outbuf) _TIFFfree(outbuf);
+    #####: 1160:	return 0;
+        -: 1161:}
+        -: 1162:
+        -: 1163:static void
+    #####: 1164:cpStripToTile(uint8* out, uint8* in,
+        -: 1165:    uint32 rows, uint32 cols, int outskew, int64 inskew)
+        -: 1166:{
+    #####: 1167:	while (rows-- > 0) {
+    #####: 1168:		uint32 j = cols;
+    #####: 1169:		while (j-- > 0)
+    #####: 1170:			*out++ = *in++;
+    #####: 1171:		out += outskew;
+    #####: 1172:		in += inskew;
+        -: 1173:	}
+    #####: 1174:}
+        -: 1175:
+        -: 1176:static void
+    #####: 1177:cpContigBufToSeparateBuf(uint8* out, uint8* in,
+        -: 1178:    uint32 rows, uint32 cols, int outskew, int inskew, tsample_t spp,
+        -: 1179:    int bytes_per_sample )
+        -: 1180:{
+    #####: 1181:	while (rows-- > 0) {
+    #####: 1182:		uint32 j = cols;
+    #####: 1183:		while (j-- > 0)
+        -: 1184:		{
+    #####: 1185:			int n = bytes_per_sample;
+        -: 1186:
+    #####: 1187:			while( n-- ) {
+    #####: 1188:				*out++ = *in++;
+        -: 1189:			}
+    #####: 1190:			in += (spp-1) * bytes_per_sample;
+        -: 1191:		}
+    #####: 1192:		out += outskew;
+    #####: 1193:		in += inskew;
+        -: 1194:	}
+    #####: 1195:}
+        -: 1196:
+        -: 1197:static void
+    #####: 1198:cpSeparateBufToContigBuf(uint8* out, uint8* in,
+        -: 1199:    uint32 rows, uint32 cols, int outskew, int inskew, tsample_t spp,
+        -: 1200:    int bytes_per_sample)
+        -: 1201:{
+    #####: 1202:	while (rows-- > 0) {
+    #####: 1203:		uint32 j = cols;
+    #####: 1204:		while (j-- > 0) {
+    #####: 1205:			int n = bytes_per_sample;
+        -: 1206:
+    #####: 1207:			while( n-- ) {
+    #####: 1208:				*out++ = *in++;
+        -: 1209:			}
+    #####: 1210:			out += (spp-1)*bytes_per_sample;
+        -: 1211:		}
+    #####: 1212:		out += outskew;
+    #####: 1213:		in += inskew;
+        -: 1214:	}
+    #####: 1215:}
+        -: 1216:
+        -: 1217:static int
+    #####: 1218:cpImage(TIFF* in, TIFF* out, readFunc fin, writeFunc fout,
+        -: 1219:	uint32 imagelength, uint32 imagewidth, tsample_t spp)
+        -: 1220:{
+    #####: 1221:	int status = 0;
+    #####: 1222:	tdata_t buf = NULL;
+    #####: 1223:	tsize_t scanlinesize = TIFFRasterScanlineSize(in);
+    #####: 1224:	tsize_t bytes = scanlinesize * (tsize_t)imagelength;
+        -: 1225:	/*
+        -: 1226:	 * XXX: Check for integer overflow.
+        -: 1227:	 */
+    #####: 1228:	if (scanlinesize
+    #####: 1229:	    && imagelength
+    #####: 1230:	    && bytes / (tsize_t)imagelength == scanlinesize) {
+    #####: 1231:		buf = _TIFFmalloc(bytes);
+    #####: 1232:		if (buf) {
+    #####: 1233:			if ((*fin)(in, (uint8*)buf, imagelength,
+        -: 1234:			    imagewidth, spp)) {
+    #####: 1235:				status = (*fout)(out, (uint8*)buf,
+        -: 1236:				    imagelength, imagewidth, spp);
+        -: 1237:			}
+    #####: 1238:			_TIFFfree(buf);
+        -: 1239:		} else {
+    #####: 1240:			TIFFError(TIFFFileName(in),
+        -: 1241:			    "Error, can't allocate space for image buffer");
+        -: 1242:		}
+        -: 1243:	} else {
+    #####: 1244:		TIFFError(TIFFFileName(in), "Error, no space for image buffer");
+        -: 1245:	}
+        -: 1246:
+    #####: 1247:	return status;
+        -: 1248:}
+        -: 1249:
+    #####: 1250:DECLAREreadFunc(readContigStripsIntoBuffer)
+        -: 1251:{
+    #####: 1252:	tsize_t scanlinesize = TIFFScanlineSize(in);
+    #####: 1253:	uint8* bufp = buf;
+        -: 1254:	uint32 row;
+        -: 1255:
+        -: 1256:	(void) imagewidth; (void) spp;
+    #####: 1257:	for (row = 0; row < imagelength; row++) {
+    #####: 1258:		if (TIFFReadScanline(in, (tdata_t) bufp, row, 0) < 0
+    #####: 1259:		    && !ignore) {
+    #####: 1260:			TIFFError(TIFFFileName(in),
+        -: 1261:			    "Error, can't read scanline %lu",
+        -: 1262:			    (unsigned long) row);
+    #####: 1263:			return 0;
+        -: 1264:		}
+    #####: 1265:		bufp += scanlinesize;
+        -: 1266:	}
+        -: 1267:
+    #####: 1268:	return 1;
+        -: 1269:}
+        -: 1270:
+    #####: 1271:DECLAREreadFunc(readSeparateStripsIntoBuffer)
+        -: 1272:{
+    #####: 1273:	int status = 1;
+    #####: 1274:	tsize_t scanlinesize = TIFFScanlineSize(in);
+        -: 1275:	tdata_t scanline;
+    #####: 1276:	if (!scanlinesize)
+    #####: 1277:		return 0;
+        -: 1278:
+    #####: 1279:	scanline = _TIFFmalloc(scanlinesize);
+    #####: 1280:	if (!scanline)
+    #####: 1281:		return 0;
+    #####: 1282:	_TIFFmemset(scanline, 0, scanlinesize);
+        -: 1283:	(void) imagewidth;
+    #####: 1284:	if (scanline) {
+    #####: 1285:		uint8* bufp = (uint8*) buf;
+        -: 1286:		uint32 row;
+        -: 1287:		tsample_t s;
+    #####: 1288:		for (row = 0; row < imagelength; row++) {
+        -: 1289:			/* merge channels */
+    #####: 1290:			for (s = 0; s < spp; s++) {
+    #####: 1291:				uint8* bp = bufp + s;
+    #####: 1292:				tsize_t n = scanlinesize;
+    #####: 1293:				uint8* sbuf = scanline;
+        -: 1294:
+    #####: 1295:				if (TIFFReadScanline(in, scanline, row, s) < 0
+    #####: 1296:				    && !ignore) {
+    #####: 1297:					TIFFError(TIFFFileName(in),
+        -: 1298:					    "Error, can't read scanline %lu",
+        -: 1299:					    (unsigned long) row);
+    #####: 1300:					    status = 0;
+    #####: 1301:					goto done;
+        -: 1302:				}
+    #####: 1303:				while (n-- > 0)
+    #####: 1304:					*bp = *sbuf++, bp += spp;
+        -: 1305:			}
+    #####: 1306:			bufp += scanlinesize * spp;
+        -: 1307:		}
+        -: 1308:	}
+        -: 1309:
+    #####: 1310:done:
+    #####: 1311:	_TIFFfree(scanline);
+    #####: 1312:	return status;
+        -: 1313:}
+        -: 1314:
+    #####: 1315:DECLAREreadFunc(readContigTilesIntoBuffer)
+        -: 1316:{
+    #####: 1317:	int status = 1;
+    #####: 1318:	tsize_t tilesize = TIFFTileSize(in);
+        -: 1319:	tdata_t tilebuf;
+    #####: 1320:	uint32 imagew = TIFFScanlineSize(in);
+    #####: 1321:	uint32 tilew  = TIFFTileRowSize(in);
+    #####: 1322:	int64 iskew = (int64)imagew - (int64)tilew;
+    #####: 1323:	uint8* bufp = (uint8*) buf;
+    #####: 1324:	uint32 tw, tl;
+        -: 1325:	uint32 row;
+        -: 1326:
+        -: 1327:	(void) spp;
+    #####: 1328:	tilebuf = _TIFFmalloc(tilesize);
+    #####: 1329:	if (tilebuf == 0)
+    #####: 1330:		return 0;
+    #####: 1331:	_TIFFmemset(tilebuf, 0, tilesize);
+    #####: 1332:	(void) TIFFGetField(in, TIFFTAG_TILEWIDTH, &tw);
+    #####: 1333:	(void) TIFFGetField(in, TIFFTAG_TILELENGTH, &tl);
+        -: 1334:        
+    #####: 1335:	for (row = 0; row < imagelength; row += tl) {
+    #####: 1336:		uint32 nrow = (row+tl > imagelength) ? imagelength-row : tl;
+    #####: 1337:		uint32 colb = 0;
+        -: 1338:		uint32 col;
+        -: 1339:
+    #####: 1340:		for (col = 0; col < imagewidth && colb < imagew; col += tw) {
+    #####: 1341:			if (TIFFReadTile(in, tilebuf, col, row, 0, 0) < 0
+    #####: 1342:			    && !ignore) {
+    #####: 1343:				TIFFError(TIFFFileName(in),
+        -: 1344:				    "Error, can't read tile at %lu %lu",
+        -: 1345:				    (unsigned long) col,
+        -: 1346:				    (unsigned long) row);
+    #####: 1347:				status = 0;
+    #####: 1348:				goto done;
+        -: 1349:			}
+    #####: 1350:			if (colb > iskew) {
+    #####: 1351:				uint32 width = imagew - colb;
+    #####: 1352:				uint32 oskew = tilew - width;
+    #####: 1353:				cpStripToTile(bufp + colb,
+        -: 1354:				    tilebuf, nrow, width,
+    #####: 1355:				    oskew + iskew, oskew );
+        -: 1356:			} else
+    #####: 1357:				cpStripToTile(bufp + colb,
+        -: 1358:				    tilebuf, nrow, tilew,
+        -: 1359:				    iskew, 0);
+    #####: 1360:			colb += tilew;
+        -: 1361:		}
+    #####: 1362:		bufp += imagew * nrow;
+        -: 1363:	}
+    #####: 1364:done:
+    #####: 1365:	_TIFFfree(tilebuf);
+    #####: 1366:	return status;
+        -: 1367:}
+        -: 1368:
+    #####: 1369:DECLAREreadFunc(readSeparateTilesIntoBuffer)
+        -: 1370:{
+    #####: 1371:	int status = 1;
+    #####: 1372:	uint32 imagew = TIFFRasterScanlineSize(in);
+    #####: 1373:	uint32 tilew = TIFFTileRowSize(in);
+    #####: 1374:	int iskew  = imagew - tilew*spp;
+    #####: 1375:	tsize_t tilesize = TIFFTileSize(in);
+        -: 1376:	tdata_t tilebuf;
+    #####: 1377:	uint8* bufp = (uint8*) buf;
+    #####: 1378:	uint32 tw, tl;
+        -: 1379:	uint32 row;
+    #####: 1380:	uint16 bps = 0, bytes_per_sample;
+        -: 1381:
+    #####: 1382:	tilebuf = _TIFFmalloc(tilesize);
+    #####: 1383:	if (tilebuf == 0)
+    #####: 1384:		return 0;
+    #####: 1385:	_TIFFmemset(tilebuf, 0, tilesize);
+    #####: 1386:	(void) TIFFGetField(in, TIFFTAG_TILEWIDTH, &tw);
+    #####: 1387:	(void) TIFFGetField(in, TIFFTAG_TILELENGTH, &tl);
+    #####: 1388:	(void) TIFFGetField(in, TIFFTAG_BITSPERSAMPLE, &bps);
+    #####: 1389:        if( bps == 0 )
+        -: 1390:        {
+    #####: 1391:            TIFFError(TIFFFileName(in), "Error, cannot read BitsPerSample");
+    #####: 1392:            status = 0;
+    #####: 1393:            goto done;
+        -: 1394:        }
+    #####: 1395:        if( (bps % 8) != 0 )
+        -: 1396:        {
+    #####: 1397:            TIFFError(TIFFFileName(in), "Error, cannot handle BitsPerSample that is not a multiple of 8");
+    #####: 1398:            status = 0;
+    #####: 1399:            goto done;
+        -: 1400:        }
+    #####: 1401:	bytes_per_sample = bps/8;
+        -: 1402:
+    #####: 1403:	for (row = 0; row < imagelength; row += tl) {
+    #####: 1404:		uint32 nrow = (row+tl > imagelength) ? imagelength-row : tl;
+    #####: 1405:		uint32 colb = 0;
+        -: 1406:		uint32 col;
+        -: 1407:
+    #####: 1408:		for (col = 0; col < imagewidth; col += tw) {
+        -: 1409:			tsample_t s;
+        -: 1410:
+    #####: 1411:			for (s = 0; s < spp; s++) {
+    #####: 1412:				if (TIFFReadTile(in, tilebuf, col, row, 0, s) < 0
+    #####: 1413:				    && !ignore) {
+    #####: 1414:					TIFFError(TIFFFileName(in),
+        -: 1415:					    "Error, can't read tile at %lu %lu, "
+        -: 1416:					    "sample %lu",
+        -: 1417:					    (unsigned long) col,
+        -: 1418:					    (unsigned long) row,
+        -: 1419:					    (unsigned long) s);
+    #####: 1420:					status = 0;
+    #####: 1421:					goto done;
+        -: 1422:				}
+        -: 1423:				/*
+        -: 1424:				 * Tile is clipped horizontally.  Calculate
+        -: 1425:				 * visible portion and skewing factors.
+        -: 1426:				 */
+    #####: 1427:				if (colb + tilew*spp > imagew) {
+    #####: 1428:					uint32 width = imagew - colb;
+    #####: 1429:					int oskew = tilew*spp - width;
+    #####: 1430:					cpSeparateBufToContigBuf(
+    #####: 1431:					    bufp+colb+s*bytes_per_sample,
+        -: 1432:					    tilebuf, nrow,
+    #####: 1433:					    width/(spp*bytes_per_sample),
+        -: 1434:					    oskew + iskew,
+    #####: 1435:					    oskew/spp, spp,
+        -: 1436:					    bytes_per_sample);
+        -: 1437:				} else
+    #####: 1438:					cpSeparateBufToContigBuf(
+    #####: 1439:					    bufp+colb+s*bytes_per_sample,
+        -: 1440:					    tilebuf, nrow, tw,
+        -: 1441:					    iskew, 0, spp,
+        -: 1442:					    bytes_per_sample);
+        -: 1443:			}
+    #####: 1444:			colb += tilew*spp;
+        -: 1445:		}
+    #####: 1446:		bufp += imagew * nrow;
+        -: 1447:	}
+    #####: 1448:done:
+    #####: 1449:	_TIFFfree(tilebuf);
+    #####: 1450:	return status;
+        -: 1451:}
+        -: 1452:
+    #####: 1453:DECLAREwriteFunc(writeBufferToContigStrips)
+        -: 1454:{
+    #####: 1455:	uint32 row, rowsperstrip;
+    #####: 1456:	tstrip_t strip = 0;
+        -: 1457:
+        -: 1458:	(void) imagewidth; (void) spp;
+    #####: 1459:	(void) TIFFGetFieldDefaulted(out, TIFFTAG_ROWSPERSTRIP, &rowsperstrip);
+    #####: 1460:	for (row = 0; row < imagelength; row += rowsperstrip) {
+    #####: 1461:		uint32 nrows = (row+rowsperstrip > imagelength) ?
+    #####: 1462:		    imagelength-row : rowsperstrip;
+    #####: 1463:		tsize_t stripsize = TIFFVStripSize(out, nrows);
+    #####: 1464:		if (TIFFWriteEncodedStrip(out, strip++, buf, stripsize) < 0) {
+    #####: 1465:			TIFFError(TIFFFileName(out),
+        -: 1466:			    "Error, can't write strip %u", strip - 1);
+    #####: 1467:			return 0;
+        -: 1468:		}
+    #####: 1469:		buf += stripsize;
+        -: 1470:	}
+    #####: 1471:	return 1;
+        -: 1472:}
+        -: 1473:
+    #####: 1474:DECLAREwriteFunc(writeBufferToSeparateStrips)
+        -: 1475:{
+    #####: 1476:	uint32 rowsize = imagewidth * spp;
+    #####: 1477:	uint32 rowsperstrip;
+    #####: 1478:	tsize_t stripsize = TIFFStripSize(out);
+        -: 1479:	tdata_t obuf;
+    #####: 1480:	tstrip_t strip = 0;
+        -: 1481:	tsample_t s;
+        -: 1482:
+    #####: 1483:	obuf = _TIFFmalloc(stripsize);
+    #####: 1484:	if (obuf == NULL)
+    #####: 1485:		return (0);
+    #####: 1486:	_TIFFmemset(obuf, 0, stripsize);
+    #####: 1487:	(void) TIFFGetFieldDefaulted(out, TIFFTAG_ROWSPERSTRIP, &rowsperstrip);
+    #####: 1488:	for (s = 0; s < spp; s++) {
+        -: 1489:		uint32 row;
+    #####: 1490:		for (row = 0; row < imagelength; row += rowsperstrip) {
+    #####: 1491:			uint32 nrows = (row+rowsperstrip > imagelength) ?
+    #####: 1492:			    imagelength-row : rowsperstrip;
+    #####: 1493:			tsize_t stripsize = TIFFVStripSize(out, nrows);
+        -: 1494:
+    #####: 1495:			cpContigBufToSeparateBuf(
+    #####: 1496:			    obuf, (uint8*) buf + row*rowsize + s,
+        -: 1497:			    nrows, imagewidth, 0, 0, spp, 1);
+    #####: 1498:			if (TIFFWriteEncodedStrip(out, strip++, obuf, stripsize) < 0) {
+    #####: 1499:				TIFFError(TIFFFileName(out),
+        -: 1500:				    "Error, can't write strip %u",
+        -: 1501:				    strip - 1);
+    #####: 1502:				_TIFFfree(obuf);
+    #####: 1503:				return 0;
+        -: 1504:			}
+        -: 1505:		}
+        -: 1506:	}
+    #####: 1507:	_TIFFfree(obuf);
+    #####: 1508:	return 1;
+        -: 1509:
+        -: 1510:}
+        -: 1511:
+    #####: 1512:DECLAREwriteFunc(writeBufferToContigTiles)
+        -: 1513:{
+    #####: 1514:	uint32 imagew = TIFFScanlineSize(out);
+    #####: 1515:	uint32 tilew  = TIFFTileRowSize(out);
+    #####: 1516:	int iskew = imagew - tilew;
+    #####: 1517:	tsize_t tilesize = TIFFTileSize(out);
+        -: 1518:	tdata_t obuf;
+    #####: 1519:	uint8* bufp = (uint8*) buf;
+    #####: 1520:	uint32 tl, tw;
+        -: 1521:	uint32 row;
+        -: 1522:
+        -: 1523:	(void) spp;
+        -: 1524:
+    #####: 1525:	obuf = _TIFFmalloc(TIFFTileSize(out));
+    #####: 1526:	if (obuf == NULL)
+    #####: 1527:		return 0;
+    #####: 1528:	_TIFFmemset(obuf, 0, tilesize);
+    #####: 1529:	(void) TIFFGetField(out, TIFFTAG_TILELENGTH, &tl);
+    #####: 1530:	(void) TIFFGetField(out, TIFFTAG_TILEWIDTH, &tw);
+    #####: 1531:	for (row = 0; row < imagelength; row += tilelength) {
+    #####: 1532:		uint32 nrow = (row+tl > imagelength) ? imagelength-row : tl;
+    #####: 1533:		uint32 colb = 0;
+        -: 1534:		uint32 col;
+        -: 1535:
+    #####: 1536:		for (col = 0; col < imagewidth && colb < imagew; col += tw) {
+        -: 1537:			/*
+        -: 1538:			 * Tile is clipped horizontally.  Calculate
+        -: 1539:			 * visible portion and skewing factors.
+        -: 1540:			 */
+    #####: 1541:			if (colb + tilew > imagew) {
+    #####: 1542:				uint32 width = imagew - colb;
+    #####: 1543:				int oskew = tilew - width;
+    #####: 1544:				cpStripToTile(obuf, bufp + colb, nrow, width,
+    #####: 1545:				    oskew, oskew + iskew);
+        -: 1546:			} else
+    #####: 1547:				cpStripToTile(obuf, bufp + colb, nrow, tilew,
+        -: 1548:				    0, iskew);
+    #####: 1549:			if (TIFFWriteTile(out, obuf, col, row, 0, 0) < 0) {
+    #####: 1550:				TIFFError(TIFFFileName(out),
+        -: 1551:				    "Error, can't write tile at %lu %lu",
+        -: 1552:				    (unsigned long) col,
+        -: 1553:				    (unsigned long) row);
+    #####: 1554:				_TIFFfree(obuf);
+    #####: 1555:				return 0;
+        -: 1556:			}
+    #####: 1557:			colb += tilew;
+        -: 1558:		}
+    #####: 1559:		bufp += nrow * imagew;
+        -: 1560:	}
+    #####: 1561:	_TIFFfree(obuf);
+    #####: 1562:	return 1;
+        -: 1563:}
+        -: 1564:
+    #####: 1565:DECLAREwriteFunc(writeBufferToSeparateTiles)
+        -: 1566:{
+    #####: 1567:	uint32 imagew = TIFFScanlineSize(out);
+    #####: 1568:	tsize_t tilew  = TIFFTileRowSize(out);
+    #####: 1569:	uint32 iimagew = TIFFRasterScanlineSize(out);
+    #####: 1570:	int iskew = iimagew - tilew*spp;
+    #####: 1571:	tsize_t tilesize = TIFFTileSize(out);
+        -: 1572:	tdata_t obuf;
+    #####: 1573:	uint8* bufp = (uint8*) buf;
+    #####: 1574:	uint32 tl, tw;
+        -: 1575:	uint32 row;
+    #####: 1576:	uint16 bps = 0, bytes_per_sample;
+        -: 1577:
+    #####: 1578:	obuf = _TIFFmalloc(TIFFTileSize(out));
+    #####: 1579:	if (obuf == NULL)
+    #####: 1580:		return 0;
+    #####: 1581:	_TIFFmemset(obuf, 0, tilesize);
+    #####: 1582:	(void) TIFFGetField(out, TIFFTAG_TILELENGTH, &tl);
+    #####: 1583:	(void) TIFFGetField(out, TIFFTAG_TILEWIDTH, &tw);
+    #####: 1584:	(void) TIFFGetField(out, TIFFTAG_BITSPERSAMPLE, &bps);
+    #####: 1585:        if( bps == 0 )
+        -: 1586:        {
+    #####: 1587:            TIFFError(TIFFFileName(out), "Error, cannot read BitsPerSample");
+    #####: 1588:            _TIFFfree(obuf);
+    #####: 1589:            return 0;
+        -: 1590:        }
+    #####: 1591:        if( (bps % 8) != 0 )
+        -: 1592:        {
+    #####: 1593:            TIFFError(TIFFFileName(out), "Error, cannot handle BitsPerSample that is not a multiple of 8");
+    #####: 1594:            _TIFFfree(obuf);
+    #####: 1595:            return 0;
+        -: 1596:        }
+    #####: 1597:	bytes_per_sample = bps/8;
+        -: 1598:
+    #####: 1599:	for (row = 0; row < imagelength; row += tl) {
+    #####: 1600:		uint32 nrow = (row+tl > imagelength) ? imagelength-row : tl;
+    #####: 1601:		uint32 colb = 0;
+        -: 1602:		uint32 col;
+        -: 1603:
+    #####: 1604:		for (col = 0; col < imagewidth; col += tw) {
+        -: 1605:			tsample_t s;
+    #####: 1606:			for (s = 0; s < spp; s++) {
+        -: 1607:				/*
+        -: 1608:				 * Tile is clipped horizontally.  Calculate
+        -: 1609:				 * visible portion and skewing factors.
+        -: 1610:				 */
+    #####: 1611:				if (colb + tilew > imagew) {
+    #####: 1612:					uint32 width = (imagew - colb);
+    #####: 1613:					int oskew = tilew - width;
+        -: 1614:
+    #####: 1615:					cpContigBufToSeparateBuf(obuf,
+    #####: 1616:					    bufp + (colb*spp) + s,
+    #####: 1617:					    nrow, width/bytes_per_sample,
+    #####: 1618:					    oskew, (oskew*spp)+iskew, spp,
+        -: 1619:					    bytes_per_sample);
+        -: 1620:				} else
+    #####: 1621:					cpContigBufToSeparateBuf(obuf,
+    #####: 1622:					    bufp + (colb*spp) + s,
+        -: 1623:					    nrow, tilewidth,
+        -: 1624:					    0, iskew, spp,
+        -: 1625:					    bytes_per_sample);
+    #####: 1626:				if (TIFFWriteTile(out, obuf, col, row, 0, s) < 0) {
+    #####: 1627:					TIFFError(TIFFFileName(out),
+        -: 1628:					    "Error, can't write tile at %lu %lu "
+        -: 1629:					    "sample %lu",
+        -: 1630:					    (unsigned long) col,
+        -: 1631:					    (unsigned long) row,
+        -: 1632:					    (unsigned long) s);
+    #####: 1633:					_TIFFfree(obuf);
+    #####: 1634:					return 0;
+        -: 1635:				}
+        -: 1636:			}
+    #####: 1637:			colb += tilew;
+        -: 1638:		}
+    #####: 1639:		bufp += nrow * iimagew;
+        -: 1640:	}
+    #####: 1641:	_TIFFfree(obuf);
+    #####: 1642:	return 1;
+        -: 1643:}
+        -: 1644:
+        -: 1645:/*
+        -: 1646: * Contig strips -> contig tiles.
+        -: 1647: */
+    #####: 1648:DECLAREcpFunc(cpContigStrips2ContigTiles)
+        -: 1649:{
+    #####: 1650:	return cpImage(in, out,
+        -: 1651:	    readContigStripsIntoBuffer,
+        -: 1652:	    writeBufferToContigTiles,
+        -: 1653:	    imagelength, imagewidth, spp);
+        -: 1654:}
+        -: 1655:
+        -: 1656:/*
+        -: 1657: * Contig strips -> separate tiles.
+        -: 1658: */
+    #####: 1659:DECLAREcpFunc(cpContigStrips2SeparateTiles)
+        -: 1660:{
+    #####: 1661:	return cpImage(in, out,
+        -: 1662:	    readContigStripsIntoBuffer,
+        -: 1663:	    writeBufferToSeparateTiles,
+        -: 1664:	    imagelength, imagewidth, spp);
+        -: 1665:}
+        -: 1666:
+        -: 1667:/*
+        -: 1668: * Separate strips -> contig tiles.
+        -: 1669: */
+    #####: 1670:DECLAREcpFunc(cpSeparateStrips2ContigTiles)
+        -: 1671:{
+    #####: 1672:	return cpImage(in, out,
+        -: 1673:	    readSeparateStripsIntoBuffer,
+        -: 1674:	    writeBufferToContigTiles,
+        -: 1675:	    imagelength, imagewidth, spp);
+        -: 1676:}
+        -: 1677:
+        -: 1678:/*
+        -: 1679: * Separate strips -> separate tiles.
+        -: 1680: */
+    #####: 1681:DECLAREcpFunc(cpSeparateStrips2SeparateTiles)
+        -: 1682:{
+    #####: 1683:	return cpImage(in, out,
+        -: 1684:	    readSeparateStripsIntoBuffer,
+        -: 1685:	    writeBufferToSeparateTiles,
+        -: 1686:	    imagelength, imagewidth, spp);
+        -: 1687:}
+        -: 1688:
+        -: 1689:/*
+        -: 1690: * Contig strips -> contig tiles.
+        -: 1691: */
+    #####: 1692:DECLAREcpFunc(cpContigTiles2ContigTiles)
+        -: 1693:{
+    #####: 1694:	return cpImage(in, out,
+        -: 1695:	    readContigTilesIntoBuffer,
+        -: 1696:	    writeBufferToContigTiles,
+        -: 1697:	    imagelength, imagewidth, spp);
+        -: 1698:}
+        -: 1699:
+        -: 1700:/*
+        -: 1701: * Contig tiles -> separate tiles.
+        -: 1702: */
+    #####: 1703:DECLAREcpFunc(cpContigTiles2SeparateTiles)
+        -: 1704:{
+    #####: 1705:	return cpImage(in, out,
+        -: 1706:	    readContigTilesIntoBuffer,
+        -: 1707:	    writeBufferToSeparateTiles,
+        -: 1708:	    imagelength, imagewidth, spp);
+        -: 1709:}
+        -: 1710:
+        -: 1711:/*
+        -: 1712: * Separate tiles -> contig tiles.
+        -: 1713: */
+    #####: 1714:DECLAREcpFunc(cpSeparateTiles2ContigTiles)
+        -: 1715:{
+    #####: 1716:	return cpImage(in, out,
+        -: 1717:	    readSeparateTilesIntoBuffer,
+        -: 1718:	    writeBufferToContigTiles,
+        -: 1719:	    imagelength, imagewidth, spp);
+        -: 1720:}
+        -: 1721:
+        -: 1722:/*
+        -: 1723: * Separate tiles -> separate tiles (tile dimension change).
+        -: 1724: */
+    #####: 1725:DECLAREcpFunc(cpSeparateTiles2SeparateTiles)
+        -: 1726:{
+    #####: 1727:	return cpImage(in, out,
+        -: 1728:	    readSeparateTilesIntoBuffer,
+        -: 1729:	    writeBufferToSeparateTiles,
+        -: 1730:	    imagelength, imagewidth, spp);
+        -: 1731:}
+        -: 1732:
+        -: 1733:/*
+        -: 1734: * Contig tiles -> contig tiles (tile dimension change).
+        -: 1735: */
+    #####: 1736:DECLAREcpFunc(cpContigTiles2ContigStrips)
+        -: 1737:{
+    #####: 1738:	return cpImage(in, out,
+        -: 1739:	    readContigTilesIntoBuffer,
+        -: 1740:	    writeBufferToContigStrips,
+        -: 1741:	    imagelength, imagewidth, spp);
+        -: 1742:}
+        -: 1743:
+        -: 1744:/*
+        -: 1745: * Contig tiles -> separate strips.
+        -: 1746: */
+    #####: 1747:DECLAREcpFunc(cpContigTiles2SeparateStrips)
+        -: 1748:{
+    #####: 1749:	return cpImage(in, out,
+        -: 1750:	    readContigTilesIntoBuffer,
+        -: 1751:	    writeBufferToSeparateStrips,
+        -: 1752:	    imagelength, imagewidth, spp);
+        -: 1753:}
+        -: 1754:
+        -: 1755:/*
+        -: 1756: * Separate tiles -> contig strips.
+        -: 1757: */
+    #####: 1758:DECLAREcpFunc(cpSeparateTiles2ContigStrips)
+        -: 1759:{
+    #####: 1760:	return cpImage(in, out,
+        -: 1761:	    readSeparateTilesIntoBuffer,
+        -: 1762:	    writeBufferToContigStrips,
+        -: 1763:	    imagelength, imagewidth, spp);
+        -: 1764:}
+        -: 1765:
+        -: 1766:/*
+        -: 1767: * Separate tiles -> separate strips.
+        -: 1768: */
+    #####: 1769:DECLAREcpFunc(cpSeparateTiles2SeparateStrips)
+        -: 1770:{
+    #####: 1771:	return cpImage(in, out,
+        -: 1772:	    readSeparateTilesIntoBuffer,
+        -: 1773:	    writeBufferToSeparateStrips,
+        -: 1774:	    imagelength, imagewidth, spp);
+        -: 1775:}
+        -: 1776:
+        -: 1777:/*
+        -: 1778: * Select the appropriate copy function to use.
+        -: 1779: */
+        -: 1780:static copyFunc
+    #####: 1781:pickCopyFunc(TIFF* in, TIFF* out, uint16 bitspersample, uint16 samplesperpixel)
+        -: 1782:{
+    #####: 1783:	uint16 shortv;
+    #####: 1784:	uint32 w, l, tw, tl;
+        -: 1785:	int bychunk;
+        -: 1786:
+    #####: 1787:	(void) TIFFGetField(in, TIFFTAG_PLANARCONFIG, &shortv);
+    #####: 1788:	if (shortv != config && bitspersample != 8 && samplesperpixel > 1) {
+    #####: 1789:		fprintf(stderr,
+        -: 1790:		    "%s: Cannot handle different planar configuration w/ bits/sample != 8\n",
+        -: 1791:		    TIFFFileName(in));
+    #####: 1792:		return (NULL);
+        -: 1793:	}
+    #####: 1794:	TIFFGetField(in, TIFFTAG_IMAGEWIDTH, &w);
+    #####: 1795:	TIFFGetField(in, TIFFTAG_IMAGELENGTH, &l);
+    #####: 1796:	if (!(TIFFIsTiled(out) || TIFFIsTiled(in))) {
+    #####: 1797:		uint32 irps = (uint32) -1L;
+    #####: 1798:		TIFFGetField(in, TIFFTAG_ROWSPERSTRIP, &irps);
+        -: 1799:		/* if biased, force decoded copying to allow image subtraction */
+    #####: 1800:		bychunk = !bias && (rowsperstrip == irps);
+        -: 1801:	}else{  /* either in or out is tiled */
+    #####: 1802:		if (bias) {
+    #####: 1803:			fprintf(stderr,
+        -: 1804:			    "%s: Cannot handle tiled configuration w/bias image\n",
+        -: 1805:			TIFFFileName(in));
+    #####: 1806:			return (NULL);
+        -: 1807:		}
+    #####: 1808:		if (TIFFIsTiled(out)) {
+    #####: 1809:			if (!TIFFGetField(in, TIFFTAG_TILEWIDTH, &tw))
+    #####: 1810:				tw = w;
+    #####: 1811:			if (!TIFFGetField(in, TIFFTAG_TILELENGTH, &tl))
+    #####: 1812:				tl = l;
+    #####: 1813:			bychunk = (tw == tilewidth && tl == tilelength);
+        -: 1814:		} else {  /* out's not, so in must be tiled */
+    #####: 1815:			TIFFGetField(in, TIFFTAG_TILEWIDTH, &tw);
+    #####: 1816:			TIFFGetField(in, TIFFTAG_TILELENGTH, &tl);
+    #####: 1817:			bychunk = (tw == w && tl == rowsperstrip);
+        -: 1818:		}
+        -: 1819:	}
+        -: 1820:#define	T 1
+        -: 1821:#define	F 0
+        -: 1822:#define pack(a,b,c,d,e)	((long)(((a)<<11)|((b)<<3)|((c)<<2)|((d)<<1)|(e)))
+    #####: 1823:	switch(pack(shortv,config,TIFFIsTiled(in),TIFFIsTiled(out),bychunk)) {
+        -: 1824:		/* Strips -> Tiles */
+    #####: 1825:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_CONTIG,   F,T,F):
+        -: 1826:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_CONTIG,   F,T,T):
+    #####: 1827:			return cpContigStrips2ContigTiles;
+    #####: 1828:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_SEPARATE, F,T,F):
+        -: 1829:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_SEPARATE, F,T,T):
+    #####: 1830:			return cpContigStrips2SeparateTiles;
+    #####: 1831:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_CONTIG,   F,T,F):
+        -: 1832:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_CONTIG,   F,T,T):
+    #####: 1833:			return cpSeparateStrips2ContigTiles;
+    #####: 1834:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_SEPARATE, F,T,F):
+        -: 1835:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_SEPARATE, F,T,T):
+    #####: 1836:			return cpSeparateStrips2SeparateTiles;
+        -: 1837:		/* Tiles -> Tiles */
+    #####: 1838:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_CONTIG,   T,T,F):
+        -: 1839:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_CONTIG,   T,T,T):
+    #####: 1840:			return cpContigTiles2ContigTiles;
+    #####: 1841:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_SEPARATE, T,T,F):
+        -: 1842:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_SEPARATE, T,T,T):
+    #####: 1843:			return cpContigTiles2SeparateTiles;
+    #####: 1844:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_CONTIG,   T,T,F):
+        -: 1845:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_CONTIG,   T,T,T):
+    #####: 1846:			return cpSeparateTiles2ContigTiles;
+    #####: 1847:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_SEPARATE, T,T,F):
+        -: 1848:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_SEPARATE, T,T,T):
+    #####: 1849:			return cpSeparateTiles2SeparateTiles;
+        -: 1850:		/* Tiles -> Strips */
+    #####: 1851:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_CONTIG,   T,F,F):
+        -: 1852:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_CONTIG,   T,F,T):
+    #####: 1853:			return cpContigTiles2ContigStrips;
+    #####: 1854:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_SEPARATE, T,F,F):
+        -: 1855:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_SEPARATE, T,F,T):
+    #####: 1856:			return cpContigTiles2SeparateStrips;
+    #####: 1857:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_CONTIG,   T,F,F):
+        -: 1858:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_CONTIG,   T,F,T):
+    #####: 1859:			return cpSeparateTiles2ContigStrips;
+    #####: 1860:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_SEPARATE, T,F,F):
+        -: 1861:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_SEPARATE, T,F,T):
+    #####: 1862:			return cpSeparateTiles2SeparateStrips;
+        -: 1863:		/* Strips -> Strips */
+    #####: 1864:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_CONTIG,   F,F,F):
+    #####: 1865:			return bias ? cpBiasedContig2Contig : cpContig2ContigByRow;
+    #####: 1866:		case pack(PLANARCONFIG_CONTIG,   PLANARCONFIG_CONTIG,   F,F,T):
+    #####: 1867:			return cpDecodedStrips;
+    #####: 1868:		case pack(PLANARCONFIG_CONTIG, PLANARCONFIG_SEPARATE,   F,F,F):
+        -: 1869:		case pack(PLANARCONFIG_CONTIG, PLANARCONFIG_SEPARATE,   F,F,T):
+    #####: 1870:			return cpContig2SeparateByRow;
+    #####: 1871:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_CONTIG,   F,F,F):
+        -: 1872:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_CONTIG,   F,F,T):
+    #####: 1873:			return cpSeparate2ContigByRow;
+    #####: 1874:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_SEPARATE, F,F,F):
+        -: 1875:		case pack(PLANARCONFIG_SEPARATE, PLANARCONFIG_SEPARATE, F,F,T):
+    #####: 1876:			return cpSeparate2SeparateByRow;
+        -: 1877:	}
+        -: 1878:#undef pack
+        -: 1879:#undef F
+        -: 1880:#undef T
+    #####: 1881:	fprintf(stderr, "tiffcp: %s: Don't know how to copy/convert image.\n",
+        -: 1882:	    TIFFFileName(in));
+    #####: 1883:	return (NULL);
+        -: 1884:}
+        -: 1885:
+        -: 1886:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -: 1887:/*
+        -: 1888: * Local Variables:
+        -: 1889: * mode: c
+        -: 1890: * c-basic-offset: 8
+        -: 1891: * fill-column: 78
+        -: 1892: * End:
+        -: 1893: */

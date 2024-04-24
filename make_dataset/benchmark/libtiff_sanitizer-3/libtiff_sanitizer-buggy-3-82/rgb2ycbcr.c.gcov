@@ -1,0 +1,398 @@
+        -:    0:Source:rgb2ycbcr.c
+        -:    1:/* $Id$ */
+        -:    2:
+        -:    3:/*
+        -:    4: * Copyright (c) 1991-1997 Sam Leffler
+        -:    5: * Copyright (c) 1991-1997 Silicon Graphics, Inc.
+        -:    6: *
+        -:    7: * Permission to use, copy, modify, distribute, and sell this software and 
+        -:    8: * its documentation for any purpose is hereby granted without fee, provided
+        -:    9: * that (i) the above copyright notices and this permission notice appear in
+        -:   10: * all copies of the software and related documentation, and (ii) the names of
+        -:   11: * Sam Leffler and Silicon Graphics may not be used in any advertising or
+        -:   12: * publicity relating to the software without the specific, prior written
+        -:   13: * permission of Sam Leffler and Silicon Graphics.
+        -:   14: * 
+        -:   15: * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+        -:   16: * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+        -:   17: * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+        -:   18: * 
+        -:   19: * IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+        -:   20: * ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+        -:   21: * OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+        -:   22: * WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+        -:   23: * LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+        -:   24: * OF THIS SOFTWARE.
+        -:   25: */
+        -:   26:
+        -:   27:#include "tif_config.h"
+        -:   28:
+        -:   29:#include <stdio.h>
+        -:   30:#include <string.h>
+        -:   31:#include <stdlib.h>
+        -:   32:
+        -:   33:#ifdef HAVE_UNISTD_H
+        -:   34:# include <unistd.h>
+        -:   35:#endif
+        -:   36:
+        -:   37:#ifdef NEED_LIBPORT
+        -:   38:# include "libport.h"
+        -:   39:#endif
+        -:   40:
+        -:   41:#include "tiffiop.h"
+        -:   42:#include "tiffio.h"
+        -:   43:
+        -:   44:#define	streq(a,b)	(strcmp(a,b) == 0)
+        -:   45:#define	CopyField(tag, v) \
+        -:   46:    if (TIFFGetField(in, tag, &v)) TIFFSetField(out, tag, v)
+        -:   47:
+        -:   48:#ifndef howmany
+        -:   49:#define	howmany(x, y)	(((x)+((y)-1))/(y))
+        -:   50:#endif
+        -:   51:#define	roundup(x, y)	(howmany(x,y)*((uint32)(y)))
+        -:   52:
+        -:   53:#define	LumaRed		ycbcrCoeffs[0]
+        -:   54:#define	LumaGreen	ycbcrCoeffs[1]
+        -:   55:#define	LumaBlue	ycbcrCoeffs[2]
+        -:   56:
+        -:   57:uint16	compression = COMPRESSION_PACKBITS;
+        -:   58:uint32	rowsperstrip = (uint32) -1;
+        -:   59:
+        -:   60:uint16	horizSubSampling = 2;		/* YCbCr horizontal subsampling */
+        -:   61:uint16	vertSubSampling = 2;		/* YCbCr vertical subsampling */
+        -:   62:float	ycbcrCoeffs[3] = { .299F, .587F, .114F };
+        -:   63:/* default coding range is CCIR Rec 601-1 with no headroom/footroom */
+        -:   64:float	refBlackWhite[6] = { 0.F, 255.F, 128.F, 255.F, 128.F, 255.F };
+        -:   65:
+        -:   66:static	int tiffcvt(TIFF* in, TIFF* out);
+        -:   67:static	void usage(int code);
+        -:   68:static	void setupLumaTables(void);
+        -:   69:
+        -:   70:int
+    #####:   71:main(int argc, char* argv[])
+        -:   72:{
+        -:   73:	TIFF *in, *out;
+        -:   74:	int c;
+        -:   75:#if !HAVE_DECL_OPTARG
+        -:   76:	extern int optind;
+        -:   77:	extern char *optarg;
+        -:   78:#endif
+        -:   79:
+    #####:   80:	while ((c = getopt(argc, argv, "c:h:r:v:z")) != -1)
+    #####:   81:		switch (c) {
+    #####:   82:		case 'c':
+    #####:   83:			if (streq(optarg, "none"))
+    #####:   84:			    compression = COMPRESSION_NONE;
+    #####:   85:			else if (streq(optarg, "packbits"))
+    #####:   86:			    compression = COMPRESSION_PACKBITS;
+    #####:   87:			else if (streq(optarg, "lzw"))
+    #####:   88:			    compression = COMPRESSION_LZW;
+    #####:   89:			else if (streq(optarg, "jpeg"))
+    #####:   90:			    compression = COMPRESSION_JPEG;
+    #####:   91:			else if (streq(optarg, "zip"))
+    #####:   92:			    compression = COMPRESSION_ADOBE_DEFLATE;
+        -:   93:			else
+    #####:   94:			    usage(-1);
+    #####:   95:			break;
+    #####:   96:		case 'h':
+    #####:   97:			horizSubSampling = atoi(optarg);
+    #####:   98:            if( horizSubSampling != 1 && horizSubSampling != 2 && horizSubSampling != 4 )
+    #####:   99:                usage(-1);
+    #####:  100:			break;
+    #####:  101:		case 'v':
+    #####:  102:			vertSubSampling = atoi(optarg);
+    #####:  103:            if( vertSubSampling != 1 && vertSubSampling != 2 && vertSubSampling != 4 )
+    #####:  104:                usage(-1);
+    #####:  105:			break;
+    #####:  106:		case 'r':
+    #####:  107:			rowsperstrip = atoi(optarg);
+    #####:  108:			break;
+    #####:  109:		case 'z':	/* CCIR Rec 601-1 w/ headroom/footroom */
+    #####:  110:			refBlackWhite[0] = 16.;
+    #####:  111:			refBlackWhite[1] = 235.;
+    #####:  112:			refBlackWhite[2] = 128.;
+    #####:  113:			refBlackWhite[3] = 240.;
+    #####:  114:			refBlackWhite[4] = 128.;
+    #####:  115:			refBlackWhite[5] = 240.;
+    #####:  116:			break;
+    #####:  117:		case '?':
+    #####:  118:			usage(0);
+        -:  119:			/*NOTREACHED*/
+        -:  120:		}
+    #####:  121:	if (argc - optind < 2)
+    #####:  122:		usage(-1);
+    #####:  123:	out = TIFFOpen(argv[argc-1], "w");
+    #####:  124:	if (out == NULL)
+    #####:  125:		return (-2);
+    #####:  126:	setupLumaTables();
+    #####:  127:	for (; optind < argc-1; optind++) {
+    #####:  128:		in = TIFFOpen(argv[optind], "r");
+    #####:  129:		if (in != NULL) {
+        -:  130:			do {
+    #####:  131:				if (!tiffcvt(in, out) ||
+    #####:  132:				    !TIFFWriteDirectory(out)) {
+    #####:  133:					(void) TIFFClose(out);
+    #####:  134:					return (1);
+        -:  135:				}
+    #####:  136:			} while (TIFFReadDirectory(in));
+    #####:  137:			(void) TIFFClose(in);
+        -:  138:		}
+        -:  139:	}
+    #####:  140:	(void) TIFFClose(out);
+    #####:  141:	return (0);
+        -:  142:}
+        -:  143:
+        -:  144:float	*lumaRed;
+        -:  145:float	*lumaGreen;
+        -:  146:float	*lumaBlue;
+        -:  147:float	D1, D2;
+        -:  148:int	Yzero;
+        -:  149:
+        -:  150:static float*
+    #####:  151:setupLuma(float c)
+        -:  152:{
+    #####:  153:	float *v = (float *)_TIFFmalloc(256 * sizeof (float));
+        -:  154:	int i;
+    #####:  155:	for (i = 0; i < 256; i++)
+    #####:  156:		v[i] = c * i;
+    #####:  157:	return (v);
+        -:  158:}
+        -:  159:
+        -:  160:static unsigned
+    #####:  161:V2Code(float f, float RB, float RW, int CR)
+        -:  162:{
+    #####:  163:	unsigned int c = (unsigned int)((((f)*(RW-RB)/CR)+RB)+.5);
+    #####:  164:	return (c > 255 ? 255 : c);
+        -:  165:}
+        -:  166:
+        -:  167:static void
+    #####:  168:setupLumaTables(void)
+        -:  169:{
+    #####:  170:	lumaRed = setupLuma(LumaRed);
+    #####:  171:	lumaGreen = setupLuma(LumaGreen);
+    #####:  172:	lumaBlue = setupLuma(LumaBlue);
+    #####:  173:	D1 = 1.F/(2.F - 2.F*LumaBlue);
+    #####:  174:	D2 = 1.F/(2.F - 2.F*LumaRed);
+    #####:  175:	Yzero = V2Code(0, refBlackWhite[0], refBlackWhite[1], 255);
+    #####:  176:}
+        -:  177:
+        -:  178:static void
+    #####:  179:cvtClump(unsigned char* op, uint32* raster, uint32 ch, uint32 cw, uint32 w)
+        -:  180:{
+    #####:  181:	float Y, Cb = 0, Cr = 0;
+        -:  182:	uint32 j, k;
+        -:  183:	/*
+        -:  184:	 * Convert ch-by-cw block of RGB
+        -:  185:	 * to YCbCr and sample accordingly.
+        -:  186:	 */
+    #####:  187:	for (k = 0; k < ch; k++) {
+    #####:  188:		for (j = 0; j < cw; j++) {
+    #####:  189:			uint32 RGB = (raster - k*w)[j];
+    #####:  190:			Y = lumaRed[TIFFGetR(RGB)] +
+    #####:  191:			    lumaGreen[TIFFGetG(RGB)] +
+    #####:  192:			    lumaBlue[TIFFGetB(RGB)];
+        -:  193:			/* accumulate chrominance */
+    #####:  194:			Cb += (TIFFGetB(RGB) - Y) * D1;
+    #####:  195:			Cr += (TIFFGetR(RGB) - Y) * D2;
+        -:  196:			/* emit luminence */
+    #####:  197:			*op++ = V2Code(Y,
+        -:  198:			    refBlackWhite[0], refBlackWhite[1], 255);
+        -:  199:		}
+    #####:  200:		for (; j < horizSubSampling; j++)
+    #####:  201:			*op++ = Yzero;
+        -:  202:	}
+    #####:  203:	for (; k < vertSubSampling; k++) {
+    #####:  204:		for (j = 0; j < horizSubSampling; j++)
+    #####:  205:			*op++ = Yzero;
+        -:  206:	}
+        -:  207:	/* emit sampled chrominance values */
+    #####:  208:	*op++ = V2Code(Cb / (ch*cw), refBlackWhite[2], refBlackWhite[3], 127);
+    #####:  209:	*op++ = V2Code(Cr / (ch*cw), refBlackWhite[4], refBlackWhite[5], 127);
+    #####:  210:}
+        -:  211:#undef LumaRed
+        -:  212:#undef LumaGreen
+        -:  213:#undef LumaBlue
+        -:  214:#undef V2Code
+        -:  215:
+        -:  216:/*
+        -:  217: * Convert a strip of RGB data to YCbCr and
+        -:  218: * sample to generate the output data.
+        -:  219: */
+        -:  220:static void
+    #####:  221:cvtStrip(unsigned char* op, uint32* raster, uint32 nrows, uint32 width)
+        -:  222:{
+        -:  223:	uint32 x;
+    #####:  224:	int clumpSize = vertSubSampling * horizSubSampling + 2;
+        -:  225:	uint32 *tp;
+        -:  226:
+    #####:  227:	for (; nrows >= vertSubSampling; nrows -= vertSubSampling) {
+    #####:  228:		tp = raster;
+    #####:  229:		for (x = width; x >= horizSubSampling; x -= horizSubSampling) {
+    #####:  230:			cvtClump(op, tp,
+        -:  231:			    vertSubSampling, horizSubSampling, width);
+    #####:  232:			op += clumpSize;
+    #####:  233:			tp += horizSubSampling;
+        -:  234:		}
+    #####:  235:		if (x > 0) {
+    #####:  236:			cvtClump(op, tp, vertSubSampling, x, width);
+    #####:  237:			op += clumpSize;
+        -:  238:		}
+    #####:  239:		raster -= vertSubSampling*width;
+        -:  240:	}
+    #####:  241:	if (nrows > 0) {
+    #####:  242:		tp = raster;
+    #####:  243:		for (x = width; x >= horizSubSampling; x -= horizSubSampling) {
+    #####:  244:			cvtClump(op, tp, nrows, horizSubSampling, width);
+    #####:  245:			op += clumpSize;
+    #####:  246:			tp += horizSubSampling;
+        -:  247:		}
+    #####:  248:		if (x > 0)
+    #####:  249:			cvtClump(op, tp, nrows, x, width);
+        -:  250:	}
+    #####:  251:}
+        -:  252:
+        -:  253:static int
+    #####:  254:cvtRaster(TIFF* tif, uint32* raster, uint32 width, uint32 height)
+        -:  255:{
+        -:  256:	uint32 y;
+    #####:  257:	tstrip_t strip = 0;
+        -:  258:	tsize_t cc, acc;
+        -:  259:	unsigned char* buf;
+    #####:  260:	uint32 rwidth = roundup(width, horizSubSampling);
+    #####:  261:	uint32 rheight = roundup(height, vertSubSampling);
+    #####:  262:	uint32 nrows = (rowsperstrip > rheight ? rheight : rowsperstrip);
+    #####:  263:        uint32 rnrows = roundup(nrows,vertSubSampling);
+        -:  264:
+    #####:  265:	cc = rnrows*rwidth +
+    #####:  266:	    2*((rnrows*rwidth) / (horizSubSampling*vertSubSampling));
+    #####:  267:	buf = (unsigned char*)_TIFFmalloc(cc);
+        -:  268:	// FIXME unchecked malloc
+    #####:  269:	for (y = height; (int32) y > 0; y -= nrows) {
+    #####:  270:		uint32 nr = (y > nrows ? nrows : y);
+    #####:  271:		cvtStrip(buf, raster + (y-1)*width, nr, width);
+    #####:  272:		nr = roundup(nr, vertSubSampling);
+    #####:  273:		acc = nr*rwidth +
+    #####:  274:			2*((nr*rwidth)/(horizSubSampling*vertSubSampling));
+    #####:  275:		if (!TIFFWriteEncodedStrip(tif, strip++, buf, acc)) {
+    #####:  276:			_TIFFfree(buf);
+    #####:  277:			return (0);
+        -:  278:		}
+        -:  279:	}
+    #####:  280:	_TIFFfree(buf);
+    #####:  281:	return (1);
+        -:  282:}
+        -:  283:
+        -:  284:static int
+    #####:  285:tiffcvt(TIFF* in, TIFF* out)
+        -:  286:{
+    #####:  287:	uint32 width, height;		/* image width & height */
+        -:  288:	uint32* raster;			/* retrieve RGBA image */
+    #####:  289:	uint16 shortv;
+    #####:  290:	float floatv;
+    #####:  291:	char *stringv;
+    #####:  292:	uint32 longv;
+        -:  293:	int result;
+        -:  294:	size_t pixel_count;
+        -:  295:
+    #####:  296:	TIFFGetField(in, TIFFTAG_IMAGEWIDTH, &width);
+    #####:  297:	TIFFGetField(in, TIFFTAG_IMAGELENGTH, &height);
+    #####:  298:	pixel_count = width * height;
+        -:  299:
+        -:  300: 	/* XXX: Check the integer overflow. */
+    #####:  301: 	if (!width || !height || pixel_count / width != height) {
+    #####:  302: 		TIFFError(TIFFFileName(in),
+        -:  303: 			  "Malformed input file; "
+        -:  304: 			  "can't allocate buffer for raster of %lux%lu size",
+        -:  305: 			  (unsigned long)width, (unsigned long)height);
+    #####:  306: 		return 0;
+        -:  307: 	}
+        -:  308: 
+    #####:  309: 	raster = (uint32*)_TIFFCheckMalloc(in, pixel_count, sizeof(uint32),
+        -:  310: 					   "raster buffer");
+    #####:  311:  	if (raster == 0) {
+    #####:  312: 		TIFFError(TIFFFileName(in),
+        -:  313: 			  "Failed to allocate buffer (%lu elements of %lu each)",
+        -:  314: 			  (unsigned long)pixel_count,
+        -:  315: 			  (unsigned long)sizeof(uint32));
+    #####:  316:  		return (0);
+        -:  317:  	}
+        -:  318:
+    #####:  319:	if (!TIFFReadRGBAImage(in, width, height, raster, 0)) {
+    #####:  320:		_TIFFfree(raster);
+    #####:  321:		return (0);
+        -:  322:	}
+        -:  323:
+    #####:  324:	CopyField(TIFFTAG_SUBFILETYPE, longv);
+    #####:  325:	TIFFSetField(out, TIFFTAG_IMAGEWIDTH, width);
+    #####:  326:	TIFFSetField(out, TIFFTAG_IMAGELENGTH, height);
+    #####:  327:	TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 8);
+    #####:  328:	TIFFSetField(out, TIFFTAG_COMPRESSION, compression);
+    #####:  329:	TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_YCBCR);
+    #####:  330:	if (compression == COMPRESSION_JPEG)
+    #####:  331:		TIFFSetField(out, TIFFTAG_JPEGCOLORMODE, JPEGCOLORMODE_RAW);
+    #####:  332:	CopyField(TIFFTAG_FILLORDER, shortv);
+    #####:  333:	TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    #####:  334:	TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 3);
+    #####:  335:	CopyField(TIFFTAG_XRESOLUTION, floatv);
+    #####:  336:	CopyField(TIFFTAG_YRESOLUTION, floatv);
+    #####:  337:	CopyField(TIFFTAG_RESOLUTIONUNIT, shortv);
+    #####:  338:	TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    #####:  339:	{ char buf[2048];
+    #####:  340:	  char *cp = strrchr(TIFFFileName(in), '/');
+    #####:  341:	  snprintf(buf, sizeof(buf), "YCbCr conversion of %s",
+    #####:  342:		   cp ? cp+1 : TIFFFileName(in));
+    #####:  343:	  TIFFSetField(out, TIFFTAG_IMAGEDESCRIPTION, buf);
+        -:  344:	}
+    #####:  345:	TIFFSetField(out, TIFFTAG_SOFTWARE, TIFFGetVersion());
+    #####:  346:	CopyField(TIFFTAG_DOCUMENTNAME, stringv);
+        -:  347:
+    #####:  348:	TIFFSetField(out, TIFFTAG_REFERENCEBLACKWHITE, refBlackWhite);
+    #####:  349:	TIFFSetField(out, TIFFTAG_YCBCRSUBSAMPLING,
+        -:  350:	    horizSubSampling, vertSubSampling);
+    #####:  351:	TIFFSetField(out, TIFFTAG_YCBCRPOSITIONING, YCBCRPOSITION_CENTERED);
+    #####:  352:	TIFFSetField(out, TIFFTAG_YCBCRCOEFFICIENTS, ycbcrCoeffs);
+    #####:  353:	rowsperstrip = TIFFDefaultStripSize(out, rowsperstrip);
+    #####:  354:	TIFFSetField(out, TIFFTAG_ROWSPERSTRIP, rowsperstrip);
+        -:  355:
+    #####:  356:	result = cvtRaster(out, raster, width, height);
+    #####:  357:        _TIFFfree(raster);
+    #####:  358:        return result;
+        -:  359:}
+        -:  360:
+        -:  361:char* stuff[] = {
+        -:  362:    "usage: rgb2ycbcr [-c comp] [-r rows] [-h N] [-v N] input... output\n",
+        -:  363:    "where comp is one of the following compression algorithms:\n",
+        -:  364:    " jpeg\t\tJPEG encoding\n",
+        -:  365:    " lzw\t\tLempel-Ziv & Welch encoding\n",
+        -:  366:    " zip\t\tdeflate encoding\n",
+        -:  367:    " packbits\tPackBits encoding (default)\n",
+        -:  368:    " none\t\tno compression\n",
+        -:  369:    "and the other options are:\n",
+        -:  370:    " -r\trows/strip\n",
+        -:  371:    " -h\thorizontal sampling factor (1,2,4)\n",
+        -:  372:    " -v\tvertical sampling factor (1,2,4)\n",
+        -:  373:    NULL
+        -:  374:};
+        -:  375:
+        -:  376:static void
+    #####:  377:usage(int code)
+        -:  378:{
+    #####:  379:	char buf[BUFSIZ];
+        -:  380:	int i;
+        -:  381:
+    #####:  382:	setbuf(stderr, buf);
+        -:  383:       
+    #####:  384: fprintf(stderr, "%s\n\n", TIFFGetVersion());
+    #####:  385:	for (i = 0; stuff[i] != NULL; i++)
+    #####:  386:		fprintf(stderr, "%s\n", stuff[i]);
+    #####:  387:	exit(code);
+        -:  388:}
+        -:  389:
+        -:  390:/* vim: set ts=8 sts=8 sw=8 noet: */
+        -:  391:/*
+        -:  392: * Local Variables:
+        -:  393: * mode: c
+        -:  394: * c-basic-offset: 8
+        -:  395: * fill-column: 78
+        -:  396: * End:
+        -:  397: */
